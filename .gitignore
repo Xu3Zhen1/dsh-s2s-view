@@ -5,3 +5,8 @@ node_modules/
 lib/
 # Repo design/plan docs stay local; only code + CI + change fragments sync to GitHub.
 docs/
+# The pre-extraction copy of the hand-written client artifact. Kept on disk as
+# the byte-identity reference `verify-bundle` was validated against, but not
+# tracked: the extracted source under `src/client/` supersedes it, and tracking
+# both would invite editing the wrong one.
+.baseline/

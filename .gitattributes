@@ -1,0 +1,21 @@
+# Line endings are a CORRECTNESS constraint in this repository, not a style
+# preference, so they are pinned rather than left to the machine's git config.
+#
+# Why: `lib/client.js` is assembled by concatenating `src/client/index.js`
+# VERBATIM with the shell in `src/client/.shell.json`, and `verify-bundle.mjs`
+# asserts the result is byte-identical to the deployed artifact. The shell's
+# prelude/epilogue strings in that JSON contain real newlines, and the client
+# body contains CSS string literals. Under `core.autocrlf=true` — the default on
+# this machine — a fresh checkout would rewrite every LF as CRLF, changing the
+# assembled bytes and breaking the very equality the gate exists to protect.
+# (It would fail loudly rather than silently, but a gate that fires on every
+# clone is a gate people learn to ignore.)
+#
+# `eol=lf` fixes the working tree to LF on every platform, which is also what
+# the upstream project is authored in.
+* text=auto eol=lf
+
+# Binary or generated content that must never be normalised.
+*.png binary
+*.ico binary
+pnpm-lock.yaml -text

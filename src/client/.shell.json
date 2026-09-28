@@ -1,0 +1,6 @@
+{
+  "header": "/**\n * `dsh-s2s` browser half — the session-history panel.\n *\n * A sidebar surface answering \"which conversations exist, grouped by\n * workspace, and where did each one stop\" WITHOUT rendering message content:\n * every row quotes a conversation (title, short id, state, when it was last\n * touched), so the user can see where a thread broke off and click back into\n * it. Content is reachable the normal way — this panel is an index, not a\n * reader.\n *\n * Everything rendered comes from state the browser already holds — the\n * `sessions` service (`ctx.sessions.list`) and the `workspaces` service — so\n * the panel adds no host round-trip, no new service and no new RPC.\n *\n * This file is the loader's closure-factory artifact by hand, so the package\n * needs no client build step: it registers a factory on the page's module\n * queue and resolves React through the module table the shell seeds. Written\n * in the same shape as the other out-of-tree client halves in this profile.\n */\n\n",
+  "shellPrologue": "window.__ModuleLoader__.load({\n  id: 'dsh-s2s',\n  factory: (require) => {\n",
+  "intro": "    var module = { exports: {} }\n    var exports = module.exports\n",
+  "footer": "\n    return module.exports\n  },\n})\n"
+}

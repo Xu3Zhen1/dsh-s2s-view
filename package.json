@@ -11,6 +11,10 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./client": {
+      "types": "./lib/types/client.d.ts",
+      "default": "./lib/client.js"
+    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
@@ -23,6 +27,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "peerDependencies": {
@@ -48,7 +55,8 @@
     "vitest": "^4.0.18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsdown && node scripts/verify-bundle.mjs",
+    "build": "tsc -p tsconfig.json && tsdown && node scripts/build-history-surface.mjs && node scripts/verify-bundle.mjs",
+    "build:surface": "node scripts/build-history-surface.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "prepare": "pnpm run build"
