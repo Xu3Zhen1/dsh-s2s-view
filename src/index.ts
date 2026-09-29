@@ -15,6 +15,7 @@ import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
 import * as toolsPlugin from './tools.ts'
+import * as digestPlugin from './digest.ts'
 
 export { S2sError } from './error.ts'
 export type { S2sErrorCode } from './error.ts'
@@ -67,5 +68,6 @@ export function apply(ctx: Context, config: Config): void {
     ctx.plugin(S2sScheduleService, config.schedule)
   }
   ctx.plugin(toolsPlugin)
+  ctx.plugin(digestPlugin)
 }
 

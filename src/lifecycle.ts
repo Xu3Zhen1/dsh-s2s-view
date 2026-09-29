@@ -11,7 +11,7 @@
  */
 
 import { Service, type Context } from '@deepseek-ai/cordis'
-import { installModelSelection, type Agent, type ModelSelection } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { S2sError } from './error.ts'
@@ -88,34 +88,119 @@ export class S2sLifecycleService extends Service {
       return 'resumed'
     }
     const registry = this.ctx.agents as typeof this.ctx.agents & {
-      resume?: (options: { resumeSessionId: string }) => Promise<ResumedHandle>
+      resume?: (options: { resumeSessionId: string; setup?: AgentSetup }) => Promise<ResumedHandle>
     }
     if (typeof registry.resume !== 'function') {
       this.ctx.logger.warn('s2s lifecycle: agent registry has no resume capability; message stays queued')
       return 'queued'
     }
-    const handle = await registry.resume({ resumeSessionId: entry.sessionId })
-    // A dormant resume bypasses the host's (apiproxy) preset setup, which is
-    // where the Agent-scoped model-selection hooks are installed for live
-    // agents. Without them a persona referencing `{{model}}` (e.g. the shared
-    // `deployment:persona`) fails prompt assembly with an unbound prompt
-    // variable. Mirror the host so the resumed session binds the model it
-    // last ran with.
-    this.installResumedSelection(handle.agent)
+    // A dormant resume through AgentRegistry.resume does NOT run the host's
+    // composeAgent, so the resumed Agent gets a fresh scoped world with no
+    // preset layer at all (tools and prompt sections silently missing). Pass a
+    // setup that reproduces the host's composition. See `resumedSetup`.
+    const setup = await this.resumedSetup(entry.sessionId)
+    const handle = await registry.resume({
+      resumeSessionId: entry.sessionId,
+      ...(setup === undefined ? {} : { setup: setup }),
+    })
     this.resumed.set(entry.sessionId, handle)
     await this.drain(entry.sessionId)
     return 'resumed'
   }
 
   /**
-   * Install the Agent-scoped model-selection hooks that the web host installs
-   * during preset setup (which a dormant resume via `AgentRegistry.resume`
-   * skips). The hooks bind `{{model}}`/`{{provider}}` for the resumed session
-   * from the model it last ran with, so a persona template that references
-   * them assembles instead of throwing `has no value`.
-   * @see {@link installModelSelection} (the host's `selectionFor` mirrors this)
+   * Build the pre-publication `setup` for a resumed Agent, mirroring the host's
+   * `ApiSessionAgentController.composeAgent` (`packages/api/session-controller`).
+   *
+   * Why this exists: `AgentRegistry.resume` mints a fresh scoped world and only
+   * the caller's `setup` populates it. The web host supplies its own for
+   * GUI-driven resumes; a dormant wake from here has no such caller, so without
+   * this the Agent comes up with **no preset**: ~26 preset-registered tools and
+   * their prompt sections vanish while the session stays alive and answers
+   * normally — a silent, hard-to-notice degradation.
+   *
+   * The preset id is read from the **`agentPreset` Session projection**, the
+   * same source the host uses, and never from the creation-time header alone:
+   * a session may switch presets while still blank.
+   *
+   * @param sessionId - the dormant session being resumed.
+   * @returns the setup callback, or `undefined` when it cannot be composed
+   *   (no preset service, or the session cannot be observed) — in which case
+   *   the caller resumes exactly as before rather than failing the delivery.
+   *
+   * **This is a MIRROR, not a reuse, and it has an exit condition.** It cannot
+   * call the host's `composeAgent` because the controller that owns it is a
+   * `private` field (`session-controller/src/index.ts`), so there is no
+   * injectable service for it. `composeAgent` itself is already `public`; the
+   * host only needs to expose that instance (a one-line `provide` plus a type
+   * declaration, not a refactor). **If the host exposes it, delete this method
+   * and call the host's implementation** — two copies drift silently, since
+   * nothing here fails to compile when `composeAgent` changes.
    */
-  private installResumedSelection(agent: Agent): void {
+  private async resumedSetup(sessionId: string): Promise<AgentSetup | undefined> {
+    const presets = this.ctx.get('agentPresets') as
+      | { resolve(id?: string): Promise<{ id: string }>; mount(agentCtx: Context, id?: string): Promise<unknown> }
+      | undefined
+    if (presets === undefined) {
+      // Mirror the host exactly: with no preset service it still supplies a
+      // setup, just without the mount (`composeAgent`: `return { setup: (agentCtx)
+      // => { this.installSelection(agentCtx) } }`). Returning no setup at all
+      // would ALSO drop the model-selection binding and reintroduce the
+      // unbound-`{{model}}` failure this code originally existed to fix.
+      // G9: the fallback announces itself — the preset layer will be missing.
+      this.ctx.logger.warn(
+        's2s lifecycle: no `agentPresets` service in this composition — the resumed session will NOT get its preset '
+        + 'layer (tools and prompt sections may be missing). Resuming anyway; install the presets plugin to fix this.',
+      )
+      return async (agentCtx: Context) => { this.installSelection(agentCtx) }
+    }
+    let presetId: string | undefined
+    try {
+      const query = this.ctx.get('sessionQuery') as
+        | { observeSession(id: SessionId): Promise<{ projections?: { values: { agentPreset?: string | null } } }> }
+        | undefined
+      if (query !== undefined) {
+        const observation = await query.observeSession(SessionId(sessionId))
+        presetId = observation.projections?.values.agentPreset ?? undefined
+      }
+    } catch (error: unknown) {
+      this.ctx.logger.warn(
+        `s2s lifecycle: could not observe "${sessionId}" to resolve its agent preset (${String(error)}); `
+        + 'falling back to the deployment default preset.',
+      )
+    }
+    try {
+      const resolvedId = (await presets.resolve(presetId)).id
+      return async (agentCtx: Context) => {
+        this.installSelection(agentCtx)
+        await presets.mount(agentCtx, resolvedId)
+      }
+    } catch (error: unknown) {
+      // Preset lookup/mount failed: keep the model-selection half rather than
+      // handing back no setup at all, and make the loss loud (G9).
+      this.ctx.logger.warn(
+        `s2s lifecycle: could not resolve/mount preset for "${sessionId}" (${String(error)}); `
+        + 'the session resumes WITHOUT its preset layer.',
+      )
+      return async (agentCtx: Context) => { this.installSelection(agentCtx) }
+    }
+  }
+
+  /**
+   * Install the Session-local model selection that the host installs during
+   * preset setup. Kept as the single place that does this (the host's
+   * `selectionFor` mirrors it): before, this ran *in addition to* the missing
+   * preset mount, which is what made the degradation lopsided.
+   *
+   * @param agentCtx - the Agent's scoped context, valid only inside `setup`.
+   */
+  private installSelection(agentCtx: Context): void {
+    const agent = (agentCtx as Context & { agent?: Agent }).agent
+    // Fail loud, exactly as the host does: a setup that cannot see its scoped
+    // Agent is a broken composition, not a case to pass over. Silent return here
+    // would let a half-composed Agent be published — the same class of defect as
+    // the missing preset layer (G9: no silent degradation).
+    if (agent === undefined) throw new S2sError('s2s lifecycle: Agent setup has no scoped Agent', 'S2S_LIFECYCLE')
     let picked: ModelSelection | undefined
     const selection = {
       get current() {
@@ -147,7 +232,10 @@ export class S2sLifecycleService extends Service {
     if (agent === undefined) return 0
     const entries = await this.mailbox.drain(sessionId)
     for (const entry of entries) {
-      const text = `[s2s-lifecycle message] from=${entry.from} queued-at=${new Date(entry.createdAt).toISOString()} replyTo=${entry.replyTo ?? '-'}
+      // Same `msgId=` header as the broker's live path: the ledger derives
+      // `landed` by finding this token in the target's session log, so both
+      // delivery paths must emit it or dormant deliveries can never land.
+      const text = `[s2s-lifecycle message] msgId=${entry.msgId} from=${entry.from} queued-at=${new Date(entry.createdAt).toISOString()} replyTo=${entry.replyTo ?? '-'}
 ${entry.text}`
       const userMessage = createUserMessage({
         content: [{ type: 'text', text }],

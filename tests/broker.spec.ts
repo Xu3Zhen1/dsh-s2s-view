@@ -22,6 +22,21 @@ describe('s2s broker', () => {
     expect(broker.deliver('ghost', { from: 'alice', text: 'hi', msgId: 'm3' })).toBe('absent')
   })
 
+  it('writes the msgId into the injected header so it survives into the log', async () => {
+    // `source` is a constant ({kind:'dsh-s2s'}) with no id, so the header is the
+    // only place the ledger can later find this delivery in the target's log.
+    const ctx = new Context()
+    const agent = fakeAgent('idle')
+    ctx.provide('agents', { get: (id: unknown) => String(id) === 's' ? agent : undefined } as never)
+    await ctx.plugin(S2sBroker)
+    const broker = ctx.get('s2sBroker') as S2sBroker
+    broker.deliver('s', { from: 'a', text: 'x', msgId: 'm-42' })
+    const text = String((agent as any).followup.mock.calls[0][0].content[0].text)
+    expect(text).toContain('msgId=m-42')
+    // it must be on the header line, before the body
+    expect(text.split('\n')[0]).toContain('msgId=m-42')
+  })
+
   it('notes process-scoped history', async () => {
     const ctx = new Context()
     ctx.provide('agents', { get: (id: unknown) => String(id) === 's' ? fakeAgent('idle') : undefined } as never)

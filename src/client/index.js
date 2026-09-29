@@ -576,23 +576,25 @@
      * Read the s2s envelope off a delivered message.
      *
      * The host's broker and lifecycle paths both prefix the body with one
-     * `[s2s message] from=… at=…` (or `queued-at=`) line, so the sender of a
-     * group-chat message is recoverable from the durable log alone — no
-     * broker round-trip, and it survives a restart. The sender name itself may
-     * contain spaces, so the header is split on the timestamp key, not on
-     * whitespace.
+     * `[s2s message] msgId=… from=… at=…` (or `queued-at=`) line, so the sender
+     * of a group-chat message is recoverable from the durable log alone — no
+     * broker round-trip, and it survives a restart. `msgId=` is optional so
+     * that messages persisted before it was added still parse. The sender name
+     * itself may contain spaces, so the header is split on the timestamp key,
+     * not on whitespace.
      * @param {string} text - full message text.
-     * @returns {object|null} { from, at, replyTo, body }, or null when not s2s.
+     * @returns {object|null} { msgId, from, at, replyTo, body }, or null when not s2s.
      */
     function parseS2sHeader(text) {
       if (typeof text !== 'string') return null
-      const match = /^\[s2s(?:-lifecycle)? message\]\s*from=([\s\S]*?)\s+(?:queued-)?at=(\S*)(?:\s+replyTo=(\S*))?\n?([\s\S]*)$/.exec(text)
+      const match = /^\[s2s(?:-lifecycle)? message\]\s*(?:msgId=(\S*)\s+)?from=([\s\S]*?)\s+(?:queued-)?at=(\S*)(?:\s+replyTo=(\S*))?\n?([\s\S]*)$/.exec(text)
       if (match === null) return null
       return {
-        from: match[1],
-        at: match[2],
-        replyTo: match[3] === undefined ? null : match[3],
-        body: match[4],
+        msgId: match[1] === undefined ? null : match[1],
+        from: match[2],
+        at: match[3],
+        replyTo: match[4] === undefined ? null : match[4],
+        body: match[5],
       }
     }
 

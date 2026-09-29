@@ -49,7 +49,12 @@ export class S2sBroker extends Service {
   deliver(sessionId: string, input: S2sDeliverInput): S2sDeliverState {
     const agent = this.liveAgent(sessionId)
     if (agent === undefined) return 'absent'
-    const text = `[s2s message] from=${input.from} at=${new Date().toISOString()}${input.replyTo ? ` replyTo=${input.replyTo}` : ''}
+    // `msgId` goes in the header so it survives into the target's session log:
+    // `source` is a constant (`{kind:'dsh-s2s'}`) and carries no id, so before
+    // this the id existed only in this process's Map and a delivery could not
+    // be matched to its log entry after a restart. Ledger `landed` derivation
+    // depends on finding this token in the target's log.
+    const text = `[s2s message] msgId=${input.msgId} from=${input.from} at=${new Date().toISOString()}${input.replyTo ? ` replyTo=${input.replyTo}` : ''}
 ${input.text}`
     const userMessage = createUserMessage({
       content: [{ type: 'text', text }],

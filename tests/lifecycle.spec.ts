@@ -46,9 +46,18 @@ describe('s2s lifecycle', () => {
     const outcome = await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'hello dormant', msgId: 'm1' })
     expect(outcome).toBe('resumed')
     expect(resume).toHaveBeenCalledTimes(1)
-    expect(resume).toHaveBeenCalledWith({ resumeSessionId: 'sess-1' })
+    // This harness mounts no `agentPresets` service, so the lifecycle takes its
+    // documented degraded path: it still resumes, warns, and supplies only the
+    // model-selection half of the setup (mirroring the host's `composeAgent`,
+    // which does the same when `agentPresets` is absent). The full setup
+    // including `presets.mount` is covered in lifecycle.model.spec.ts.
+    expect(resume.mock.calls[0]![0]).toMatchObject({ resumeSessionId: 'sess-1' })
+    expect(typeof (resume.mock.calls[0]![0] as { setup?: unknown }).setup).toBe('function')
     expect(followups).toHaveLength(1)
     expect(String((followups[0] as { content: { text: string }[] }).content[0]!.text)).toContain('[s2s-lifecycle message]')
+    // The dormant path must carry the same msgId token as the broker's live
+    // path, or a dormant delivery could never be matched to its log entry.
+    expect(String((followups[0] as { content: { text: string }[] }).content[0]!.text)).toContain('msgId=m1')
     expect(String((followups[0] as { content: { text: string }[] }).content[0]!.text)).toContain('hello dormant')
     // Producer-owned kind: session format v4 refuses the retired `plugin` wrapper.
     const source = (followups[0] as { source: { kind: string; plugin?: string } }).source

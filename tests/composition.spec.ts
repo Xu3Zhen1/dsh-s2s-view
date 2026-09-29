@@ -15,11 +15,15 @@ async function harness() {
 }
 
 describe('s2s composition', () => {
-  it('mounts broker + discovery and registers 5 tools', async () => {
+  it('mounts broker + discovery and registers the 7 tools', async () => {
     const { ctx, registered } = await harness()
     expect(ctx.get('s2sBroker')).toBeDefined()
     expect(ctx.get('s2sDiscovery')).toBeDefined()
-    expect(registered.map(t => t.name)).toEqual(['s2s_peers', 's2s_sessions', 's2s_message', 's2s_resume', 's2s_history', 's2s_schedule'])
+    // NOTE (observed, not assumed): src/index.ts mounts toolsPlugin *before*
+    // digestPlugin, yet `s2s_digest` registers *first* here. The order below is
+    // what this harness actually produces — don't "fix" it to match
+    // src/index.ts. Update this list whenever a tool is added or removed.
+    expect(registered.map(t => t.name)).toEqual(['s2s_digest', 's2s_peers', 's2s_sessions', 's2s_message', 's2s_resume', 's2s_history', 's2s_schedule'])
     await ctx.fiber.dispose()
   })
 })
