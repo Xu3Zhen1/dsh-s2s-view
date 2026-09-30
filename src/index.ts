@@ -14,6 +14,7 @@ import { S2sLifecycleService, type LifecycleConfig } from './lifecycle.ts'
 import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
+import { S2sLedger } from './ledger.ts'
 import * as toolsPlugin from './tools.ts'
 import * as digestPlugin from './digest.ts'
 
@@ -48,8 +49,15 @@ export interface Config {
 /**
  * Mount the s2s core: the in-process broker + session discovery + tools, and
  * (when configured) the lifecycle wake path and the anti-loop budget.
+ *
+ * `config` defaults to `{}`: a bare mount (broker + discovery + tools only) is
+ * a supported shape, and a profile row that declares no `config` block at all
+ * hands `undefined`. Reading `config.lifecycle` then threw
+ * `Cannot read properties of undefined (reading 'lifecycle')`, so the bare
+ * mount this function documents was the one shape that could not mount.
+ * (Upstream fix `v0.4.0-s2s.13`; taken here while 0.2.x support was being added.)
  */
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, config: Config = {}): void {
   ctx.plugin(S2sBroker)
   ctx.plugin(S2sDiscoveryService)
   if (config.lifecycle !== undefined) {
@@ -67,6 +75,23 @@ export function apply(ctx: Context, config: Config): void {
   if (config.schedule !== undefined) {
     ctx.plugin(S2sScheduleService, config.schedule)
   }
+  ctx.plugin(S2sLedger)
+  // Opening is async and `storageDomain` is optional (Q2 allows a self-built
+  // fallback), so a failure must not abort mounting the plugin — the tools are
+  // still useful without a ledger. It must, however, be *loud*: a silently
+  // absent ledger turns every later status read into an invention (G9).
+  void (async function() {
+    const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
+    if (ledger === undefined) return
+    try {
+      await ledger.open()
+    } catch (error: unknown) {
+      ctx.logger.warn(
+        `s2s: the durable ledger could not be opened (${String(error)}); `
+        + 'messages will not be tracked and s2s_status will have nothing to report.',
+      )
+    }
+  })()
   ctx.plugin(toolsPlugin)
   ctx.plugin(digestPlugin)
 }

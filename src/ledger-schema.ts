@@ -173,8 +173,11 @@ export const ledgerDomain = defineDomain({
   name: LEDGER_DOMAIN,
   version: LEDGER_DOMAIN_VERSION,
   tables: {
-    [MESSAGES_TABLE]: domainTable<'msgId', MessageRecord>(messageRecordSchema),
-    [SESSIONS_TABLE]: domainTable<'sessionId', SessionRecord>(sessionRecordSchema),
+    // The phantom key parameter is the **key space**, not one key: passing
+    // `'msgId'` would type every lookup as the literal `"msgId"` and reject real
+    // ids. Caught by `pnpm run typecheck` the moment the ledger used the table.
+    [MESSAGES_TABLE]: domainTable<string, MessageRecord>(messageRecordSchema),
+    [SESSIONS_TABLE]: domainTable<string, SessionRecord>(sessionRecordSchema),
   },
 })
 

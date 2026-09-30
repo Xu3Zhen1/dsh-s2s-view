@@ -14,6 +14,7 @@ export type S2sErrorCode =
   | 'S2S_BUDGET_RATE'
   | 'S2S_BUDGET_MEANINGLESS'
   | 'S2S_INVALID_MESSAGE'
+  | 'S2S_LEDGER'
   | 'S2S_SCHEDULE'
 
 export class S2sError extends HarnessError {

@@ -12,6 +12,7 @@ import type { S2sDiscoveryService, S2sResolveResult, S2sSessionInfo } from './di
 import { S2sLifecycleService } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
+import type { S2sLedger } from './ledger.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -82,8 +83,8 @@ function sameProjectAsCaller(infos: readonly S2sSessionInfo[], exec: unknown): r
   return infos.filter((info) => info.workspaceDir === caller.workspaceDir)
 }
 
-export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService }): ToolDefinition[] {
-  const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule
+export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
+  const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule, ledger = deps.ledger
   const resolve = async function(name: string | undefined, sessionId: string | undefined): Promise<S2sResolveResult | { kind: 'err'; reason: string }> {
     if ((name === undefined || name.length === 0) && (sessionId === undefined || sessionId.length === 0)) {
       return { kind: 'err', reason: 'Provide a name (the session title) or a session_id.' }
@@ -139,6 +140,12 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
         const from = args.from ?? String(exec.agent?.id ?? 'unknown')
         const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+        // Record before delivering: the row must exist for the delivery to
+        // advance it, and a message that is lost mid-flight is exactly the one a
+        // status query later needs to find.
+        if (ledger !== undefined) {
+          await ledger.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+        }
         let warn: string | undefined
         if (budget !== undefined) {
           const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
@@ -146,6 +153,13 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
         }
         if (resolved.state !== 'dormant') {
           const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+          // `absent` means no live agent was there after all — the message was
+          // handed to nobody, so the ledger must keep it `queued`. Marking it
+          // `inboxed` on `absent` would report an acceptance that never happened,
+          // which is exactly the overclaiming invariant I1 forbids.
+          if (ledger !== undefined && state !== 'absent') {
+            await ledger.markInboxed(msgId, resolved.sessionId)
+          }
           return { text: 'Delivered to "' + labelOf(resolved) + '" (state=' + state + ').' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
         }
         if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' }
@@ -250,7 +264,10 @@ export function apply(ctx: Context): void {
   const lifecycle = ctx.get('s2sLifecycle') as S2sLifecycleService | undefined
   const budget = ctx.get('s2sBudget') as S2sBudget | undefined
   const schedule = ctx.get('s2sSchedule') as S2sScheduleService | undefined
-  const disposers = buildTools({ broker: broker, discovery: discovery, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }) }).map(function(d) { return tools.register(d) })
+  // Optional like the others: the tools must still work when no ledger is
+  // mounted, they just cannot report delivery state.
+  const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
+  const disposers = buildTools({ broker: broker, discovery: discovery, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }), ...(ledger === undefined ? {} : { ledger: ledger }) }).map(function(d) { return tools.register(d) })
   ctx.effect(function() { return function() { for (const d of disposers) d() } }, 's2s-tools.disposers')
 }
 
