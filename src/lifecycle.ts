@@ -35,6 +35,26 @@ interface ResumedHandle {
 }
 
 /**
+ * The `setup` runtime contract, which the published type lags.
+ *
+ * `AgentSetup` declares a single `agentCtx` parameter, but the shipping
+ * 0.2.0-rc.2 host hands over the Agent itself as a **second** argument —
+ * verified in the deployed bundle (`resources/app.asar`):
+ *
+ *     setup?.(prepared.agent.ctx, prepared.agent)
+ *
+ * The context alone is not enough: it is the *unpublished* Agent scope, which
+ * carries no scoped Agent, so `agentCtx.get('agent')` yields `undefined`. A
+ * setup that reads only the context cannot compose the Agent at all — measured
+ * on 0.2.0-rc.2, every dormant wake died with
+ * `s2s lifecycle: Agent setup has no scoped Agent`.
+ *
+ * The second parameter is optional so this stays assignable to `AgentSetup`,
+ * which keeps hosts that still pass one argument working.
+ */
+type ScopedAgentSetup = (agentCtx: Context, agent?: Agent) => void | Promise<void>
+
+/**
  * The lifecycle service. Mounted only when a `lifecycle` config block is
  * present, so deployments that never target dormant sessions pay nothing.
  */
@@ -137,7 +157,7 @@ export class S2sLifecycleService extends Service {
    * and call the host's implementation** — two copies drift silently, since
    * nothing here fails to compile when `composeAgent` changes.
    */
-  private async resumedSetup(sessionId: string): Promise<AgentSetup | undefined> {
+  private async resumedSetup(sessionId: string): Promise<ScopedAgentSetup | undefined> {
     const presets = this.ctx.get('agentPresets') as
       | { resolve(id?: string): Promise<{ id: string }>; mount(agentCtx: Context, id?: string): Promise<unknown> }
       | undefined
@@ -152,7 +172,7 @@ export class S2sLifecycleService extends Service {
         's2s lifecycle: no `agentPresets` service in this composition — the resumed session will NOT get its preset '
         + 'layer (tools and prompt sections may be missing). Resuming anyway; install the presets plugin to fix this.',
       )
-      return async (agentCtx: Context) => { this.installSelection(agentCtx) }
+      return async (agentCtx: Context, agent?: Agent) => { this.installSelection(agentCtx, agent) }
     }
     let presetId: string | undefined
     try {
@@ -171,8 +191,8 @@ export class S2sLifecycleService extends Service {
     }
     try {
       const resolvedId = (await presets.resolve(presetId)).id
-      return async (agentCtx: Context) => {
-        this.installSelection(agentCtx)
+      return async (agentCtx: Context, agent?: Agent) => {
+        this.installSelection(agentCtx, agent)
         await presets.mount(agentCtx, resolvedId)
       }
     } catch (error: unknown) {
@@ -182,7 +202,7 @@ export class S2sLifecycleService extends Service {
         `s2s lifecycle: could not resolve/mount preset for "${sessionId}" (${String(error)}); `
         + 'the session resumes WITHOUT its preset layer.',
       )
-      return async (agentCtx: Context) => { this.installSelection(agentCtx) }
+      return async (agentCtx: Context, agent?: Agent) => { this.installSelection(agentCtx, agent) }
     }
   }
 
@@ -193,28 +213,37 @@ export class S2sLifecycleService extends Service {
    * preset mount, which is what made the degradation lopsided.
    *
    * @param agentCtx - the Agent's scoped context, valid only inside `setup`.
+   * @param agent - the Agent the host passes as `setup`'s second argument; the
+   *   scope alone is not enough, because it is still unpublished and therefore
+   *   has no scoped Agent to read.
    */
-  private installSelection(agentCtx: Context): void {
-    // `agentCtx.agent` is NOT a probe: cordis resolves `ctx.<service>` through a
-    // proxy that **throws** `cannot get property "agent" without inject` for a
-    // service the context did not declare, so a defensive `=== undefined` check
-    // never runs — reading the property is itself the failure. `ctx.get` is the
-    // only correct probe for an optional seam.
+  private installSelection(agentCtx: Context, agent: Agent | undefined): void {
+    // The order matters: take the host's explicit second argument first (that is
+    // the 0.2.0-rc.2 contract), and only then fall back to the scope, which
+    // keeps hosts that call `setup(agentCtx)` alone working.
     //
-    // Measured on the desktop host (0.2.0-rc.2): the property read threw, so a
-    // dormant `s2s_resume` failed outright with
-    // `Error: cannot get property "agent" without inject`.
-    const agent = agentCtx.get('agent') as Agent | undefined
+    // The fallback is `ctx.get`, NOT a property read: cordis resolves
+    // `ctx.<service>` through a proxy that **throws** `cannot get property
+    // "agent" without inject` for a service the context did not declare, so a
+    // defensive `=== undefined` check never runs — reading the property is
+    // itself the failure. `ctx.get` is the only correct probe for an optional
+    // seam.
+    //
+    // Measured on the desktop host (0.2.0-rc.2): the property read threw
+    // `Error: cannot get property "agent" without inject`, and after switching
+    // to `ctx.get` the read simply found nothing (this throw) — because the
+    // scope handed to `setup` is unprepared. Hence the second argument.
+    const scoped = agent ?? (agentCtx.get('agent') as Agent | undefined)
     // Fail loud, exactly as the host does: a setup that cannot see its scoped
     // Agent is a broken composition, not a case to pass over. Silent return here
     // would let a half-composed Agent be published — the same class of defect as
     // the missing preset layer (G9: no silent degradation).
-    if (agent === undefined) throw new S2sError('s2s lifecycle: Agent setup has no scoped Agent', 'S2S_LIFECYCLE')
+    if (scoped === undefined) throw new S2sError('s2s lifecycle: Agent setup has no scoped Agent', 'S2S_LIFECYCLE')
     let picked: ModelSelection | undefined
     const selection = {
       get current() {
         if (picked !== undefined) return picked
-        const logged = agent.session.requestHeader()?.config
+        const logged = scoped.session.requestHeader()?.config
         if (logged === undefined) return undefined
         return {
           provider: logged.provider,
@@ -227,7 +256,9 @@ export class S2sLifecycleService extends Service {
       },
       assembled: undefined,
     }
-    installModelSelection(agent.ctx, selection)
+    // The Agent's own scope, not the composition scope: the selection is
+    // Agent-scoped, and the two are the same object in the host's own call.
+    installModelSelection(scoped.ctx, selection)
   }
 
   /**
