@@ -195,7 +195,16 @@ export class S2sLifecycleService extends Service {
    * @param agentCtx - the Agent's scoped context, valid only inside `setup`.
    */
   private installSelection(agentCtx: Context): void {
-    const agent = (agentCtx as Context & { agent?: Agent }).agent
+    // `agentCtx.agent` is NOT a probe: cordis resolves `ctx.<service>` through a
+    // proxy that **throws** `cannot get property "agent" without inject` for a
+    // service the context did not declare, so a defensive `=== undefined` check
+    // never runs — reading the property is itself the failure. `ctx.get` is the
+    // only correct probe for an optional seam.
+    //
+    // Measured on the desktop host (0.2.0-rc.2): the property read threw, so a
+    // dormant `s2s_resume` failed outright with
+    // `Error: cannot get property "agent" without inject`.
+    const agent = agentCtx.get('agent') as Agent | undefined
     // Fail loud, exactly as the host does: a setup that cannot see its scoped
     // Agent is a broken composition, not a case to pass over. Silent return here
     // would let a half-composed Agent be published — the same class of defect as

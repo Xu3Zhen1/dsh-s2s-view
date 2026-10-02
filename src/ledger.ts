@@ -166,6 +166,24 @@ export class S2sLedger extends Service {
   }
 
   /**
+   * Report a ledger operation that failed, **without letting it break the caller**.
+   *
+   * Callers guard their writes with this so an unopened or broken ledger degrades
+   * to "untracked" rather than failing the delivery, while still leaving an
+   * observable trace (G9). It lives here because the service owns its logger.
+   *
+   * @param operation - the ledger method that failed (named in the message).
+   * @param error - the thrown value.
+   */
+  warn(operation: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    this.ctx.logger.warn(
+      `s2s: ledger.${operation}() failed (${message}); `
+      + 'the message is still delivered, but it will not be tracked.',
+    )
+  }
+
+  /**
    * Advance a row to `inboxed`: s2s has handed the message to a **live** agent,
    * which is strictly more than "we accepted it" and strictly less than "it is
    * in the target's log".

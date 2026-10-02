@@ -103,6 +103,33 @@ describe('s2s_message ledger wiring (T6)', () => {
     expect(out.text).toContain('Delivered to')
   })
 
+  it('★ still delivers when the ledger exists but was never opened', async () => {
+    // The real deployment shape that broke: a `storageDomain`-less host still
+    // registers the `S2sLedger` service, so `ledger !== undefined` while every
+    // write throws `used before open()`. Guarding only on `undefined` therefore
+    // missed it and the whole delivery failed. Measured as `s2s_message` →
+    // `Error: s2s ledger: used before open()` with no message ever sent.
+    const root = await mkdtemp(join(tmpdir(), 's2s-t6b-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx) // constructed, deliberately NOT opened
+    const warn = vi.fn()
+    ctx.logger.warn = warn as never
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ broker, discovery, ledger } as any)
+    const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
+
+    const out = await msg.execute({ name: 'a', text: 'x' }, { agent: { id: 'sess-a' } })
+    // Delivery outranks bookkeeping: the message must go out regardless.
+    expect(out.text).toContain('Delivered to')
+    expect(broker.deliver).toHaveBeenCalledTimes(1)
+    // …but the loss of tracking must not be silent (G9).
+    expect(warn).toHaveBeenCalled()
+    expect(String(warn.mock.calls.at(-1)![0])).toContain('ledger')
+    await ctx.fiber.dispose()
+  })
+
   it('keeps `to` as the addressing string the caller wrote', async () => {
     const { ctx, ledger, by } = await harness({ deliver: 'idle' })
     await by('s2s_message').execute({ name: 'some-title', text: 'x' }, { agent: { id: 'sess-a' } })

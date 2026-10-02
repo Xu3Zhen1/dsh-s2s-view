@@ -79,7 +79,12 @@ async function resumeOnce(
   await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'wake', msgId: 'm1' })
   const setup = (resume.mock.calls[0]![0] as { setup?: (c: Context) => unknown }).setup
   // The resumed Agent's scoped ctx carries the Agent (the host's setup contract).
-  const agentCtx = Object.assign(new Context(), { agent })
+  // Provided through a real cordis context, NOT `Object.assign`: cordis resolves
+  // `ctx.agent` via a proxy that throws `cannot get property "agent" without
+  // inject`, so a plain own-property fake would not exercise the same path the
+  // plugin actually takes (and would have hidden the 0.2.x failure).
+  const agentCtx = new Context()
+  agentCtx.provide('agent', agent as never)
   if (setup !== undefined) await setup(agentCtx)
   return { resume, agent, mount, resolve, setup, agentCtx, warn }
 }
@@ -168,5 +173,44 @@ describe('s2s lifecycle wake fidelity (the {{model}} + preset fix)', () => {
     expect(setup).toBeTypeOf('function')
     // A bare Context has no `.agent` accessor value — the host rejects this too.
     await expect(setup!(new Context())).rejects.toThrow('no scoped Agent')
+  })
+
+  it('★ reads the scoped Agent via ctx.get, not by property access', async () => {
+    // cordis resolves `ctx.<service>` through a proxy that THROWS
+    // `cannot get property "agent" without inject` for an undeclared service, so
+    // `if (agentCtx.agent === undefined)` never runs — the read IS the failure.
+    // Measured on the desktop host (0.2.0-rc.2): a dormant `s2s_resume` died with
+    // exactly that error before this was switched to `ctx.get`.
+    //
+    // The installed cordis here is 4.0.1, which does NOT throw on a bare read, so
+    // a plain `new Context()` cannot reproduce it (a first version of this test
+    // passed against the buggy code — a test that proved nothing). The throwing
+    // proxy is therefore simulated explicitly: an own accessor that throws, which
+    // is also how the host shadows `agent` on an Agent's own ctx.
+    const ctx = new Context()
+    ctx.provide('agentPresets', {
+      resolve: async () => ({ id: 'p1' }),
+      mount: async () => ({}),
+    } as never)
+    ctx.provide('sessionQuery', { observeSession: async () => ({ projections: { values: { agentPreset: null } } }) } as never)
+    const resume = vi.fn(async () => ({ agent: makeAgent() }))
+    ctx.provide('agents', { get: () => undefined, resume } as never)
+    await ctx.plugin(s2sApply, { lifecycle: { autoResume: 'allow', mailboxDir: await mkdtemp(join(tmpdir(), 's2s-lm-')) } })
+    const lifecycle = ctx.get('s2sLifecycle') as S2sLifecycleService
+    await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'a', text: 't', msgId: 'm1' })
+    const setup = (resume.mock.calls[0]![0] as { setup?: (c: Context) => unknown }).setup
+
+    // A ctx that throws on `.agent` — the 0.2.x shape with no scoped agent.
+    function throwingCtx(): Context {
+      const c = new Context()
+      Object.defineProperty(c, 'agent', {
+        get() { throw new Error('cannot get property "agent" without inject') },
+        configurable: true,
+      })
+      return c
+    }
+    // The plugin's OWN error must surface, never cordis's proxy error.
+    await expect(setup!(throwingCtx())).rejects.toThrow('no scoped Agent')
+    await expect(setup!(throwingCtx())).rejects.not.toThrow('without inject')
   })
 })

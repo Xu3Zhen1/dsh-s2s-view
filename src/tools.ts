@@ -28,6 +28,39 @@ function labelOf(r: Extract<S2sResolveResult, { kind: 'ok' }>): string {
 }
 
 /**
+ * Run a ledger write **without ever failing the caller**.
+ *
+ * The ledger is optional infrastructure: the plan treats `storageDomain` as
+ * optional (Q2 names a self-built JSON fallback) and the desktop profile mounts
+ * no storage backend at all. When it is absent the `S2sLedger` service still
+ * exists in the context — it simply never opened — so an unguarded `record()`
+ * throws `s2s ledger: used before open()` and **the message is never delivered**.
+ *
+ * That is a measured outage, not a hypothetical: a deployment with no storage
+ * backend turned an optional bookkeeping step into a total delivery failure.
+ * Bookkeeping must never outrank delivery. The failure stays visible (G9: no
+ * silent degradation) through a warning naming the operation, and the caller
+ * proceeds.
+ *
+ * @param ledger - the ledger service, or `undefined` when none is mounted.
+ * @param operation - the ledger method name, for the warning.
+ * @param run - the actual call, invoked only when a ledger is present.
+ */
+async function noteLedger(
+  ledger: S2sLedger | undefined,
+  operation: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (ledger === undefined) return
+  try {
+    await run()
+  } catch (error: unknown) {
+    ledger.warn(operation, error)
+  }
+}
+
+
+/**
  * Short display form of a session id.
  *
  * A real session id is the full `session-<uuid>` string — that exact form is
@@ -143,9 +176,9 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
         // Record before delivering: the row must exist for the delivery to
         // advance it, and a message that is lost mid-flight is exactly the one a
         // status query later needs to find.
-        if (ledger !== undefined) {
-          await ledger.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
-        }
+        await noteLedger(ledger, 'record', function() {
+          return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+        })
         let warn: string | undefined
         if (budget !== undefined) {
           const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
@@ -157,8 +190,8 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
           // handed to nobody, so the ledger must keep it `queued`. Marking it
           // `inboxed` on `absent` would report an acceptance that never happened,
           // which is exactly the overclaiming invariant I1 forbids.
-          if (ledger !== undefined && state !== 'absent') {
-            await ledger.markInboxed(msgId, resolved.sessionId)
+          if (state !== 'absent') {
+            await noteLedger(ledger, 'markInboxed', function() { return ledger!.markInboxed(msgId, resolved.sessionId) })
           }
           return { text: 'Delivered to "' + labelOf(resolved) + '" (state=' + state + ').' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
         }

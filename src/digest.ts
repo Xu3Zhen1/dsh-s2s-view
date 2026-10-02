@@ -101,7 +101,19 @@ interface SessionQueryLike {
 
 /** Structural view of the parts of the session package this view replays. */
 interface SessionModuleLike {
-  create?: (id: string, events: readonly unknown[], header: unknown, inheritedEventCount: unknown) => unknown
+  /**
+   * The `Session` **class**, not a module-level `create`.
+   *
+   * `@deepseek-ai/dsh-session` exports `Session` (with a *static* `create`), plus
+   * `SessionStore` etc. — it has never exported a bare `create`. An earlier
+   * revision probed `mod.create`, which is always `undefined`, so the timeline
+   * column reported "Session.create is not exported by this host revision" on
+   * every host including the 0.1.x ones it was written against. The capability
+   * probe must look where the function actually lives.
+   */
+  Session?: {
+    create?: (id: string, seed: readonly unknown[], header: unknown, inheritedEventCount: unknown) => unknown
+  }
 }
 
 /** The shape `readSession` resolves to, as far as this view reads it. */
@@ -191,19 +203,19 @@ async function timelineCapability(): Promise<TimelineCapability> {
     capability = { read: undefined, reason: `session package not importable: ${messageOf(error)}` }
     return capability
   }
-  if (typeof mod.create !== 'function') {
+  if (typeof mod.Session?.create !== 'function') {
     capability = { read: undefined, reason: 'Session.create is not exported by this host revision' }
     return capability
   }
   try {
-    mod.create('s2s-digest-probe', [], {}, 0)
+    mod.Session.create('s2s-digest-probe', [], {}, 0)
   } catch (error: unknown) {
     if (error instanceof TypeError) {
       capability = { read: undefined, reason: 'Session.create is exported but not callable on this host' }
       return capability
     }
   }
-  const create = mod.create
+  const create = mod.Session.create
   capability = {
     read: async (sessionId: string): Promise<TimelineFact[]> => {
       const log = await readStoredLog(sessionId)
