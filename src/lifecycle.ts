@@ -148,6 +148,11 @@ export class S2sLifecycleService extends Service {
     // stalling it. `s2s_resume` routes live sessions here too, so without this
     // a live target would silently queue with no delivery.
     if (this.ctx.agents.get(SessionId(entry.sessionId)) !== undefined) {
+      // Already live: no resume, therefore no `resumedSetup`, therefore no
+      // preset decision to report. Saying nothing here is what made an external
+      // reviewer see "resumes: none recorded" for a wake that visibly succeeded
+      // — the observation existed, it was just not recorded for this path.
+      this.rememberResume(entry.sessionId, undefined, 'already live: no resume was performed, so no preset was composed')
       await this.drain(entry.sessionId)
       return 'resumed'
     }

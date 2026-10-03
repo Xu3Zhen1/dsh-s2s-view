@@ -215,10 +215,15 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           lines.push('ledger: open (backend=' + String(ledger.backend) + ').')
         }
 
-        // History durability: the process-scoped Map dies with the process, and
-        // a reader who has just restarted cannot tell that from "no messages".
-        lines.push('history: process-scoped only (not durable across restarts); the last restart empties it. '
-          + 'A durable read path requires the ledger to be open.')
+        // History durability: T11 gave history a durable read path, so the old
+        // flat "process-scoped only" claim is no longer true and must not be
+        // printed. What matters now is *which* source can answer.
+        const ledgerAnswers = ledger !== undefined && ledger.isOpen
+        lines.push('history: ' + (ledgerAnswers
+          ? 'durable read path ACTIVE on both sources (ledger + the target\'s session log).'
+          : 'the ledger cannot answer (not open), so history falls back to the TARGET\'S SESSION LOG — '
+            + 'still durable across restarts, but only for deliveries whose header landed in that log.')
+          + ' The in-process buffer is process-scoped and a restart clears it; it is a last resort, not the read path.')
 
         // Resume reports: the G9 discriminator that used to exist only in the
         // logger. This is the read-back that makes it externally checkable.

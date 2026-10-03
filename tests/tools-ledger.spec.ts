@@ -12,7 +12,14 @@ import { S2sLedger } from '../src/ledger.ts'
 type Tool = { name: string; execute: (args: any, exec: any) => Promise<{ text: string }> | { text: string } }
 
 const dirs: string[] = []
+const disposers: Array<() => Promise<void>> = []
 afterEach(async () => {
+  // Close ledgers BEFORE removing their directories: an open sqlite handle makes
+  // `rm` fail with EBUSY, which surfaces as a red test pointing at cleanup
+  // rather than at the code under test.
+  for (const dispose of disposers.splice(0)) {
+    try { await dispose() } catch { /* cleanup must not mask the real result */ }
+  }
   for (const dir of dirs.splice(0)) {
     await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
@@ -30,6 +37,7 @@ async function harness(opts: { deliver?: 'idle' | 'busy' | 'absent' } = {}) {
   ctx.provide('storageDomain', facility as never)
   const ledger = new S2sLedger(ctx)
   await ledger.open()
+  disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
 
   const broker = {
     deliver: vi.fn(() => (opts.deliver ?? 'idle') as 'idle' | 'busy' | 'absent'),
@@ -69,7 +77,6 @@ describe('s2s_status (T10)', () => {
     const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('ledger: open')
     expect(out.text).toContain('backend=storage-domain')
-    await ctx.fiber.dispose()
   })
 
   it('★ declares that history is not durable across restarts', async () => {
@@ -78,16 +85,38 @@ describe('s2s_status (T10)', () => {
     // unless the tool says so out loud.
     const { ctx, by } = await harness({ deliver: 'idle' })
     const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
-    expect(out.text).toContain('process-scoped')
-    expect(out.text).toContain('not durable across restarts')
+    // T11 made history durable; the line must reflect WHICH source answers
+    // rather than repeating the obsolete "process-scoped only" claim. This
+    // harness HAS an open ledger, so both sources are live.
+    expect(out.text).toContain('durable read path ACTIVE')
+    expect(out.text).toContain('last resort, not the read path')
+    expect(out.text).not.toContain('history: process-scoped only')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ names the session-log fallback when the ledger cannot answer (T11)', async () => {
+    // The deployment shape that produced the user-reported symptom: no
+    // `storageDomain`, so the ledger is mounted but never opens. The status line
+    // must say the log fallback carries the read path, not that history is lost.
+    const root = await mkdtemp(join(tmpdir(), 's2s-status-noledger-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx) // constructed, deliberately NOT opened
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('falls back to the TARGET\'S SESSION LOG')
+    expect(out.text).toContain('durable across restarts')
     await ctx.fiber.dispose()
   })
 
   it('says lifecycle is not configured rather than omitting the section', async () => {
-    const { ctx, by } = await harness({ deliver: 'idle' })
+    const { by } = await harness({ deliver: 'idle' })
     const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('lifecycle not configured')
-    await ctx.fiber.dispose()
   })
 })
 

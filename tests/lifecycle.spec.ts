@@ -144,6 +144,22 @@ describe('s2s lifecycle', () => {
     expect(await lifecycle.queuedCount('sess-1')).toBe(0) // no leftover
   })
 
+  it('★ records WHY no preset was composed when the target was already live (T10)', async () => {
+    // Found on the running host: this path returns before `resumedSetup`, so the
+    // preset decision is never made — and before this fix nothing was recorded
+    // either, so `s2s_status` printed "resumes: none recorded in this process"
+    // for a wake that had visibly succeeded. An observation that exists but is
+    // never recorded is indistinguishable from no observation at all.
+    const { lifecycle, setLive } = await harness('allow')
+    setLive(true)
+    await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'hi', msgId: 'm1' })
+
+    const report = lifecycle.resumeReport('sess-1')
+    expect(report).toBeDefined()
+    expect(report!.preset).toBeUndefined()
+    expect(String(report!.presetUnavailableReason)).toContain('already live')
+  })
+
   it('rejects unsafe session ids loud', async () => {
     const { lifecycle } = await harness('deny')
     await expect(lifecycle.queueForDormant({ sessionId: '../evil', from: 'a', text: 't', msgId: 'm' })).rejects.toThrow(/unsafe/)
