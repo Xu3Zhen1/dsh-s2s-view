@@ -19,7 +19,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { S2sError } from './error.ts'
-import { readSessionLog } from './history.ts'
+import { readSessionLog, type HistoryEntry } from './history.ts'
 import {
   LEDGER_LIMITS,
   MESSAGES_TABLE,
@@ -100,6 +100,13 @@ export interface S2sLedgerQuery {
 /** Where the ledger's bytes actually live, for honest reporting in tool output. */
 export type S2sLedgerBackend = 'storage-domain'
 
+/** One cached log read, with the instant it was taken. */
+interface LogCacheEntry {
+  readonly at: number
+  /** `undefined` encodes "the read failed" — a negative result, cached too. */
+  readonly entries: readonly HistoryEntry[] | undefined
+}
+
 /** What one `reconcile()` pass over a target's log changed (and could not). */
 export interface ReconcileResult {
   readonly sessionId: string
@@ -121,9 +128,35 @@ export class S2sLedger extends Service {
    * it. The absence is surfaced in `open()` instead.
    */
   private domain: Domain<typeof ledgerDomain> | undefined
+  /**
+   * Per-session cache of the last log read, bounded by
+   * `LEDGER_LIMITS.reconcileTtlMs`.
+   *
+   * Reconciling means decoding a target's whole log, and a status read can be
+   * asked repeatedly in a short window; without this, one slow session costs a
+   * full decode per question. The **negative** result is cached too: a target
+   * whose log cannot be read must not be re-read (and re-warned) on every pass.
+   */
+  private readonly logCache = new Map<string, LogCacheEntry>()
 
   constructor(ctx: Context) {
     super(ctx, 's2sLedger')
+  }
+
+  /**
+   * Drop cached log reads so the next `reconcile()` sees the real thing.
+   *
+   * This matters because the cache holds a *read*: right after delivering to a
+   * session, a cached read taken moments earlier does not contain the new
+   * message, and reconciling against it would report "not landed" for a
+   * delivery that is in fact there. Callers invalidate on delivery rather than
+   * waiting the TTL out.
+   *
+   * @param sessionId - one session, or every session when omitted.
+   */
+  invalidateLogCache(sessionId?: string): void {
+    if (sessionId === undefined) this.logCache.clear()
+    else this.logCache.delete(sessionId)
   }
 
   /** The backing store in use, or `undefined` before a successful `open()`. */
@@ -273,6 +306,9 @@ export class S2sLedger extends Service {
       resolvedSessionId,
       updatedAt: Date.now(),
     })
+    // The target's log has just gained (or is about to gain) this delivery, so
+    // any cached read of it is stale by construction.
+    this.invalidateLogCache(resolvedSessionId)
   }
 
   /**
@@ -298,12 +334,27 @@ export class S2sLedger extends Service {
    *
    * @param sessionId - the target whose log to reconcile against.
    * @param opts.now - injectable clock, so tests can pin times.
+   * @param opts.useCache - honour the per-session read cache (default true);
+   *   pass `false` to force a fresh read.
    * @returns what changed, and what could not be read.
    */
-  async reconcile(sessionId: string, opts: { now?: number } = {}): Promise<ReconcileResult> {
+  async reconcile(sessionId: string, opts: { now?: number; useCache?: boolean } = {}): Promise<ReconcileResult> {
     const domain = this.opened()
     const now = opts.now ?? Date.now()
-    const entries = await readSessionLog(this.ctx, sessionId, LEDGER_LIMITS.reconcileTtlMs)
+    const useCache = opts.useCache !== false
+    const cached = useCache ? this.logCache.get(sessionId) : undefined
+    // A cached entry is only usable while it is fresh. Note this caches the
+    // **read**, not the decision, and a *failed* read is cached for far less
+    // time: a log that was momentarily unreadable usually becomes readable
+    // again quickly, and caching the failure for the full TTL would make the
+    // gap self-perpetuating (the row would keep its stale `inboxed` status
+    // purely because nobody looked again).
+    const ttl = cached?.entries === undefined
+      ? Math.min(LEDGER_LIMITS.reconcileTtlMs, LEDGER_LIMITS.reconcileFailureTtlMs)
+      : LEDGER_LIMITS.reconcileTtlMs
+    const fresh = cached !== undefined && now - cached.at < ttl
+    const entries = fresh ? cached.entries : await readSessionLog(this.ctx, sessionId, LEDGER_LIMITS.reconcileTtlMs)
+    if (!fresh) this.logCache.set(sessionId, { at: now, entries })
     const unreadable = entries === undefined
     let examined = 0
     let landed = 0

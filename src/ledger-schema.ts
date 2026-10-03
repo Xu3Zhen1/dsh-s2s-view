@@ -67,6 +67,14 @@ export const LEDGER_LIMITS = {
   retentionRows: 10000,
   /** TTL for a `reconcile()` log read. */
   reconcileTtlMs: 5000,
+  /**
+   * Shorter TTL for a reconcile read that **failed**.
+   *
+   * A momentarily unreadable log usually recovers quickly; caching the failure
+   * for the full `reconcileTtlMs` would keep the row at a stale `inboxed` purely
+   * because nobody looked again — the gap would sustain itself.
+   */
+  reconcileFailureTtlMs: 500,
   /** Sessions reconciled in one request. */
   maxSessionsPerRequest: 8,
   /** Fallback thaw for a handover gate left frozen by a crashed roll. */

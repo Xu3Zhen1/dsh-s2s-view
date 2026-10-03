@@ -188,10 +188,15 @@ describe('ledger domain spec (T4)', () => {
       retentionDays: 30,
       retentionRows: 10000,
       reconcileTtlMs: 5000,
+      // Deliberately far shorter than `reconcileTtlMs`: a failed log read must
+      // not stay cached long enough for the gap to sustain itself.
+      reconcileFailureTtlMs: 500,
       maxSessionsPerRequest: 8,
       rollTimeoutMs: 600000,
       textMaxChars: 8000,
       nextAttemptAtClampMs: 24 * 60 * 60 * 1000,
     })
+    // The invariant behind the shorter failure TTL, asserted rather than implied.
+    expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBeLessThan(LEDGER_LIMITS.reconcileTtlMs)
   })
 })

@@ -7,7 +7,7 @@ import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import * as sqliteStorage from '@deepseek-ai/dsh-storage-sqlite'
 import { S2sLedger } from '../src/ledger.ts'
-import { TERMINAL_STATUSES } from '../src/ledger-schema.ts'
+import { LEDGER_LIMITS, TERMINAL_STATUSES } from '../src/ledger-schema.ts'
 
 /**
  * T7: reconcile advances a row to `landed` by reading the **target's log**.
@@ -139,7 +139,10 @@ describe('S2sLedger.reconcile (T7)', () => {
     expect((await ledger.get('m-1'))!.unreadableSince).not.toBeNull()
 
     control.fails = false // the log is readable now, and holds the record
-    await ledger.reconcile('sess-1')
+    // Step past the (short) failure TTL: a failed read is cached briefly so a
+    // broken target is not re-read every pass, but not so long that the gap
+    // sustains itself.
+    await ledger.reconcile('sess-1', { now: Date.now() + LEDGER_LIMITS.reconcileFailureTtlMs + 1 })
 
     const row = await ledger.get('m-1')
     expect(row!.status).toBe('landed')
@@ -208,5 +211,133 @@ describe('S2sLedger.reconcile (T7)', () => {
     await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'x' })
     // Never delivered: `resolvedSessionId` stays null.
     expect((await ledger.reconcile('sess-1')).examined).toBe(0)
+  })
+})
+
+describe('reconcile log cache (T8)', () => {
+  it('★ does not re-read the log within the TTL', async () => {
+    // Reconciling decodes a whole log, and a status read can be asked repeatedly
+    // in a short window; without the cache one slow session costs a full decode
+    // per question.
+    let reads = 0
+    const root = await mkdtemp(join(tmpdir(), 's2s-cache-'))
+    dirs.push(root)
+    const { ledger, ctx } = await harness({ events: [s2sRecord(1, 'm-1')] })
+    // Count reads by wrapping the provider's own function.
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'x' })
+    await ledger.markInboxed('m-1', 'sess-1') // invalidates once, by design
+    const baseline = reads
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 1000 })
+
+    expect(reads - baseline).toBe(1) // second pass served from cache
+  })
+
+  it('re-reads once the TTL has elapsed', async () => {
+    let reads = 0
+    const { ledger, ctx } = await harness({ events: [s2sRecord(1, 'm-1')] })
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    const afterFirst = reads
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + LEDGER_LIMITS.reconcileTtlMs + 1 })
+
+    expect(reads - afterFirst).toBe(1)
+  })
+
+  it('useCache=false forces a fresh read', async () => {
+    let reads = 0
+    const { ledger, ctx } = await harness({ events: [s2sRecord(1, 'm-1')] })
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    const afterFirst = reads
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 1, useCache: false })
+
+    expect(reads - afterFirst).toBe(1)
+  })
+
+  it('★ caches the NEGATIVE result too (a broken log is not re-read every pass)', async () => {
+    // Caching only successes would make an unreadable target the most expensive
+    // case: every pass would re-read it and re-warn. A failed read is cached for
+    // a SHORTER window than a successful one (see `reconcileFailureTtlMs`), so
+    // the gap does not sustain itself.
+    let reads = 0
+    const { ledger, ctx } = await harness({ readFails: true })
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    const first = await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    const afterFirst = reads
+    const second = await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 100 })
+
+    expect(first.unreadable).toBe(true)
+    expect(second.unreadable).toBe(true)
+    expect(reads - afterFirst).toBe(0) // within the failure TTL: served from cache
+
+    // Past the (short) failure TTL it tries again rather than staying stuck.
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + LEDGER_LIMITS.reconcileFailureTtlMs + 1 })
+    expect(reads - afterFirst).toBe(1)
+  })
+
+  it('★ markInboxed invalidates the cache so a fresh delivery is not masked', async () => {
+    // The cache holds a READ. Right after delivering, a read taken moments
+    // earlier does not contain the new message, and reconciling against it would
+    // report "not landed" for a delivery that is in fact there.
+    const control = { fails: false, events: [s2sRecord(1, 'm-1')] as readonly unknown[] }
+    const { ledger } = await harness({ control })
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 }) // prime the cache
+
+    // A new delivery appears in the log, then s2s records it.
+    control.events = [s2sRecord(1, 'm-1'), s2sRecord(2, 'm-2')]
+    await ledger.record({ msgId: 'm-2', from: 'alice', to: 'sess-1', text: 'y' })
+    await ledger.markInboxed('m-2', 'sess-1')
+
+    // Within the same TTL window: the invalidation, not the clock, is what makes
+    // m-2 visible.
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 100 })
+
+    expect((await ledger.get('m-2'))!.status).toBe('landed')
+    expect((await ledger.get('m-2'))!.landedSeq).toBe(2)
+  })
+
+  it('invalidateLogCache(sessionId) and () both work', async () => {
+    let reads = 0
+    const { ledger, ctx } = await harness({ events: [s2sRecord(1, 'm-1')] })
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    ledger.invalidateLogCache('sess-1')
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 1 })
+    const afterOne = reads
+    ledger.invalidateLogCache()
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 + 2 })
+
+    expect(afterOne).toBe(2) // primed + re-read after the targeted invalidation
+    expect(reads).toBe(3) // and again after the global one
+  })
+
+  it('caches per session, not globally', async () => {
+    let reads = 0
+    const { ledger, ctx } = await harness({ events: [s2sRecord(1, 'm-1')] })
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.reconcile('sess-1', { now: 1_700_000_000_000 })
+    await ledger.reconcile('sess-2', { now: 1_700_000_000_000 + 1 })
+
+    expect(reads).toBe(2) // one read per distinct session
   })
 })
