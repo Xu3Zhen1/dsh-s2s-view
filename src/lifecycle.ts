@@ -36,6 +36,40 @@ interface ResumedHandle {
 }
 
 /**
+ * What the last resume of one session actually composed.
+ *
+ * The three trace branches in `resumedSetup` write to the **logger**, and a
+ * logger is not a durable artifact on this host: the session transcript keeps
+ * only `{type,seq,time,data}` records, `~/.dsh` has no host log directory, and
+ * the mailbox is empty once a wake drains. An external reviewer therefore had
+ * no way to tell "restored its own preset" from "silently got the deployment
+ * default" — the information existed only inside the running process.
+ *
+ * This record is that information, kept where a tool can read it back
+ * (`s2s_status`), so the observation survives the call that produced it.
+ */
+export interface ResumePresetReport {
+  /** The preset id recorded for the session, or `undefined` when none was. */
+  readonly recorded: string | undefined
+  /** The preset id actually mounted. */
+  readonly mounted: string
+  /** True when `mounted !== recorded` — the default stood in for the record. */
+  readonly substituted: boolean
+  /** Text of the trace that was emitted, for one-glance comparison. */
+  readonly detail: string
+}
+
+/** The last resume this process performed for one session. */
+export interface ResumeReport {
+  readonly sessionId: string
+  readonly at: number
+  /** `undefined` when the preset service was missing or resolve/mount failed. */
+  readonly preset: ResumePresetReport | undefined
+  /** Why the preset half is absent, when it is. */
+  readonly presetUnavailableReason?: string
+}
+
+/**
  * The `setup` runtime contract, which the published type lags.
  *
  * `AgentSetup` declares a single `agentCtx` parameter, but the shipping
@@ -62,10 +96,19 @@ type ScopedAgentSetup = (agentCtx: Context, agent?: Agent) => void | Promise<voi
 export class S2sLifecycleService extends Service {
   static inject = ['agents']
 
+  /** How many sessions' resume reports to keep (oldest dropped first). */
+  private static readonly RESUME_REPORT_LIMIT = 200
+
   private readonly config: LifecycleConfig
   private readonly mailbox: S2sMailbox
   /** Resumed handles are kept alive for the process lifetime (see OQ-5). */
   private readonly resumed = new Map<string, ResumedHandle>()
+  /**
+   * What the last resume composed, per session, for `s2s_status` to read back.
+   * Bounded like the mailbox: a wake is rare and this is a diagnostic, so the
+   * oldest entry is dropped rather than growing without limit.
+   */
+  private readonly resumeReports = new Map<string, ResumeReport>()
   private readonly offCreated: () => void
 
   constructor(ctx: Context, config: LifecycleConfig = {}) {
@@ -173,6 +216,7 @@ export class S2sLifecycleService extends Service {
         's2s lifecycle: no `agentPresets` service in this composition — the resumed session will NOT get its preset '
         + 'layer (tools and prompt sections may be missing). Resuming anyway; install the presets plugin to fix this.',
       )
+      this.rememberResume(sessionId, undefined, 'no `agentPresets` service in this composition')
       return async (agentCtx: Context, agent?: Agent) => { this.installSelection(agentCtx, agent) }
     }
     let presetId: string | undefined
@@ -216,6 +260,19 @@ export class S2sLifecycleService extends Service {
           `s2s lifecycle: resuming "${sessionId}" with its recorded agent preset "${resolvedId}".`,
         )
       }
+      // Same discriminator, in a form that outlives the process: the logger
+      // above is unreadable after the fact on this host, so `s2s_status` reads
+      // this instead.
+      this.rememberResume(sessionId, {
+        recorded: presetId,
+        mounted: resolvedId,
+        substituted: presetId !== undefined && resolvedId !== presetId,
+        detail: presetId === undefined
+          ? `no recorded preset; mounted the deployment default "${resolvedId}"`
+          : resolvedId !== presetId
+            ? `recorded "${presetId}" but mounted "${resolvedId}" (substituted)`
+            : `mounted its recorded preset "${resolvedId}"`,
+      })
       return async (agentCtx: Context, agent?: Agent) => {
         this.installSelection(agentCtx, agent)
         await presets.mount(agentCtx, resolvedId)
@@ -229,6 +286,44 @@ export class S2sLifecycleService extends Service {
       )
       return async (agentCtx: Context, agent?: Agent) => { this.installSelection(agentCtx, agent) }
     }
+  }
+
+  /**
+   * Record what the last resume composed, for `s2s_status` to read back later.
+   *
+   * This exists because the trace it mirrors goes to the logger, and a logger
+   * leaves nothing an outside reader can inspect on this host. Keeping it here
+   * — next to the resume that produced it — is what turns "the layer was
+   * present" into "the layer was *this* preset", which is exactly the question
+   * an adversarial review could not answer.
+   *
+   * @param sessionId - the session that was resumed.
+   * @param preset - the preset outcome, or `undefined` when none applied.
+   * @param unavailableReason - why the preset half is missing, when it is.
+   */
+  private rememberResume(sessionId: string, preset: ResumePresetReport | undefined, unavailableReason?: string): void {
+    // Bounded like the mailbox: wakes are rare and this is diagnostic state, so
+    // drop the oldest rather than growing without limit.
+    if (this.resumeReports.size >= S2sLifecycleService.RESUME_REPORT_LIMIT) {
+      const oldest = this.resumeReports.keys().next()
+      if (oldest.done !== true) this.resumeReports.delete(oldest.value)
+    }
+    this.resumeReports.set(sessionId, {
+      sessionId,
+      at: Date.now(),
+      preset,
+      ...(unavailableReason === undefined ? {} : { presetUnavailableReason: unavailableReason }),
+    })
+  }
+
+  /** The last resume report for one session, or `undefined` if never resumed. */
+  resumeReport(sessionId: string): ResumeReport | undefined {
+    return this.resumeReports.get(sessionId)
+  }
+
+  /** Every resume report still remembered, newest first. */
+  resumeReports_(): ResumeReport[] {
+    return [...this.resumeReports.values()].sort((a, b) => b.at - a.at)
   }
 
   /**

@@ -44,6 +44,53 @@ async function harness(opts: { deliver?: 'idle' | 'busy' | 'absent' } = {}) {
   return { ctx, ledger, by, broker, discovery }
 }
 
+describe('s2s_status (T10)', () => {
+  it('★ says the ledger is mounted-but-not-open instead of looking empty', async () => {
+    // The real `storageDomain`-less deployment: `ledger !== undefined` while
+    // never opened. Before T10 a reader saw empty history and had no way to tell
+    // "nothing was ever tracked" from "tracking is silently off".
+    const root = await mkdtemp(join(tmpdir(), 's2s-status-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx) // constructed, deliberately NOT opened
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('mounted but NOT OPEN')
+    expect(out.text).toContain('storageDomain')
+    await ctx.fiber.dispose()
+  })
+
+  it('reports the ledger as open and its backend when it is', async () => {
+    const { ctx, by } = await harness({ deliver: 'idle' })
+    const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('ledger: open')
+    expect(out.text).toContain('backend=storage-domain')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ declares that history is not durable across restarts', async () => {
+    // The user-visible symptom this addresses: after a restart `s2s_history`
+    // shows nothing, which is indistinguishable from "no messages ever sent"
+    // unless the tool says so out loud.
+    const { ctx, by } = await harness({ deliver: 'idle' })
+    const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('process-scoped')
+    expect(out.text).toContain('not durable across restarts')
+    await ctx.fiber.dispose()
+  })
+
+  it('says lifecycle is not configured rather than omitting the section', async () => {
+    const { ctx, by } = await harness({ deliver: 'idle' })
+    const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('lifecycle not configured')
+    await ctx.fiber.dispose()
+  })
+})
+
 describe('s2s_message ledger wiring (T6)', () => {
   it('records a delivered message and advances it to inboxed', async () => {
     const { ctx, ledger, by } = await harness({ deliver: 'idle' })

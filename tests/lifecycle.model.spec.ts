@@ -276,4 +276,37 @@ describe('s2s lifecycle wake fidelity (the {{model}} + preset fix)', () => {
     const trace = info.mock.calls.map((c) => String(c[0])).join('\n')
     expect(trace).toContain('ops-default')
   })
+
+  it('★ keeps the same discriminator where a tool can read it back (T10)', async () => {
+    // The traces above go to the logger, and on this host a logger leaves
+    // nothing an outside reader can inspect: the transcript keeps no logger
+    // output, `~/.dsh` has no host log directory, and a drained mailbox is
+    // empty. So the identical discriminator is recorded on the service for
+    // `s2s_status` to read after the fact. Verified: reading it back needs no
+    // logger at all.
+    const { lifecycle } = await resumeOnce(
+      { provider: 'p', model: 'm' },
+      { presetId: 'ops-default', resolveTo: 'fallback-preset' },
+    )
+    const report = lifecycle.resumeReport('sess-1')
+    expect(report).toBeDefined()
+    expect(report!.preset).toMatchObject({ recorded: 'ops-default', mounted: 'fallback-preset', substituted: true })
+    expect(report!.preset!.detail).toContain('fallback-preset')
+  })
+
+  it('records an as-recorded resume as NOT substituted (T10)', async () => {
+    // The positive case must be as readable as the alarming one, or "no warning
+    // in the log" stays the only evidence that nothing was replaced.
+    const { lifecycle } = await resumeOnce({ provider: 'p', model: 'm' }, { presetId: 'ops-default' })
+    const report = lifecycle.resumeReport('sess-1')
+    expect(report!.preset).toMatchObject({ recorded: 'ops-default', mounted: 'ops-default', substituted: false })
+    expect(lifecycle.resumeReports_()).toHaveLength(1)
+  })
+
+  it('records why the preset half is missing when no preset service is mounted (T10)', async () => {
+    const { lifecycle } = await resumeOnce({ provider: 'p', model: 'm' }, { presetsAbsent: true })
+    const report = lifecycle.resumeReport('sess-1')
+    expect(report!.preset).toBeUndefined()
+    expect(String(report!.presetUnavailableReason)).toContain('agentPresets')
+  })
 })

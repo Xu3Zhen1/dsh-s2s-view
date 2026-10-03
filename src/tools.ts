@@ -193,6 +193,67 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
       },
     }),
     defineTool({
+      name: 's2s_status',
+      description: 'Report what s2s knows about itself: ledger backend and whether it opened, per-session queue depth, the last resume\'s preset outcome, and whether history is durable. Use it to tell a real degradation from a silent one.',
+      parameters: {
+        session_id: { type: 'string', description: 'Optional: restrict the per-session sections to one session id.' },
+      },
+      output: OUTPUT,
+      execute: async function(args) {
+        const lines: string[] = []
+
+        // Ledger: the single most load-bearing optional dependency. Its absence
+        // must be stated as a fact, not left to be inferred from empty results.
+        if (ledger === undefined) {
+          lines.push('ledger: NOT MOUNTED — nothing is being tracked durably.')
+        } else if (!ledger.isOpen) {
+          lines.push('ledger: mounted but NOT OPEN — every write degrades to "untracked" (bookkeeping never blocks delivery). '
+            + 'Cause: no `storageDomain` service (or its open failed). s2s_status/history have nothing durable to read.')
+        } else {
+          lines.push('ledger: open (backend=' + String(ledger.backend) + ').')
+        }
+
+        // History durability: the process-scoped Map dies with the process, and
+        // a reader who has just restarted cannot tell that from "no messages".
+        lines.push('history: process-scoped only (not durable across restarts); the last restart empties it. '
+          + 'A durable read path requires the ledger to be open.')
+
+        // Resume reports: the G9 discriminator that used to exist only in the
+        // logger. This is the read-back that makes it externally checkable.
+        const reports = lifecycle === undefined
+          ? []
+          : (args.session_id === undefined ? lifecycle.resumeReports_() : [lifecycle.resumeReport(args.session_id)].filter(function(r) { return r !== undefined }))
+        if (lifecycle === undefined) {
+          lines.push('resumes: lifecycle not configured — dormant wakes are unavailable.')
+        } else if (reports.length === 0) {
+          lines.push('resumes: none recorded in this process.')
+        } else {
+          lines.push('resumes: ' + reports.length + ' recorded in this process (newest first):')
+          for (const r of reports) {
+            const when = new Date(r.at).toISOString()
+            const preset = r.preset === undefined
+              ? 'preset=NOT APPLIED (' + (r.presetUnavailableReason ?? 'unknown reason') + ')'
+              : 'preset=' + (r.preset.substituted ? 'SUBSTITUTED' : 'as-recorded') + ' [' + r.preset.detail + ']'
+            lines.push('  ' + r.sessionId + '  at=' + when + '  ' + preset)
+          }
+        }
+
+        // Queue depth is the one per-session number that needs no ledger: the
+        // mailbox is on disk, so it is honest even on a storage-less host.
+        if (lifecycle !== undefined) {
+          const targets = args.session_id === undefined
+            ? [...new Set(reports.map(function(r) { return r.sessionId }))]
+            : [args.session_id]
+          for (const id of targets) {
+            const queued = await lifecycle.queuedCount(id)
+            lines.push('queue: ' + id + ' = ' + queued + ' message(s) waiting.')
+          }
+        }
+
+        return { text: lines.join('\n') }
+      },
+    }),
+    defineTool({
       name: 's2s_history',
       description: 'Recent messages for a session (process-scoped, not durable across restarts). Address by name or session_id.',
       parameters: {
