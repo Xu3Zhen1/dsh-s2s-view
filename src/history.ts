@@ -41,6 +41,13 @@ export interface HistoryEntry {
   readonly preview: string
   /** Which source produced this entry. Never inferred — always recorded. */
   readonly source: 'ledger' | 'session-log' | 'memory'
+  /**
+   * The log record's `seq`, when this came from a session log.
+   *
+   * Carried (not displayed) because the ledger's `landedSeq` contract *is* this
+   * number: `reconcile` reads a log through this same parser and writes it back.
+   */
+  readonly seq?: number
 }
 
 /** The merged result, plus what the reader must know to trust it. */
@@ -93,12 +100,22 @@ function timeOf(iso: string | undefined): number | undefined {
  * delivered message regardless of whether any storage backend is mounted, so it
  * is the only source that survives a restart in a storage-less deployment.
  *
+ * This is also the primitive `reconcile` uses to advance a row to `landed`: the
+ * ledger's contract is "the `seq` of the target-log `user/message` that matched
+ * this `msgId`", so the `seq` is returned rather than discarded. One parser, so
+ * history and reconcile can never disagree about what a landed delivery is.
+ *
  * @param ctx - context carrying `sessionQuery` (optional infrastructure).
  * @param sessionId - the session whose log to read (the **target**).
- * @returns entries found, newest first, or `undefined` when the read failed
- *   (so the caller can report "could not read" rather than "nothing there").
+ * @param timeoutMs - bound on the read; a slow session must not stall a caller.
+ * @returns entries found, or `undefined` when the read failed (so the caller can
+ *   report "could not read" rather than "nothing there").
  */
-async function readSessionLog(ctx: Context, sessionId: string): Promise<HistoryEntry[] | undefined> {
+export async function readSessionLog(
+  ctx: Context,
+  sessionId: string,
+  timeoutMs = READ_TIMEOUT_MS,
+): Promise<HistoryEntry[] | undefined> {
   const query = ctx.get('sessionQuery') as
     | { readSession(id: string): Promise<unknown> }
     | undefined
@@ -109,7 +126,7 @@ async function readSessionLog(ctx: Context, sessionId: string): Promise<HistoryE
     record = await Promise.race([
       query.readSession(sessionId),
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => { reject(new Error(`timed out after ${READ_TIMEOUT_MS}ms`)) }, READ_TIMEOUT_MS)
+        timer = setTimeout(() => { reject(new Error(`timed out after ${timeoutMs}ms`)) }, timeoutMs)
       }),
     ])
   } catch (error: unknown) {
@@ -145,6 +162,7 @@ async function readSessionLog(ctx: Context, sessionId: string): Promise<HistoryE
       at: timeOf(fields.at) ?? (typeof event.time === 'number' ? event.time : 0),
       ...(fields.replyTo === undefined || fields.replyTo === '-' ? {} : { replyTo: fields.replyTo }),
       preview: (body.length > 0 ? body : (lines[0] ?? '')).slice(0, 160),
+      ...(typeof event.seq === 'number' ? { seq: event.seq } : {}),
       source: 'session-log',
     })
     if (out.length >= LOG_SCAN_LIMIT) break

@@ -19,6 +19,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { S2sError } from './error.ts'
+import { readSessionLog } from './history.ts'
 import {
   LEDGER_LIMITS,
   MESSAGES_TABLE,
@@ -98,6 +99,19 @@ export interface S2sLedgerQuery {
 
 /** Where the ledger's bytes actually live, for honest reporting in tool output. */
 export type S2sLedgerBackend = 'storage-domain'
+
+/** What one `reconcile()` pass over a target's log changed (and could not). */
+export interface ReconcileResult {
+  readonly sessionId: string
+  /** Rows belonging to this target that were eligible for landing. */
+  readonly examined: number
+  /** Rows advanced to `landed` with a `landedSeq`. */
+  readonly landed: number
+  /** True when the target's log could not be read at all. */
+  readonly unreadable: boolean
+  /** Deliveries visible in the log, when it was readable. */
+  readonly seenInLog?: number
+}
 
 export class S2sLedger extends Service {
   /**
@@ -259,6 +273,85 @@ export class S2sLedger extends Service {
       resolvedSessionId,
       updatedAt: Date.now(),
     })
+  }
+
+  /**
+   * Reconcile tracked rows against the **target's log**: a delivery that s2s
+   * handed over is not yet "delivered" in the only sense the plan accepts — the
+   * truth of a delivery is the target session's log (`inboxed` is our side of
+   * the story, `landed` is the target's).
+   *
+   * `landedSeq` is defined in the schema as *the `seq` of the target-log
+   * `user/message` that matched this `msgId`*, so this reads the log through the
+   * **same parser `s2s_history` uses** (`readSessionLog`) rather than a second
+   * implementation: history renders those records, this advances rows by them,
+   * and one parser means the two cannot disagree about what landed means.
+   *
+   * Only rows that could plausibly have landed are examined: already-`landed`/
+   * `consumed` and terminal rows are skipped, and a row without a recorded
+   * `resolvedSessionId` has no log to read. Progress is **monotonic** — this
+   * never walks a row backwards, and never revives a terminal one.
+   *
+   * A log that cannot be read is reported, not silently treated as "nothing
+   * landed": `unreadableSince` is stamped so a caller can apply the
+   * `landedDeadlineMs` deadline, and it is cleared on a successful read.
+   *
+   * @param sessionId - the target whose log to reconcile against.
+   * @param opts.now - injectable clock, so tests can pin times.
+   * @returns what changed, and what could not be read.
+   */
+  async reconcile(sessionId: string, opts: { now?: number } = {}): Promise<ReconcileResult> {
+    const domain = this.opened()
+    const now = opts.now ?? Date.now()
+    const entries = await readSessionLog(this.ctx, sessionId, LEDGER_LIMITS.reconcileTtlMs)
+    const unreadable = entries === undefined
+    let examined = 0
+    let landed = 0
+    const table = domain.table(MESSAGES_TABLE)
+    // The `seq` of the log record that carries each msgId, which is exactly what
+    // `landedSeq` means.
+    const seqByMsgId = new Map<string, number>()
+    for (const entry of entries ?? []) {
+      if (entry.msgId !== undefined && entry.seq !== undefined) seqByMsgId.set(entry.msgId, entry.seq)
+    }
+
+    for (const [, row] of table.entries()) {
+      if (row.resolvedSessionId !== sessionId) continue
+      if (row.status === 'landed' || row.status === 'consumed') continue
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+      examined += 1
+      if (unreadable) {
+        // Recorded so a caller can enforce the deadline; never silently ignored.
+        if (row.unreadableSince === null || row.unreadableSince === undefined) {
+          await table.put(row.msgId, { ...row, unreadableSince: now, updatedAt: now })
+        }
+        continue
+      }
+      const seq = seqByMsgId.get(row.msgId)
+      if (seq === undefined) {
+        // Readable log, no matching record: the delivery has not landed *yet*.
+        // Clear any stale unreadable marker — the log is readable now.
+        if (row.unreadableSince !== null && row.unreadableSince !== undefined) {
+          await table.put(row.msgId, { ...row, unreadableSince: null, updatedAt: now })
+        }
+        continue
+      }
+      await table.put(row.msgId, {
+        ...row,
+        status: 'landed',
+        landedSeq: seq,
+        unreadableSince: null,
+        updatedAt: now,
+      })
+      landed += 1
+    }
+    return {
+      sessionId,
+      examined,
+      landed,
+      unreadable,
+      ...(entries === undefined ? {} : { seenInLog: entries.length }),
+    }
   }
 
   /**
