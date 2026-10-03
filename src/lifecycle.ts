@@ -191,6 +191,30 @@ export class S2sLifecycleService extends Service {
     }
     try {
       const resolvedId = (await presets.resolve(presetId)).id
+      // G9: make the preset a resumed session actually gets **observable**.
+      // Which preset was mounted is otherwise invisible in every artifact — the
+      // transcript records the *permission* preset, not the agent preset — so
+      // "restored the session's own preset" and "got the deployment default"
+      // look identical. An adversarial review of wake fidelity (G8) flagged
+      // exactly this: the layer's presence was provable, its identity was not.
+      // The three branches below are the whole discriminator; the happy path is
+      // traced at `info` so that "no substitution happened" is a positive
+      // record rather than an argument from silence.
+      if (presetId === undefined) {
+        this.ctx.logger.warn(
+          `s2s lifecycle: "${sessionId}" has no recorded agent preset — resuming with the deployment default `
+          + `"${resolvedId}". Its tool set and prompt sections may differ from how it was created.`,
+        )
+      } else if (resolvedId !== presetId) {
+        this.ctx.logger.warn(
+          `s2s lifecycle: the agent preset "${presetId}" recorded for "${sessionId}" resolved to "${resolvedId}" `
+          + '(not the recorded preset) — the session resumes with a SUBSTITUTED preset.',
+        )
+      } else {
+        this.ctx.logger.info(
+          `s2s lifecycle: resuming "${sessionId}" with its recorded agent preset "${resolvedId}".`,
+        )
+      }
       return async (agentCtx: Context, agent?: Agent) => {
         this.installSelection(agentCtx, agent)
         await presets.mount(agentCtx, resolvedId)

@@ -38,6 +38,8 @@ type SetupFn = (agentCtx: Context, agent?: unknown) => unknown
 
 interface SetupOpts {
   presetId?: string
+  /** Force `presets.resolve()` to answer with this id (simulates substitution). */
+  resolveTo?: string
   presetsAbsent?: boolean
   observeFails?: boolean
   resolveFails?: boolean
@@ -58,7 +60,9 @@ async function composeSetup(
   const ctx = new Context()
   // Capture the service's own logger, not console: that is what the code calls.
   const warn = vi.fn()
+  const info = vi.fn()
   ctx.logger.warn = warn as never
+  ctx.logger.info = info as never
   const agent = makeAgent(requestHeader)
   const mount = vi.fn(async () => {
     if (opts.mountFails === true) throw new Error('mount exploded')
@@ -66,7 +70,7 @@ async function composeSetup(
   })
   const resolve = vi.fn(async (id?: string) => {
     if (opts.resolveFails === true) throw new Error('resolve exploded')
-    return { id: id ?? 'default-preset' }
+    return { id: opts.resolveTo ?? id ?? 'default-preset' }
   })
   if (opts.presetsAbsent !== true) {
     ctx.provide('agentPresets', { resolve, mount } as never)
@@ -83,7 +87,7 @@ async function composeSetup(
   const lifecycle = ctx.get('s2sLifecycle') as S2sLifecycleService
   await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'wake', msgId: 'm1' })
   const setup = (resume.mock.calls[0]![0] as { setup?: SetupFn }).setup
-  return { resume, agent, mount, resolve, setup, warn, lifecycle }
+  return { resume, agent, mount, resolve, setup, warn, info, lifecycle }
 }
 
 /**
@@ -238,5 +242,38 @@ describe('s2s lifecycle wake fidelity (the {{model}} + preset fix)', () => {
     // The plugin's OWN error must surface, never cordis's proxy error.
     await expect((setup as SetupFn)(throwingCtx())).rejects.toThrow('no scoped Agent')
     await expect((setup as SetupFn)(throwingCtx())).rejects.not.toThrow('without inject')
+  })
+
+  it('★ traces the deployment default when the session has no recorded preset (G9)', async () => {
+    // The gap an adversarial review flagged on wake fidelity (G8): the mounted
+    // preset was invisible in every artifact, so "restored the session's own
+    // preset" and "silently got the deployment default" were indistinguishable.
+    // `presetId = null` (no recorded preset) is exactly that case.
+    const { warn } = await resumeOnce({ provider: 'p', model: 'm' })
+    const last = String(warn.mock.calls.at(-1)![0])
+    expect(last).toContain('no recorded agent preset')
+    expect(last).toContain('default-preset') // the id actually mounted, not just "the default"
+  })
+
+  it('★ traces a SUBSTITUTED preset when resolve answers with another id (G9)', async () => {
+    const { warn } = await resumeOnce(
+      { provider: 'p', model: 'm' },
+      { presetId: 'ops-default', resolveTo: 'fallback-preset' },
+    )
+    const last = String(warn.mock.calls.at(-1)![0])
+    expect(last).toContain('ops-default') // what the session recorded
+    expect(last).toContain('fallback-preset') // what it actually got
+    expect(last).toContain('SUBSTITUTED')
+  })
+
+  it('traces the happy path positively — no substitution is a record, not silence (G9)', async () => {
+    // Deliberately NOT `warn).not.toHaveBeenCalled()`: the point is that the
+    // absence of a substitution warning is backed by a positive `info` record.
+    const { info, warn } = await resumeOnce({ provider: 'p', model: 'm' }, { presetId: 'ops-default' })
+    const warnText = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(warnText).not.toContain('no recorded agent preset')
+    expect(warnText).not.toContain('SUBSTITUTED')
+    const trace = info.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(trace).toContain('ops-default')
   })
 })
