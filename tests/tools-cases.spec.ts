@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import { buildTools } from '../src/tools.ts'
 
 type Tool = { name: string; execute: (args: any, exec: any) => Promise<{ text: string }> | { text: string } }
@@ -18,7 +19,11 @@ function makeTools(overrides: Record<string, any> = {}) {
     cancel: vi.fn(async () => true),
     ...(overrides.schedule ?? {}),
   }
-  const defs = buildTools({ broker, discovery, lifecycle, budget, schedule } as any)
+  // T11: `s2s_history` now reads a durable source, which needs a context to
+  // reach `sessionQuery`. The default ctx mounts none, so the log source reports
+  // itself unavailable rather than pretending to be empty.
+  const ctx = overrides.ctx ?? (() => { const c = new Context(); c.logger.warn = vi.fn() as never; return c })()
+  const defs = buildTools({ ctx, broker, discovery, lifecycle, budget, schedule } as any)
   const by = (n: string) => defs.find((d) => d.name === n) as unknown as Tool
   return { by, exec: { agent: { id: 'sess-a' } }, broker, discovery, lifecycle, budget, schedule, defs }
 }
@@ -140,14 +145,24 @@ describe('s2s tools execution', () => {
     expect(out.text).toContain('Provide a name')
   })
   it('s2s_history records', async () => {
-    const { by } = makeTools({ broker: { deliver: vi.fn(), history: vi.fn(() => [{ createdAt: 1700000000000, from: 'a', text: 't' }]) } })
+    const { by } = makeTools({ broker: { deliver: vi.fn(), history: vi.fn(() => [{ msgId: 'm-1', createdAt: 1700000000000, from: 'a', text: 't' }]) } })
     const out = await by('s2s_history').execute({ name: 'a' }, {})
-    expect(out.text).toContain('a -> t')
+    // The line carries the msgId when the source recorded one.
+    expect(out.text).toContain('a msgId=m-1 -> t')
+    // The source must be named: "memory" here, because the harness mounts no
+    // ledger and no sessionQuery.
+    expect(out.text).toContain('(memory)')
   })
-  it('s2s_history empty', async () => {
+  it('s2s_history empty still names every source it consulted', async () => {
     const { by } = makeTools()
     const out = await by('s2s_history').execute({ session_id: 's1' }, {})
-    expect(out.text).toBe('No recent messages.')
+    // T11: an empty result must not look like "no messages were ever sent" —
+    // the provenance line says which sources answered and which were unavailable.
+    expect(out.text).toContain('No messages found')
+    expect(out.text).toContain('sources:')
+    expect(out.text).toContain('ledger=UNAVAILABLE(not mounted)')
+    expect(out.text).toContain('session-log=UNAVAILABLE')
+    expect(out.text).toContain('memory=UNAVAILABLE')
   })
   it('s2s_schedule unconfigured', async () => {
     const defs = buildTools({ broker: { deliver: vi.fn(), history: vi.fn() }, discovery: { list: vi.fn(), resolve: vi.fn() } } as any)

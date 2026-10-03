@@ -13,6 +13,7 @@ import { S2sLifecycleService } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
+import { readHistory } from './history.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -83,7 +84,8 @@ function sameProjectAsCaller(infos: readonly S2sSessionInfo[], exec: unknown): r
   return infos.filter((info) => info.workspaceDir === caller.workspaceDir)
 }
 
-export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
+export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
+  const ctx = deps.ctx
   const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule, ledger = deps.ledger
   const resolve = async function(name: string | undefined, sessionId: string | undefined): Promise<S2sResolveResult | { kind: 'err'; reason: string }> {
     if ((name === undefined || name.length === 0) && (sessionId === undefined || sessionId.length === 0)) {
@@ -255,7 +257,7 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
     }),
     defineTool({
       name: 's2s_history',
-      description: 'Recent messages for a session (process-scoped, not durable across restarts). Address by name or session_id.',
+      description: 'Recent messages for a session, merged from every durable source. The ledger is authoritative when it is open; the target\'s session log is read as the fallback that survives a restart without a storage backend. Each line names its source, and a source that answered with nothing says so rather than looking like "no messages".',
       parameters: {
         name: { type: 'string', description: 'Target session title.' },
         session_id: { type: 'string', description: 'Exact session id.' },
@@ -266,9 +268,29 @@ export function buildTools(deps: { broker: S2sBroker; discovery: S2sDiscoverySer
         const resolved = (args.name !== undefined || args.session_id !== undefined) ? await resolve(args.name, args.session_id) : { kind: 'err' as const, reason: 'Provide a name or session_id.' }
         if (resolved.kind === 'err') return { text: resolved.reason }
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
-        const records = broker.history(resolved.sessionId, args.limit === undefined ? {} : { limit: args.limit })
-        if (records.length === 0) return { text: 'No recent messages.' }
-        return { text: records.map(function(r) { return '[' + new Date(r.createdAt).toISOString() + '] ' + r.from + ' -> ' + r.text }).join('\n') }
+        // T11: the durable read path. `broker.history` is process-scoped and a
+        // restart empties it, which used to make "nothing was ever sent" and
+        // "everything was lost at restart" print identically.
+        const memory = broker.history(resolved.sessionId, { limit: 200 }).map(function(r) {
+          return { msgId: r.msgId, from: r.from, at: r.createdAt, ...(r.replyTo === undefined ? {} : { replyTo: r.replyTo }), preview: r.text.slice(0, 160), source: 'memory' as const }
+        })
+        const result = await readHistory(ctx, resolved.sessionId, {
+          ...(ledger === undefined ? {} : { ledger: ledger }),
+          memory: memory,
+          ...(args.limit === undefined ? {} : { limit: args.limit }),
+        })
+        const provenance = 'sources: ' + result.sources.map(function(s) {
+          return s.name + '=' + (s.ok ? String(s.count) : 'UNAVAILABLE(' + s.note + ')')
+        }).join(', ')
+        if (result.entries.length === 0) {
+          return { text: 'No messages found for "' + labelOf(resolved) + '".\n' + provenance }
+        }
+        const lines = result.entries.map(function(e) {
+          const when = new Date(e.at).toISOString()
+          const id = e.msgId === undefined ? '' : ' msgId=' + e.msgId
+          return '[' + when + '] (' + e.source + ') ' + e.from + id + ' -> ' + e.preview
+        })
+        return { text: lines.join('\n') + '\n' + provenance }
       },
     }),
     defineTool({
@@ -328,7 +350,7 @@ export function apply(ctx: Context): void {
   // Optional like the others: the tools must still work when no ledger is
   // mounted, they just cannot report delivery state.
   const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
-  const disposers = buildTools({ broker: broker, discovery: discovery, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }), ...(ledger === undefined ? {} : { ledger: ledger }) }).map(function(d) { return tools.register(d) })
+  const disposers = buildTools({ ctx: ctx, broker: broker, discovery: discovery, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }), ...(ledger === undefined ? {} : { ledger: ledger }) }).map(function(d) { return tools.register(d) })
   ctx.effect(function() { return function() { for (const d of disposers) d() } }, 's2s-tools.disposers')
 }
 
