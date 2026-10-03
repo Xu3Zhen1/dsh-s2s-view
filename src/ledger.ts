@@ -29,8 +29,44 @@ import {
   type MessageStatus,
 } from './ledger-schema.ts'
 
-/** What a caller supplies when recording an outgoing message. */
-export interface S2sLedgerRecordInput {
+/**
+ * Run a ledger write **without ever failing the caller**.
+ *
+ * The ledger is optional infrastructure: the plan treats `storageDomain` as
+ * optional (Q2 names a self-built JSON fallback) and the desktop profile mounts
+ * no storage backend at all. When it is absent the `S2sLedger` service still
+ * exists in the context — it simply never opened — so an unguarded `record()`
+ * throws `s2s ledger: used before open()` and **the message is never delivered**.
+ *
+ * That is a measured outage, not a hypothetical: a deployment with no storage
+ * backend turned an optional bookkeeping step into a total delivery failure.
+ * Bookkeeping must never outrank delivery. The failure stays visible (G9: no
+ * silent degradation) through a warning naming the operation, and the caller
+ * proceeds.
+ *
+ * It lives next to the service rather than in one of its callers because both
+ * delivery paths need it (the live path in `tools.ts`, the dormant path in
+ * `lifecycle.ts`) and two copies would drift: the guard's whole value is that
+ * it is applied *everywhere* a ledger write happens.
+ *
+ * @param ledger - the ledger service, or `undefined` when none is mounted.
+ * @param operation - the ledger method name, for the warning.
+ * @param run - the actual call, invoked only when a ledger is present.
+ */
+export async function noteLedger(
+  ledger: S2sLedger | undefined,
+  operation: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (ledger === undefined) return
+  try {
+    await run()
+  } catch (error: unknown) {
+    ledger.warn(operation, error)
+  }
+}
+
+/** What a caller supplies when recording an outgoing message. */export interface S2sLedgerRecordInput {
   /** Idempotency key; also the primary key. */
   msgId: string
   /** Sender label (the tool's `from`, or an agent id). */

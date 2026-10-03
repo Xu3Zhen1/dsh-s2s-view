@@ -12,7 +12,7 @@ import type { S2sDiscoveryService, S2sResolveResult, S2sSessionInfo } from './di
 import { S2sLifecycleService } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
-import type { S2sLedger } from './ledger.ts'
+import { noteLedger, type S2sLedger } from './ledger.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -26,39 +26,6 @@ const OUTPUT = {
 function labelOf(r: Extract<S2sResolveResult, { kind: 'ok' }>): string {
   return r.title ?? r.sessionId
 }
-
-/**
- * Run a ledger write **without ever failing the caller**.
- *
- * The ledger is optional infrastructure: the plan treats `storageDomain` as
- * optional (Q2 names a self-built JSON fallback) and the desktop profile mounts
- * no storage backend at all. When it is absent the `S2sLedger` service still
- * exists in the context — it simply never opened — so an unguarded `record()`
- * throws `s2s ledger: used before open()` and **the message is never delivered**.
- *
- * That is a measured outage, not a hypothetical: a deployment with no storage
- * backend turned an optional bookkeeping step into a total delivery failure.
- * Bookkeeping must never outrank delivery. The failure stays visible (G9: no
- * silent degradation) through a warning naming the operation, and the caller
- * proceeds.
- *
- * @param ledger - the ledger service, or `undefined` when none is mounted.
- * @param operation - the ledger method name, for the warning.
- * @param run - the actual call, invoked only when a ledger is present.
- */
-async function noteLedger(
-  ledger: S2sLedger | undefined,
-  operation: string,
-  run: () => Promise<void>,
-): Promise<void> {
-  if (ledger === undefined) return
-  try {
-    await run()
-  } catch (error: unknown) {
-    ledger.warn(operation, error)
-  }
-}
-
 
 /**
  * Short display form of a session id.

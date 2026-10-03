@@ -15,6 +15,7 @@ import { installModelSelection, type Agent, type AgentSetup, type ModelSelection
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { S2sError } from './error.ts'
+import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2S_MESSAGE_SOURCE } from './source.ts'
 import { S2sMailbox, type MailboxEntry } from './mailbox.ts'
 
@@ -294,6 +295,13 @@ export class S2sLifecycleService extends Service {
   async drain(sessionId: string): Promise<number> {
     const agent = this.ctx.agents.get(SessionId(sessionId))
     if (agent === undefined) return 0
+    // T6b: the row for a dormant message was created by the caller
+    // (`s2s_message` records before dispatch) and stayed `queued` for the whole
+    // wake, so a status query could not tell a delivered wake from a stuck one.
+    // The handover below **is** the dormant path's `inboxed` moment — the same
+    // meaning the live path gives it in `broker.deliver`'s non-`absent` branch
+    // (`tools.ts`). Resolved once per drain; the ledger is optional.
+    const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
     const entries = await this.mailbox.drain(sessionId)
     for (const entry of entries) {
       // Same `msgId=` header as the broker's live path: the ledger derives
@@ -310,6 +318,9 @@ ${entry.text}`
       } else {
         agent.inject(userMessage)
       }
+      // Guarded, like the live path: bookkeeping never outranks delivery (an
+      // unopened ledger must not abort the drain), and the loss stays loud (G9).
+      await noteLedger(ledger, 'markInboxed', () => ledger!.markInboxed(entry.msgId, sessionId))
     }
     return entries.length
   }
