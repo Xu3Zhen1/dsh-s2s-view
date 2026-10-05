@@ -15,6 +15,7 @@ import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
 import { S2sLedger, type LedgerConfig } from './ledger.ts'
+import { ledgerDiagnostics } from './ledger-diagnostics.ts'
 import * as toolsPlugin from './tools.ts'
 import * as digestPlugin from './digest.ts'
 
@@ -100,10 +101,23 @@ export function apply(ctx: Context, config: Config = {}): void {
   // The ledger stays **optional**: if the host never provides the service, this
   // callback simply never runs and the tools keep working untracked (I1/G9 —
   // absence is reported by `s2s_status`, never invented).
+  //
+  // ★ Diagnostics below exist because the FIRST version of this fix did not work
+  // on the real host while every local probe passed. The plugin logger is never
+  // persisted, so "the callback never fired" and "it fired and just did not
+  // help" are indistinguishable after the fact. These counters carry that fact
+  // out through `s2s_status` instead of through a log nobody can read.
+  ledgerDiagnostics.injectRegistered = true
   ctx.inject(['storageDomain'], function(domainCtx) {
+    ledgerDiagnostics.injectFired = (ledgerDiagnostics.injectFired ?? 0) + 1
+    ledgerDiagnostics.injectFiredAt = Date.now()
     const ledger = domainCtx.get('s2sLedger') as S2sLedger | undefined
+    ledgerDiagnostics.ledgerVisibleInCallback = ledger !== undefined
     if (ledger === undefined) return
-    void ledger.open().catch(function(error: unknown) {
+    void ledger.open().then(function() {
+      ledgerDiagnostics.openSucceeded = true
+    }).catch(function(error: unknown) {
+      ledgerDiagnostics.openError = String(error)
       // Loud, never fatal: a silently absent ledger turns every later status
       // read into an invention.
       domainCtx.logger.warn(

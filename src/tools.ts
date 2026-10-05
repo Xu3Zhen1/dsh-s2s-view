@@ -15,6 +15,7 @@ import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { readHistory } from './history.ts'
+import { ledgerDiagnostics } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -320,6 +321,48 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 ? ' — SKIPPED: the ledger is not open, so the sweep ran but could do nothing. The timer is alive; its effect is not.'
                 : ' — executed against the store.'))
           }
+        }
+
+        // ★ Ledger handshake diagnostics.
+        //
+        // The first attempt at the race fix passed every local probe and did
+        // nothing on the real host. Since the plugin logger is never persisted,
+        // "the callback never fired" and "it fired but the store still was not
+        // there" look identical afterwards. This line carries the handshake out
+        // through the tool surface so the next iteration is driven by evidence
+        // from the running process rather than by local models of it.
+        //
+        // Guarded on `ctx` because a diagnostic must never be the thing that
+        // breaks the tool it is meant to explain — a harness that builds the
+        // tools without a context still has to be able to ask for status.
+        {
+          const d = ledgerDiagnostics
+          const probe = function(name: string): string {
+            if (ctx === undefined) return 'n/a (no ctx)'
+            try {
+              return ctx.get(name) === undefined ? 'undefined' : 'PRESENT'
+            } catch (error: unknown) {
+              return 'THREW(' + String(error) + ')'
+            }
+          }
+          const hubProbe = (function(): string {
+            if (ctx === undefined) return 'n/a (no ctx)'
+            try {
+              const hub = ctx.get('storage') as { domain?: unknown } | undefined
+              return hub === undefined ? 'no storage hub' : (hub.domain === undefined ? 'undefined' : 'PRESENT')
+            } catch (error: unknown) {
+              return 'THREW(' + String(error) + ')'
+            }
+          })()
+          lines.push('handshake: register=' + String(d.injectRegistered === true)
+            + ' fired=' + String(d.injectFired ?? 0)
+            + (d.injectFiredAt === undefined ? '' : ' at=' + new Date(d.injectFiredAt).toISOString())
+            + ' ledgerVisible=' + String(d.ledgerVisibleInCallback)
+            + ' openOk=' + String(d.openSucceeded === true)
+            + (d.openError === undefined ? '' : ' openError=' + d.openError)
+            + '  |  live probes: ctx.get(storageDomain)=' + probe('storageDomain')
+            + ' ctx.get(storage)=' + probe('storage')
+            + ' storage.domain=' + hubProbe)
         }
 
         return { text: lines.join('\n') }
