@@ -129,6 +129,16 @@ export const messageRecordSchema = z.object({
   createdAt: z.number(),
   /** Last state-change epoch ms. */
   updatedAt: z.number(),
+  /**
+   * Monotonic revision, bumped on every state change (T23).
+   *
+   * This is the compare-and-swap token: a writer that read revision *n* may only
+   * write if the stored row is still at *n*. Without it, serialization would be
+   * the *only* defence, and any future caller that forgets to go through the
+   * chain could silently resurrect a stale decision. Optional so rows written
+   * before this field existed still load; treat a missing value as 0.
+   */
+  revision: z.number().int().min(0).default(0),
   /** Delivery attempts so far. */
   attempts: z.number().int().min(0),
   /** Attempt budget for this row. */

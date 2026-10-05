@@ -243,6 +243,70 @@ export class S2sLedger extends Service {
   }
 
   /**
+   * Serializes **every** read-modify-write pass over the messages table (T23).
+   *
+   * Every mutation here is read-decide-write: `markInboxed`, `reconcile` and
+   * `expireZombies` all read a row, compute the next state, then `put` a row
+   * derived from that read. Two such passes that interleave can both decide from
+   * the *same* stale snapshot, and then the later `put` silently **erases** the
+   * earlier one's decision — measured directly: a `reconcile` landing a row to
+   * `landed`/`landedSeq=42` was undone by an `expireZombies` that had read the
+   * row before that landing, leaving it `dead_letter` with a null seq. A lost
+   * update is worse than a slow one: the row ends up in a state no code path
+   * would ever have chosen.
+   *
+   * This is reachable now that the ledger sweeps on a timer while a tool can
+   * call `s2s_reconcile` at the same instant, so the two do not merely race in
+   * theory.
+   *
+   * One promise chain, not a lock library: each pass appends itself and awaits
+   * its predecessor, so passes run strictly one at a time in arrival order.
+   * `Tail` is deliberately *not* reset on failure — a rejected link must not
+   * swallow the passes queued behind it (each caller sees its own error).
+   */
+  private tail: Promise<unknown> = Promise.resolve()
+
+  /**
+   * Run one read-modify-write pass with exclusive access to the messages table.
+   *
+   * @param fn - the pass; its result is returned to the caller.
+   * @returns whatever `fn` returns, after all earlier passes have settled.
+   */
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(fn, fn)
+    // Keep the chain alive without letting one failure reject the next link.
+    this.tail = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /**
+   * Write a row **only if** it has not changed since it was read (T23 CAS).
+   *
+   * Serialization alone would leave one hole: a caller that reads a row, awaits
+   * something slow (a log decode is the real case — `reconcile` awaits
+   * `readSessionLog` between reading and writing), and then writes, still
+   * reverts whatever happened in the meantime. Because the awaited work happens
+   * *inside* the serialized pass this cannot occur through the chain, but the
+   * check is what makes the guarantee local to the write rather than a property
+   * of every caller remembering to queue.
+   *
+   * @param expectedRevision - the `revision` observed when the row was read.
+   * @param next - the row to store.
+   * @returns true when the write happened, false when it was refused as stale.
+   */
+  private async putIfUnchanged(expectedRevision: number, next: MessageRecord): Promise<boolean> {
+    const table = this.opened().table(MESSAGES_TABLE)
+    const current = table.get(next.msgId)
+    if (current !== undefined && (current.revision ?? 0) !== expectedRevision) {
+      // Refused, not failed: the other writer's decision already moved the row,
+      // and silently overwriting it is exactly the lost update this prevents.
+      return false
+    }
+    await table.put(next.msgId, { ...next, revision: expectedRevision + 1 })
+    return true
+  }
+
+  /**
    * Drop cached log reads so the next `reconcile()` sees the real thing.
    *
    * This matters because the cache holds a *read*: right after delivering to a
@@ -343,6 +407,7 @@ export class S2sLedger extends Service {
       replyTo: input.replyTo ?? null,
       lastError: null,
       unreadableSince: null,
+      revision: 0,
     }
     await domain.table(MESSAGES_TABLE).put(row.msgId, row)
   }
@@ -386,24 +451,29 @@ export class S2sLedger extends Service {
   async markInboxed(msgId: string, resolvedSessionId: string): Promise<void> {
     const domain = this.opened()
     const table = domain.table(MESSAGES_TABLE)
-    const row = table.get(msgId)
-    if (row === undefined) {
-      // Reachable if a caller delivers without recording first. Not fatal to the
-      // delivery, but it must not pass unremarked — a ledger silently missing
-      // rows is worse than one that says it is missing them (G9).
-      this.ctx.logger.warn(
-        `s2s ledger: markInboxed("${msgId}") found no recorded row; the delivery is not tracked. `
-        + 'Record the message before delivering it.',
-      )
-      return
-    }
-    if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return
-    if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) return
-    await table.put(msgId, {
-      ...row,
-      status: 'inboxed',
-      resolvedSessionId,
-      updatedAt: Date.now(),
+    // Serialized: this is a read-decide-write, and a `reconcile`/sweep pass
+    // running at the same instant would otherwise be able to write back a row
+    // derived from the pre-inboxed snapshot, discarding this transition.
+    await this.serialize(async () => {
+      const row = table.get(msgId)
+      if (row === undefined) {
+        // Reachable if a caller delivers without recording first. Not fatal to the
+        // delivery, but it must not pass unremarked — a ledger silently missing
+        // rows is worse than one that says it is missing them (G9).
+        this.ctx.logger.warn(
+          `s2s ledger: markInboxed("${msgId}") found no recorded row; the delivery is not tracked. `
+          + 'Record the message before delivering it.',
+        )
+        return
+      }
+      if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) return
+      await this.putIfUnchanged(row.revision ?? 0, {
+        ...row,
+        status: 'inboxed',
+        resolvedSessionId,
+        updatedAt: Date.now(),
+      })
     })
     // The target's log has just gained (or is about to gain) this delivery, so
     // any cached read of it is stale by construction.
@@ -452,56 +522,68 @@ export class S2sLedger extends Service {
       ? Math.min(LEDGER_LIMITS.reconcileTtlMs, LEDGER_LIMITS.reconcileFailureTtlMs)
       : LEDGER_LIMITS.reconcileTtlMs
     const fresh = cached !== undefined && now - cached.at < ttl
-    const entries = fresh ? cached.entries : await readSessionLog(this.ctx, sessionId, LEDGER_LIMITS.reconcileTtlMs)
-    if (!fresh) this.logCache.set(sessionId, { at: now, entries })
-    const unreadable = entries === undefined
-    let examined = 0
-    let landed = 0
-    const table = domain.table(MESSAGES_TABLE)
-    // The `seq` of the log record that carries each msgId, which is exactly what
-    // `landedSeq` means.
-    const seqByMsgId = new Map<string, number>()
-    for (const entry of entries ?? []) {
-      if (entry.msgId !== undefined && entry.seq !== undefined) seqByMsgId.set(entry.msgId, entry.seq)
-    }
+    // The whole pass — including the log read — runs under the serialization
+    // chain. Reading outside it would let an `expireZombies` pass decide the row
+    // is a zombie while this one is still decoding the log, and whichever writes
+    // last would win on a stale view (the measured lost update).
+    return this.serialize(async () => {
+      const entries = fresh ? cached.entries : await readSessionLog(this.ctx, sessionId, LEDGER_LIMITS.reconcileTtlMs)
+      if (!fresh) this.logCache.set(sessionId, { at: now, entries })
+      const unreadable = entries === undefined
+      let examined = 0
+      let landed = 0
+      const table = domain.table(MESSAGES_TABLE)
+      // The `seq` of the log record that carries each msgId, which is exactly what
+      // `landedSeq` means.
+      const seqByMsgId = new Map<string, number>()
+      for (const entry of entries ?? []) {
+        if (entry.msgId !== undefined && entry.seq !== undefined) seqByMsgId.set(entry.msgId, entry.seq)
+      }
 
-    for (const [, row] of table.entries()) {
-      if (row.resolvedSessionId !== sessionId) continue
-      if (row.status === 'landed' || row.status === 'consumed') continue
-      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
-      examined += 1
-      if (unreadable) {
-        // Recorded so a caller can enforce the deadline; never silently ignored.
-        if (row.unreadableSince === null || row.unreadableSince === undefined) {
-          await table.put(row.msgId, { ...row, unreadableSince: now, updatedAt: now })
+      // Re-read every row inside the pass: a cached iteration taken before the
+      // await above would be the stale snapshot this method must not decide from.
+      for (const [, row] of [...table.entries()]) {
+        if (row.resolvedSessionId !== sessionId) continue
+        if (row.status === 'landed' || row.status === 'consumed') continue
+        if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+        examined += 1
+        const revision = row.revision ?? 0
+        if (unreadable) {
+          // Recorded so a caller can enforce the deadline; never silently ignored.
+          if (row.unreadableSince === null || row.unreadableSince === undefined) {
+            await this.putIfUnchanged(revision, { ...row, unreadableSince: now, updatedAt: now })
+          }
+          continue
         }
-        continue
-      }
-      const seq = seqByMsgId.get(row.msgId)
-      if (seq === undefined) {
-        // Readable log, no matching record: the delivery has not landed *yet*.
-        // Clear any stale unreadable marker — the log is readable now.
-        if (row.unreadableSince !== null && row.unreadableSince !== undefined) {
-          await table.put(row.msgId, { ...row, unreadableSince: null, updatedAt: now })
+        const seq = seqByMsgId.get(row.msgId)
+        if (seq === undefined) {
+          // Readable log, no matching record: the delivery has not landed *yet*.
+          // Clear any stale unreadable marker — the log is readable now.
+          if (row.unreadableSince !== null && row.unreadableSince !== undefined) {
+            await this.putIfUnchanged(revision, { ...row, unreadableSince: null, updatedAt: now })
+          }
+          continue
         }
-        continue
+        const wrote = await this.putIfUnchanged(revision, {
+          ...row,
+          status: 'landed',
+          landedSeq: seq,
+          unreadableSince: null,
+          updatedAt: now,
+        })
+        // Only count a landing that actually stuck: a refused CAS means another
+        // pass moved the row first, so reporting it here would overstate what
+        // this pass did (I1).
+        if (wrote) landed += 1
       }
-      await table.put(row.msgId, {
-        ...row,
-        status: 'landed',
-        landedSeq: seq,
-        unreadableSince: null,
-        updatedAt: now,
-      })
-      landed += 1
-    }
-    return {
-      sessionId,
-      examined,
-      landed,
-      unreadable,
-      ...(entries === undefined ? {} : { seenInLog: entries.length }),
-    }
+      return {
+        sessionId,
+        examined,
+        landed,
+        unreadable,
+        ...(entries === undefined ? {} : { seenInLog: entries.length }),
+      }
+    })
   }
 
   /**
@@ -536,33 +618,39 @@ export class S2sLedger extends Service {
   async expireZombies(opts: { now?: number } = {}): Promise<ZombieSweepResult> {
     const domain = this.opened()
     const now = opts.now ?? Date.now()
-    let examined = 0
-    let expired = 0
-    for (const [, row] of domain.table(MESSAGES_TABLE).entries()) {
-      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
-      // Only a handed-over row can be a zombie; see the exclusions above.
-      if (row.status !== 'inboxed' && row.status !== 'delivering') continue
-      examined += 1
-      const since = row.unreadableSince
-      // No unreadable stamp ⇒ the last read succeeded (or never happened), so
-      // there is no evidence the landing is unreachable. Leave it alone.
-      if (since === null || since === undefined) continue
-      if (now - since < LEDGER_LIMITS.landedDeadlineMs) continue
-      await domain.table(MESSAGES_TABLE).put(row.msgId, {
-        ...row,
-        status: 'dead_letter',
-        // Auditable reason, not merely a boolean: a reader must be able to see
-        // that this died of an unreadable log and when it started.
-        lastError: 'landed unreachable: the target log stayed unreadable for '
-          + Math.round((now - since) / 1000) + 's (deadline '
-          + Math.round(LEDGER_LIMITS.landedDeadlineMs / 1000) + 's), first unreadable at '
-          + new Date(since).toISOString(),
-        unreadableSince: null,
-        updatedAt: now,
-      })
-      expired += 1
-    }
-    return { examined, expired }
+    return this.serialize(async () => {
+      let examined = 0
+      let expired = 0
+      const table = domain.table(MESSAGES_TABLE)
+      // Read inside the pass and honour the CAS: if a `reconcile` landed this row
+      // since, the write is refused and the landing survives. That is the whole
+      // point — a sweep must never undo a successful delivery.
+      for (const [, row] of [...table.entries()]) {
+        if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+        // Only a handed-over row can be a zombie; see the exclusions above.
+        if (row.status !== 'inboxed' && row.status !== 'delivering') continue
+        examined += 1
+        const since = row.unreadableSince
+        // No unreadable stamp ⇒ the last read succeeded (or never happened), so
+        // there is no evidence the landing is unreachable. Leave it alone.
+        if (since === null || since === undefined) continue
+        if (now - since < LEDGER_LIMITS.landedDeadlineMs) continue
+        const died = await this.putIfUnchanged(row.revision ?? 0, {
+          ...row,
+          status: 'dead_letter',
+          // Auditable reason, not merely a boolean: a reader must be able to see
+          // that this died of an unreadable log and when it started.
+          lastError: 'landed unreachable: the target log stayed unreadable for '
+            + Math.round((now - since) / 1000) + 's (deadline '
+            + Math.round(LEDGER_LIMITS.landedDeadlineMs / 1000) + 's), first unreadable at '
+            + new Date(since).toISOString(),
+          unreadableSince: null,
+          updatedAt: now,
+        })
+        if (died) expired += 1
+      }
+      return { examined, expired }
+    })
   }
 
   /**
