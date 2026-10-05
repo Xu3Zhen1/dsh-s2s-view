@@ -195,8 +195,16 @@ describe('ledger domain spec (T4)', () => {
       rollTimeoutMs: 600000,
       textMaxChars: 8000,
       nextAttemptAtClampMs: 24 * 60 * 60 * 1000,
+      // T24: how often the ledger sweeps on its own. This is what makes
+      // `landedDeadlineMs` reachable without a human calling a tool.
+      sweepIntervalMs: 60 * 60 * 1000,
     })
     // The invariant behind the shorter failure TTL, asserted rather than implied.
     expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBeLessThan(LEDGER_LIMITS.reconcileTtlMs)
+    // T24: the sweep must be frequent enough to honour the deadline meaningfully.
+    // One sweep per hour bounds the overshoot of a 24 h deadline to ~4%; a sweep
+    // interval at or above the deadline itself would let a zombie overrun it by
+    // up to 100%, which is the "deadline in name only" failure this guards.
+    expect(LEDGER_LIMITS.sweepIntervalMs).toBeLessThan(LEDGER_LIMITS.landedDeadlineMs / 10)
   })
 })

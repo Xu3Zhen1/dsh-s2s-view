@@ -59,6 +59,16 @@ export const TERMINAL_STATUSES = ['dead_letter', 'cancelled', 'legacy_unverifiab
 export const LEDGER_LIMITS = {
   /** How long a target log may stay unreadable before `landed` is judged unreachable. */
   landedDeadlineMs: 24 * 60 * 60 * 1000,
+  /**
+   * How often the ledger sweeps on its own (T24).
+   *
+   * The sweep is what makes `landedDeadlineMs` real: a deadline is only reached
+   * if something advances the clock, and before this the only caller of
+   * `reconcile()` was a tool a human had to invoke. An hour is frequent enough
+   * that a 24 h deadline is honoured to within ~4%, and rare enough that the
+   * cost is a log decode per tracked target per hour, not a poll.
+   */
+  sweepIntervalMs: 60 * 60 * 1000,
   /** Delivery attempts before a message is dead-lettered. */
   maxRetries: 3,
   /** Rolling retention window for the ledger. */

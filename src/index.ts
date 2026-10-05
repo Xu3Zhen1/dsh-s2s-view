@@ -14,7 +14,7 @@ import { S2sLifecycleService, type LifecycleConfig } from './lifecycle.ts'
 import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
-import { S2sLedger } from './ledger.ts'
+import { S2sLedger, type LedgerConfig } from './ledger.ts'
 import * as toolsPlugin from './tools.ts'
 import * as digestPlugin from './digest.ts'
 
@@ -44,6 +44,8 @@ export interface Config {
   readonly lifecycle?: { enabled?: boolean; autoResume?: string; mailboxDir?: string }
   readonly budget?: BudgetConfig
   readonly schedule?: ScheduleConfig
+  /** Ledger tuning. `timerIntervalMs: 0` disables the automatic sweep (tests). */
+  readonly ledger?: LedgerConfig
 }
 
 /**
@@ -75,7 +77,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (config.schedule !== undefined) {
     ctx.plugin(S2sScheduleService, config.schedule)
   }
-  ctx.plugin(S2sLedger)
+  ctx.plugin(S2sLedger, config.ledger ?? {})
   // Opening is async and `storageDomain` is optional (Q2 allows a self-built
   // fallback), so a failure must not abort mounting the plugin — the tools are
   // still useful without a ledger. It must, however, be *loud*: a silently

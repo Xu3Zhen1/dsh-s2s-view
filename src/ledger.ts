@@ -120,6 +120,24 @@ export interface ReconcileResult {
   readonly seenInLog?: number
 }
 
+/** What one `expireZombies()` sweep examined and killed (T24). */
+export interface ZombieSweepResult {
+  /** Rows eligible to be zombies (handed over, not terminal). */
+  readonly examined: number
+  /** Rows dead-lettered by this sweep. */
+  readonly expired: number
+}
+
+/** Ledger configuration. */
+export interface LedgerConfig {
+  /**
+   * Auto-sweep interval (ms). Defaults to `LEDGER_LIMITS.sweepIntervalMs`;
+   * `0` disables the timer, which is what tests do so they can call `tick()`
+   * with a pinned clock instead of waiting on wall time.
+   */
+  readonly timerIntervalMs?: number
+}
+
 export class S2sLedger extends Service {
   /**
    * `storageDomain` is looked up lazily through `ctx.get` rather than declared
@@ -139,8 +157,89 @@ export class S2sLedger extends Service {
    */
   private readonly logCache = new Map<string, LogCacheEntry>()
 
-  constructor(ctx: Context) {
+  /**
+   * Auto-sweep timer handle, and the interval it was armed with.
+   *
+   * **The trigger decision (T24).** `reconcile()` advances rows, but a row only
+   * moves when *someone asks*. Before this, the deadline in
+   * `LEDGER_LIMITS.landedDeadlineMs` was inert: it was only ever consulted by a
+   * `reconcile()` that nothing ran automatically, so a zombie row could sit at
+   * `inboxed` indefinitely and the deadline would never be reached. A deadline
+   * without a clock is documentation, not behaviour.
+   *
+   * So the sweep is driven by its own interval, mirroring `S2sScheduleService`:
+   * armed in the constructor, `unref()`'d so it never holds the process open,
+   * disposed through `ctx.effect`, and skippable for tests via
+   * `timerIntervalMs: 0` in favour of calling `tick()` with a pinned clock.
+   */
+  private timer?: ReturnType<typeof setInterval>
+
+  constructor(ctx: Context, config: LedgerConfig = {}) {
     super(ctx, 's2sLedger')
+    this.timerIntervalMs = config.timerIntervalMs ?? LEDGER_LIMITS.sweepIntervalMs
+    if (this.timerIntervalMs > 0) {
+      this.timer = setInterval(() => {
+        void this.tick().catch((error: unknown) => {
+          this.ctx.logger.warn('s2s ledger: sweep failed: ' + String(error))
+        })
+      }, this.timerIntervalMs)
+      this.timer.unref?.()
+    }
+    this.ctx.effect(() => () => { if (this.timer !== undefined) clearInterval(this.timer) }, 's2sLedger.timer')
+  }
+
+  private readonly timerIntervalMs: number
+
+  /**
+   * One automatic sweep: advance tracked rows against their logs, then give the
+   * ones whose log never recovered an exit.
+   *
+   * Order matters. Reconcile first, so a row whose log has become readable is
+   * landed (and its `unreadableSince` cleared) rather than counted as a zombie
+   * by the sweep that follows in the same pass. Doing it the other way would
+   * kill a delivery that had just become verifiable.
+   *
+   * Never throws: a ledger that cannot serve the sweep must degrade quietly (G9
+   * warns) rather than break the host's timer.
+   *
+   * @param opts.now - injectable clock; tests pin it to cross deadlines.
+   * @returns how many targets were reconciled and how many rows were expired.
+   */
+  async tick(opts: { now?: number } = {}): Promise<{ reconciled: number; expired: number; examined: number }> {
+    if (this.domain === undefined) return { reconciled: 0, expired: 0, examined: 0 }
+    const now = opts.now ?? Date.now()
+    // Which targets actually have a row worth advancing? Reconciling every known
+    // session would decode logs for sessions this ledger has no stake in, and
+    // `maxSessionsPerRequest` bounds a single request for the same reason.
+    const targets = new Set<string>()
+    for (const [, row] of this.domain.table(MESSAGES_TABLE).entries()) {
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+      if (row.status === 'landed' || row.status === 'consumed') continue
+      if (row.resolvedSessionId === null || row.resolvedSessionId === undefined) continue
+      targets.add(row.resolvedSessionId)
+    }
+    let reconciled = 0
+    for (const sessionId of [...targets].slice(0, LEDGER_LIMITS.maxSessionsPerRequest)) {
+      try {
+        // `useCache: false` on purpose. The cache exists to collapse repeated
+        // *questions* inside a short window; a scheduled sweep is the opposite —
+        // it is the periodic re-examination of reality, and reusing a read taken
+        // up to `reconcileTtlMs` ago would let a log that has just gone away
+        // still look readable, delaying (or wrongly skipping) the zombie verdict
+        // that this sweep exists to reach.
+        await this.reconcile(sessionId, { now, useCache: false })
+        reconciled += 1
+      } catch (error) {
+        this.warn('reconcile', error)
+      }
+    }
+    const sweep = await this.expireZombies({ now })
+    if (sweep.expired > 0) {
+      // A death is worth a line: it is the only way a passive observer learns
+      // that a delivery was abandoned rather than still in flight.
+      this.ctx.logger.warn('s2s ledger: dead-lettered ' + sweep.expired + ' zombie row(s) whose target log stayed unreadable past the deadline')
+    }
+    return { reconciled, expired: sweep.expired, examined: sweep.examined }
   }
 
   /**
@@ -403,6 +502,67 @@ export class S2sLedger extends Service {
       unreadable,
       ...(entries === undefined ? {} : { seenInLog: entries.length }),
     }
+  }
+
+  /**
+   * Give rows whose log never became readable an exit (T24).
+   *
+   * A row stuck at `inboxed` because its target log is gone is a **zombie**: it
+   * will never land, and without a deadline it would sit there forever looking
+   * like a delivery still in flight. Once `unreadableSince` is older than
+   * `LEDGER_LIMITS.landedDeadlineMs`, `landed` is judged **unreachable** and the
+   * row becomes `dead_letter` — a terminal state that keeps the evidence
+   * (`lastError` records why) instead of hiding it.
+   *
+   * Three deliberate exclusions, each a way this could do harm:
+   *
+   * - **Only rows that were actually handed over.** A `queued` row was never
+   *   delivered, so an unreadable log says nothing about it; dead-lettering it
+   *   would destroy a message that is merely waiting.
+   * - **Only rows with an unreadable log.** `unreadableSince` is stamped solely
+   *   by a failed `reconcile()` read and cleared by a successful one, so a
+   *   readable log with no matching record is "not landed *yet*" — never a
+   *   zombie. This is the negative case the plan insists on: a normally
+   *   undelivered message must not be killed.
+   * - **Never a terminal row.** `dead_letter`/`cancelled`/`legacy_unverifiable`
+   *   are final, and re-dead-lettering would rewrite their timestamps.
+   *
+   * Idempotent by construction: the first pass writes the terminal status, and
+   * every later pass skips it, so a row transitions **at most once**.
+   *
+   * @param opts.now - injectable clock, so tests can cross the deadline without waiting.
+   * @returns what was examined and what was dead-lettered.
+   */
+  async expireZombies(opts: { now?: number } = {}): Promise<ZombieSweepResult> {
+    const domain = this.opened()
+    const now = opts.now ?? Date.now()
+    let examined = 0
+    let expired = 0
+    for (const [, row] of domain.table(MESSAGES_TABLE).entries()) {
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+      // Only a handed-over row can be a zombie; see the exclusions above.
+      if (row.status !== 'inboxed' && row.status !== 'delivering') continue
+      examined += 1
+      const since = row.unreadableSince
+      // No unreadable stamp ⇒ the last read succeeded (or never happened), so
+      // there is no evidence the landing is unreachable. Leave it alone.
+      if (since === null || since === undefined) continue
+      if (now - since < LEDGER_LIMITS.landedDeadlineMs) continue
+      await domain.table(MESSAGES_TABLE).put(row.msgId, {
+        ...row,
+        status: 'dead_letter',
+        // Auditable reason, not merely a boolean: a reader must be able to see
+        // that this died of an unreadable log and when it started.
+        lastError: 'landed unreachable: the target log stayed unreadable for '
+          + Math.round((now - since) / 1000) + 's (deadline '
+          + Math.round(LEDGER_LIMITS.landedDeadlineMs / 1000) + 's), first unreadable at '
+          + new Date(since).toISOString(),
+        unreadableSince: null,
+        updatedAt: now,
+      })
+      expired += 1
+    }
+    return { examined, expired }
   }
 
   /**
