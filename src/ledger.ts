@@ -174,6 +174,21 @@ export class S2sLedger extends Service {
    */
   private timer?: ReturnType<typeof setInterval>
 
+  /**
+   * What the most recent sweep did, for `s2s_status` to report.
+   *
+   * T24 armed a timer whose effect was **unobservable**: under a profile without
+   * `storageDomain` the ledger never opens, so `tick()` returns early every hour
+   * and nothing anywhere recorded that it ran. That made "the sweep is alive"
+   * provable only by a unit test — the thing could silently stop working on the
+   * real host and nobody could tell.
+   *
+   * `skipped` separates two situations a lone timestamp would merge: "the sweep
+   * ran and had work to do" vs "the sweep ran but the ledger has no store, so it
+   * could do nothing". Without that distinction an inert sweep looks healthy.
+   */
+  private lastSweep: { at: number; reconciled: number; expired: number; skipped: boolean } | undefined
+
   constructor(ctx: Context, config: LedgerConfig = {}) {
     super(ctx, 's2sLedger')
     this.timerIntervalMs = config.timerIntervalMs ?? LEDGER_LIMITS.sweepIntervalMs
@@ -191,6 +206,21 @@ export class S2sLedger extends Service {
   private readonly timerIntervalMs: number
 
   /**
+   * The automatic sweep's interval and last outcome, for self-report (T9/T24).
+   *
+   * Exposed as a read-only view so `s2s_status` can state whether a sweep is
+   * even *armed* and what the last one achieved — the difference between "this
+   * feature exists in the bundle" and "this feature is running here".
+   */
+  get sweepStatus(): { armed: boolean; intervalMs: number; last?: { at: number; reconciled: number; expired: number; skipped: boolean } } {
+    return {
+      armed: this.timer !== undefined,
+      intervalMs: this.timerIntervalMs,
+      ...(this.lastSweep === undefined ? {} : { last: this.lastSweep }),
+    }
+  }
+
+  /**
    * One automatic sweep: advance tracked rows against their logs, then give the
    * ones whose log never recovered an exit.
    *
@@ -206,8 +236,14 @@ export class S2sLedger extends Service {
    * @returns how many targets were reconciled and how many rows were expired.
    */
   async tick(opts: { now?: number } = {}): Promise<{ reconciled: number; expired: number; examined: number }> {
-    if (this.domain === undefined) return { reconciled: 0, expired: 0, examined: 0 }
     const now = opts.now ?? Date.now()
+    if (this.domain === undefined) {
+      // Recorded even though nothing can be done: otherwise an open-less
+      // deployment looks identical to one where the timer never fired, and the
+      // difference is exactly what an operator needs to see (T9/T24).
+      this.lastSweep = { at: now, reconciled: 0, expired: 0, skipped: true }
+      return { reconciled: 0, expired: 0, examined: 0 }
+    }
     // Which targets actually have a row worth advancing? Reconciling every known
     // session would decode logs for sessions this ledger has no stake in, and
     // `maxSessionsPerRequest` bounds a single request for the same reason.
@@ -239,6 +275,7 @@ export class S2sLedger extends Service {
       // that a delivery was abandoned rather than still in flight.
       this.ctx.logger.warn('s2s ledger: dead-lettered ' + sweep.expired + ' zombie row(s) whose target log stayed unreadable past the deadline')
     }
+    this.lastSweep = { at: now, reconciled, expired: sweep.expired, skipped: false }
     return { reconciled, expired: sweep.expired, examined: sweep.examined }
   }
 

@@ -124,7 +124,7 @@ describe('s2s_message ledger wiring (T6)', () => {
   it('records a delivered message and advances it to inboxed', async () => {
     const { ctx, ledger, by } = await harness({ deliver: 'idle' })
     const out = await by('s2s_message').execute({ name: 'a', text: 'hello' }, { agent: { id: 'sess-a' } })
-    expect(out.text).toContain('Delivered to')
+    expect(out.text).toContain('Handed to')
 
     const rows = await ledger.query()
     expect(rows).toHaveLength(1)
@@ -176,7 +176,7 @@ describe('s2s_message ledger wiring (T6)', () => {
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
     // The ledger is optional; its absence must not break sending.
     const out = await msg.execute({ name: 'a', text: 'x' }, { agent: { id: 'sess-a' } })
-    expect(out.text).toContain('Delivered to')
+    expect(out.text).toContain('Handed to')
   })
 
   it('★ still delivers when the ledger exists but was never opened', async () => {
@@ -198,7 +198,7 @@ describe('s2s_message ledger wiring (T6)', () => {
 
     const out = await msg.execute({ name: 'a', text: 'x' }, { agent: { id: 'sess-a' } })
     // Delivery outranks bookkeeping: the message must go out regardless.
-    expect(out.text).toContain('Delivered to')
+    expect(out.text).toContain('Handed to')
     expect(broker.deliver).toHaveBeenCalledTimes(1)
     // …but the loss of tracking must not be silent (G9).
     expect(warn).toHaveBeenCalled()

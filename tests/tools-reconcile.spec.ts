@@ -229,3 +229,86 @@ describe('s2s_status reconcile exposure (T26)', () => {
     await ctx.fiber.dispose()
   })
 })
+
+describe('T9 wording honesty (I1) and sweep observability', () => {
+  it('★ the live-delivery line names what is NOT yet proven', async () => {
+    // The old line printed a bare `Delivered to …`, which a reader takes as "it
+    // is in the target's log". That is the one claim the project reserves for
+    // `landed`, so the wording must stop short of it and say where to confirm.
+    const { ctx, by } = await harness({ events: [] })
+    const out = await by('s2s_message').execute({ name: 'a', text: 'x' }, { agent: { id: 'sess-a' } })
+
+    expect(out.text).toContain('Handed to')
+    expect(out.text).toContain('NOT that it is in the target\'s log yet')
+    expect(out.text).toContain('s2s_reconcile')
+    expect(out.text).not.toContain('Delivered to')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ the absent case says the message reached nobody, and does not claim delivery', async () => {
+    // The worst instance of the old wording: `Delivered to "a" (state=absent)`
+    // asserted delivery for a message handed to no one.
+    const { ctx } = await harness({ events: [] })
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(() => 'absent' as const), history: vi.fn(() => [] as any[]) },
+      discovery: { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) },
+      ledger: ctx.get('s2sLedger') as never,
+    } as any)
+    const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
+    const out = await msg.execute({ name: 'a', text: 'x' }, { agent: { id: 'sess-a' } })
+
+    expect(out.text).toContain('NOT delivered')
+    expect(out.text).toContain('reached nobody')
+    expect(out.text).not.toContain('Delivered to')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ ★ s2s_status reports whether the sweep is armed, and whether it did anything', async () => {
+    // T24 armed a timer whose effect was unobservable. This is the line that
+    // makes "the sweep is alive here" checkable on a real host instead of only
+    // provable by a unit test.
+    const root = await mkdtemp(join(tmpdir(), 's2s-sweep-status-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx, { timerIntervalMs: 0 }) // not opened, timer off
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    // Timer deliberately off in this harness ⇒ the line must say DISARMED rather
+    // than pretend a sweep exists.
+    expect(out.text).toContain('sweep: DISARMED')
+    expect(out.text).toContain('only when s2s_reconcile is called by hand')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ ★ an armed-but-unopened sweep says it ran but could do nothing', async () => {
+    // The real `desktop` shape: timer armed, ledger never opens. Saying just
+    // "sweep ran at T" would look healthy; the SKIPPED note is what exposes that
+    // the timer is alive while its effect is not.
+    const root = await mkdtemp(join(tmpdir(), 's2s-sweep-skipped-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx, { timerIntervalMs: 60_000 })
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    // Before any tick: armed, nothing recorded yet.
+    const before = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(before.text).toContain('sweep: armed every 60s')
+    expect(before.text).toContain('has NOT run yet in this process')
+
+    // Drive one tick on an unopened ledger — the exact production situation.
+    await ledger.tick()
+    const after = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(after.text).toContain('sweep: armed every 60s')
+    expect(after.text).toContain('SKIPPED')
+    expect(after.text).toContain('The timer is alive; its effect is not')
+    await ctx.fiber.dispose()
+  })
+})

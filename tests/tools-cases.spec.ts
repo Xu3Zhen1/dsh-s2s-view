@@ -105,7 +105,13 @@ describe('s2s tools execution', () => {
     const { by } = makeTools({ broker: { deliver, history: vi.fn(() => []) } })
     const out = await by('s2s_message').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
     expect(deliver).toHaveBeenCalledTimes(1)
-    expect(out.text).toContain('Delivered')
+    // T9: the broker handing the message to a live agent is *acceptance*, not
+    // proof it reached the target's log. The line must say which, and name the
+    // tool that can confirm the stronger claim.
+    expect(out.text).toContain('Handed to')
+    expect(out.text).toContain('NOT that it is in the target\'s log yet')
+    expect(out.text).toContain('s2s_reconcile')
+    expect(out.text).not.toContain('Delivered to')
   })
   it('s2s_message dormant resumes', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) } })
@@ -128,7 +134,10 @@ describe('s2s tools execution', () => {
   it('s2s_resume dormant resumed', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) } })
     const out = await by('s2s_resume').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
-    expect(out.text).toContain('resumed and delivered')
+    // T9: the wake hands the queue over; it must not claim the message is in the
+    // target's log, which is the only sense of "delivered" this project accepts.
+    expect(out.text).toContain('resumed and the queued message(s) were handed to it')
+    expect(out.text).not.toContain('delivered')
   })
   it('s2s_resume not-found', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any) } })

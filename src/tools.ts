@@ -163,12 +163,27 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           if (state !== 'absent') {
             await noteLedger(ledger, 'markInboxed', function() { return ledger!.markInboxed(msgId, resolved.sessionId) })
           }
-          return { text: 'Delivered to "' + labelOf(resolved) + '" (state=' + state + ').' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+          // T9: the wording must not outrun the fact. `broker.deliver` returning
+          // a state means the message was handed to the live agent — it is NOT
+          // evidence the target's log now contains it, which is the only sense of
+          // "delivered" this project accepts (I1). The old line printed an
+          // unqualified `Delivered to …` even on the `absent` branch, i.e. for a
+          // message that reached nobody. Three outcomes now read differently.
+          if (state === 'absent') {
+            return { text: 'NOT delivered: "' + labelOf(resolved) + '" resolved but had no live agent (broker state=absent), so the message reached nobody (left queued).' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+          }
+          const how = state === 'idle' ? 'as a follow-up turn' : 'by context injection (the target was mid-turn)'
+          return { text: 'Handed to "' + labelOf(resolved) + '" ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
         }
         if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' }
         const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
         const queued = await lifecycle.queuedCount(resolved.sessionId)
-        const base = outcome === 'resumed' ? 'Woke "' + labelOf(resolved) + '" and delivered (queued: ' + queued + ').' : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total).'
+        // T9: `drain()` hands the queue to the agent, which is the same handover
+        // the live path reports — so the same restraint applies. The old wording
+        // said a bare "delivered", which a reader takes as "it is in the log".
+        const base = outcome === 'resumed'
+          ? 'Woke "' + labelOf(resolved) + '" and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+          : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
         return { text: base + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
       },
     }),
@@ -192,7 +207,11 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
         const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
         const queued = await lifecycle.queuedCount(resolved.sessionId)
-        return { text: outcome === 'resumed' ? 'Session "' + labelOf(resolved) + '" resumed and delivered (queued: ' + queued + ').' : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total).' }
+        // T9: same restraint as `s2s_message` — a wake hands the queue over, it
+        // does not put anything in the target's log on its own.
+        return { text: outcome === 'resumed'
+          ? 'Session "' + labelOf(resolved) + '" resumed and the queued message(s) were handed to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+          : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' }
       },
     }),
     defineTool({
@@ -276,6 +295,32 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + 'msgId is visible in the target\'s session log; until that pass runs, an inboxed row is NOT proof of delivery.'
           : 'reconcile: unavailable — it needs the ledger, which is not open, so deliveries cannot advance beyond what '
             + 'the target log itself shows (read them with s2s_history).')
+
+        // Sweep exposure (T24). The ledger arms a timer, but "armed" and
+        // "achieving something" are different facts, and on a host without
+        // `storageDomain` every tick returns early — so this line must report the
+        // last attempt AND whether it could do anything. Without it the timer is
+        // only provable by a unit test and could stop working unnoticed.
+        if (ledger === undefined) {
+          lines.push('sweep: no ledger is mounted, so no automatic sweep exists.')
+        } else {
+          const sw = ledger.sweepStatus
+          if (!sw.armed) {
+            lines.push('sweep: DISARMED (interval=' + sw.intervalMs + 'ms) — no automatic pass will run; '
+              + 'rows advance only when s2s_reconcile is called by hand.')
+          } else if (sw.last === undefined) {
+            lines.push('sweep: armed every ' + Math.round(sw.intervalMs / 1000) + 's, but has NOT run yet in this process '
+              + '(nothing recorded since the last restart).')
+          } else {
+            const ageS = Math.round((sampledAt - sw.last.at) / 1000)
+            const when = new Date(sw.last.at).toISOString()
+            lines.push('sweep: armed every ' + Math.round(sw.intervalMs / 1000) + 's; last attempt ' + when
+              + ' (' + ageS + 's ago), reconciled=' + sw.last.reconciled + ' expired=' + sw.last.expired
+              + (sw.last.skipped
+                ? ' — SKIPPED: the ledger is not open, so the sweep ran but could do nothing. The timer is alive; its effect is not.'
+                : ' — executed against the store.'))
+          }
+        }
 
         return { text: lines.join('\n') }
       },
