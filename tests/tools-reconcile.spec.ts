@@ -176,6 +176,36 @@ describe('s2s_reconcile (T26 wiring)', () => {
 })
 
 describe('s2s_status reconcile exposure (T26)', () => {
+  it('★ stamps the sample with an `as of` time and the backend the numbers came from', async () => {
+    // T26: a status read is a point-in-time sample. Live session data drifts
+    // (the same probe has read 209 then 215), so a reading is not reusable for
+    // later comparison without its instant — and the numbers mean different
+    // things depending on which store answered.
+    const { ctx, by } = await harness({ events: [] })
+    const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toMatch(/as of: \d{4}-\d{2}-\d{2}T[\d:.]+Z \(t=\d+\)/)
+    expect(out.text).toContain('backend=storage-domain')
+    expect(out.text).toContain('point-in-time sample')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ names the absent backend when the ledger is mounted but not open', async () => {
+    const root = await mkdtemp(join(tmpdir(), 's2s-status-asof-closed-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx) // deliberately NOT opened
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    // "no ledger" and "a ledger that could not open" are different diagnoses;
+    // the header must not flatten them into one.
+    expect(out.text).toContain('backend=none (ledger constructed but not open)')
+    await ctx.fiber.dispose()
+  })
+
   it('★ names s2s_reconcile so an inboxed row is not mistaken for delivered', async () => {
     const { ctx, by } = await harness({ events: [] })
     const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })

@@ -205,6 +205,15 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
       execute: async function(args) {
         const lines: string[] = []
 
+        // T26: a status read is a *sample*, and every number below is only true
+        // as of the instant it was taken. Live session data drifts, so the
+        // reading is worthless for later comparison without its timestamp, and
+        // the numbers mean different things depending on which store answered.
+        const sampledAt = Date.now()
+        const backendOf = ledger === undefined ? 'none (no ledger mounted)' : ledger.isOpen ? String(ledger.backend) : 'none (ledger constructed but not open)'
+        lines.push('as of: ' + new Date(sampledAt).toISOString() + ' (t=' + sampledAt + '), backend=' + backendOf
+          + ' — these numbers are a point-in-time sample and will drift.')
+
         // Ledger: the single most load-bearing optional dependency. Its absence
         // must be stated as a fact, not left to be inferred from empty results.
         if (ledger === undefined) {
