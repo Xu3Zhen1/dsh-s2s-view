@@ -78,22 +78,40 @@ export function apply(ctx: Context, config: Config = {}): void {
     ctx.plugin(S2sScheduleService, config.schedule)
   }
   ctx.plugin(S2sLedger, config.ledger ?? {})
-  // Opening is async and `storageDomain` is optional (Q2 allows a self-built
-  // fallback), so a failure must not abort mounting the plugin — the tools are
-  // still useful without a ledger. It must, however, be *loud*: a silently
-  // absent ledger turns every later status read into an invention (G9).
-  void (async function() {
-    const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
+  // Wait for `storageDomain` to *appear* instead of racing it (measured defect).
+  //
+  // The host builds its storage chain asynchronously: `dsh-base` patches in
+  // `storage` + `storage-json`, and `@deepseek-ai/dsh-storage-domain` provides
+  // `storageDomain` only **inside** its own `ctx.inject([backendServiceKey], …)`
+  // callback. So at the moment this plugin mounts, `ctx.get('storageDomain')` is
+  // legitimately `undefined` — not because the host lacks a store, but because
+  // the chain has not finished. The previous code asked once, threw, and never
+  // retried, so the ledger stayed shut for the whole process and `s2s_status`
+  // reported "no storageDomain" forever. Measured on this machine: `~/.dsh/storages`
+  // exists and is actively written by the host's own projection cache, which is
+  // what proved the environment was never the problem.
+  //
+  // `ctx.inject` is the right shape for that: probe-verified that injecting a
+  // service which never appears does NOT throw and does NOT stall mounting (the
+  // fiber stays ACTIVE, only the callback is withheld), and that the callback
+  // fires by itself once the service is provided. So this neither races, nor
+  // polls with a magic timeout, nor changes `S2sLedger.inject`.
+  //
+  // The ledger stays **optional**: if the host never provides the service, this
+  // callback simply never runs and the tools keep working untracked (I1/G9 —
+  // absence is reported by `s2s_status`, never invented).
+  ctx.inject(['storageDomain'], function(domainCtx) {
+    const ledger = domainCtx.get('s2sLedger') as S2sLedger | undefined
     if (ledger === undefined) return
-    try {
-      await ledger.open()
-    } catch (error: unknown) {
-      ctx.logger.warn(
+    void ledger.open().catch(function(error: unknown) {
+      // Loud, never fatal: a silently absent ledger turns every later status
+      // read into an invention.
+      domainCtx.logger.warn(
         `s2s: the durable ledger could not be opened (${String(error)}); `
         + 'messages will not be tracked and s2s_status will have nothing to report.',
       )
-    }
-  })()
+    })
+  })
   ctx.plugin(toolsPlugin)
   ctx.plugin(digestPlugin)
 }

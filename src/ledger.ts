@@ -140,10 +140,19 @@ export interface LedgerConfig {
 
 export class S2sLedger extends Service {
   /**
-   * `storageDomain` is looked up lazily through `ctx.get` rather than declared
-   * in `inject`: the plan treats it as optional (Q2 names a self-built JSON
-   * fallback), and `inject` would make the whole plugin fail to mount without
-   * it. The absence is surfaced in `open()` instead.
+   * The store behind the domain, once a caller has successfully opened it.
+   *
+   * Callers are responsible for *when* they call `open()`: the host provides
+   * `storageDomain` asynchronously (its domain plugin does so inside an
+   * `inject` callback), so opening at mount time races the chain. `src/index.ts`
+   * therefore waits on `ctx.inject(['storageDomain'], …)` rather than calling
+   * `open()` eagerly — see the note there.
+   *
+   * An earlier revision of this comment claimed `inject` "would make the whole
+   * plugin fail to mount" without the service. **That is false** and was
+   * measured: injecting a service that never appears leaves the plugin mounted
+   * and its fiber ACTIVE, withholding only the callback. The false claim is what
+   * justified the eager `ctx.get` lookup, and that lookup is what hit the race.
    */
   private domain: Domain<typeof ledgerDomain> | undefined
   /**
@@ -378,6 +387,21 @@ export class S2sLedger extends Service {
    * @throws S2sError when no `storageDomain` service is mounted. Returning
    *   quietly would leave every later status read fabricated.
    */
+  /**
+   * Open the durable ledger.
+   *
+   * Idempotent: a second call returns without reopening (the facility rejects a
+   * duplicate open of one domain name by design, so re-opening would throw).
+   *
+   * **Callers must not call this at mount time.** The host provides
+   * `storageDomain` asynchronously, so an eager call loses the race and — since
+   * this method only asks once — leaves the ledger shut for the whole process.
+   * `src/index.ts` waits on the service with `ctx.inject` for exactly this
+   * reason.
+   *
+   * @throws S2sError when no `storageDomain` is available *at this instant*.
+   *   Returning quietly would leave every later status read fabricated.
+   */
   async open(): Promise<void> {
     if (this.domain !== undefined) return
     const facility = this.ctx.get('storageDomain') as
@@ -385,8 +409,9 @@ export class S2sLedger extends Service {
       | undefined
     if (facility === undefined) {
       throw new S2sError(
-        's2s ledger: the `storageDomain` service is not mounted, so the ledger has no durable store. '
-        + 'Mount the storage-domain plugin (or wait for the self-built JSON fallback).',
+        's2s ledger: `storageDomain` is not available yet, so the ledger has no durable store. '
+        + 'Note the host provides it asynchronously — wait for it (ctx.inject([\'storageDomain\'], …)) '
+        + 'instead of calling open() at mount time, or history reads will have nothing durable to answer from.',
         'S2S_LEDGER',
       )
     }
