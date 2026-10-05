@@ -1,6 +1,7 @@
 /**
  * Model-facing s2s tools: peers (live), sessions (all w/ titles), message
- * (send / wake), resume (explicit wake), history (process-scoped).
+ * (send / wake), resume (explicit wake), history (durable, multi-source),
+ * status (self-report), reconcile (advance tracked rows against a log).
  * @module dsh-s2s/tools
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -257,7 +258,50 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           }
         }
 
+        // Reconcile exposure (T26). Without this the reconcile pass existed in
+        // the code but nothing could run it, so `inboxed` rows silently stayed
+        // `inboxed` forever and "tracked" looked like "delivered". Naming the
+        // tool here is what makes the gap findable from the self-report.
+        lines.push(ledgerAnswers
+          ? 'reconcile: available via s2s_reconcile — rows advance from inboxed to landed only when the ' 
+            + 'msgId is visible in the target\'s session log; until that pass runs, an inboxed row is NOT proof of delivery.'
+          : 'reconcile: unavailable — it needs the ledger, which is not open, so deliveries cannot advance beyond what '
+            + 'the target log itself shows (read them with s2s_history).')
+
         return { text: lines.join('\n') }
+      },
+    }),
+    defineTool({
+      name: 's2s_reconcile',
+      description: 'Advance tracked deliveries for a target from `inboxed` to `landed` by checking whether they actually appear in that target\'s session log. A row is only `landed` once its msgId is visible in the log; this is the step that turns "written into the inbox" into "delivered". Safe to call repeatedly: progress is monotonic and terminal rows are never revived.',
+      parameters: {
+        name: { type: 'string', description: 'Target session title.' },
+        session_id: { type: 'string', description: 'Exact session id.' },
+        use_cache: { type: 'boolean', description: 'Honour the short-lived log-read cache (default true). Pass false to force a fresh read of the target log.' },
+      },
+      output: OUTPUT,
+      execute: async function(args) {
+        if (ledger === undefined) return { text: 'No ledger is mounted, so there is nothing to reconcile: delivery state is not being tracked in this process.' }
+        if (!ledger.isOpen) return { text: 'The ledger is mounted but NOT OPEN (no storageDomain), so delivery state is not being tracked and there is nothing to reconcile. See s2s_status.' }
+        const resolved = (args.name !== undefined || args.session_id !== undefined) ? await resolve(args.name, args.session_id) : { kind: 'err' as const, reason: 'Provide a name or session_id.' }
+        if (resolved.kind === 'err') return { text: resolved.reason }
+        if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
+        const result = await ledger.reconcile(resolved.sessionId, {
+          ...(args.use_cache === undefined ? {} : { useCache: args.use_cache }),
+        })
+        const label = labelOf(resolved)
+        const head = result.unreadable
+          ? 'Could NOT read the session log for "' + label + '": ' + result.examined + ' tracked row(s) examined, none advanced. The log being unreadable is NOT evidence that nothing landed — the rows keep their previous status and are marked as awaiting a readable log.'
+          : result.landed === 0
+            ? 'Read the session log for "' + label + '": ' + result.examined + ' tracked row(s) examined, none newly landed.'
+            : 'Advanced ' + result.landed + ' of ' + result.examined + ' tracked row(s) for "' + label + '" to landed.'
+        const detail = [
+          'examined=' + result.examined,
+          'landed=' + result.landed,
+          'log=' + (result.unreadable ? 'UNREADABLE' : 'readable (' + (result.seenInLog ?? 0) + ' deliver(ies) visible)'),
+          'cache=' + (args.use_cache === false ? 'bypassed' : 'honoured'),
+        ]
+        return { text: head + '\n' + detail.join('  ') }
       },
     }),
     defineTool({
