@@ -102,18 +102,52 @@ export function apply(ctx: Context, config: Config = {}): void {
   // callback simply never runs and the tools keep working untracked (I1/G9 —
   // absence is reported by `s2s_status`, never invented).
   //
-  // ★ Diagnostics below exist because the FIRST version of this fix did not work
-  // on the real host while every local probe passed. The plugin logger is never
-  // persisted, so "the callback never fired" and "it fired and just did not
-  // help" are indistinguishable after the fact. These counters carry that fact
-  // out through `s2s_status` instead of through a log nobody can read.
+  // ★ Diagnostics + the stable-reference fix (review verdict: fix and instrument
+  // in ONE deploy, so the next restart yields both evidence and, if it works, a
+  // working ledger).
+  //
+  // Measured on the real host (commit d4a7f69, `s2s_status`):
+  //   register=true fired=1 ledgerVisible=false openOk=false
+  //   live probes: ctx.get(storageDomain)=PRESENT ctx.get(storage)=PRESENT storage.domain=PRESENT
+  // i.e. the injection DID fire and the store IS present, but looking the ledger
+  // up from INSIDE the callback returned undefined, so `open()` was never called.
+  // The old code did exactly that lookup, so the lookup is the blocker.
+  //
+  // The fix: capture the reference here, in `apply()` scope, and hand it to the
+  // callback. This differs from `domainCtx.get(...)` in a way that is measurable
+  // rather than assumed — `tools.ts` already proves an `apply()`-scope lookup
+  // works on this host (that is how `s2s_status` reports ledger state at all).
+  //
+  // `callbackLedgerVisible` is kept because the review explicitly requires the
+  // distinction: if the outer lookup is ALSO invisible on the real host, this is
+  // NOT a fix and the next step is service lifecycle / `ctx.plugin` semantics —
+  // not another guess. `openCalled` separates "never reached" from "reached and
+  // failed", which is the ambiguity that cost several rounds.
+  // NOTE the ordering hazard, which a test caught in the first cut of this fix:
+  // `ctx.plugin(S2sLedger, …)` above is asynchronous, so capturing the reference
+  // here — at `apply()` top level — reads it BEFORE the service registers and
+  // yields `undefined`. The capture must therefore happen lazily, INSIDE the
+  // callback (which only runs once `storageDomain` exists, long after our own
+  // service registered), while still reading through `ctx` rather than through
+  // the injected child context. That keeps the one property the measurement
+  // supports (an `apply()`-scope `ctx` lookup works on the real host — that is
+  // how `s2s_status` reports ledger state at all) without racing our own service.
   ledgerDiagnostics.injectRegistered = true
   ctx.inject(['storageDomain'], function(domainCtx) {
     ledgerDiagnostics.injectFired = (ledgerDiagnostics.injectFired ?? 0) + 1
     ledgerDiagnostics.injectFiredAt = Date.now()
-    const ledger = domainCtx.get('s2sLedger') as S2sLedger | undefined
-    ledgerDiagnostics.ledgerVisibleInCallback = ledger !== undefined
-    if (ledger === undefined) return
+    // Captured through the outer `ctx`, NOT `domainCtx` — see the note above.
+    const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
+    ledgerDiagnostics.outerLedgerVisible = ledger !== undefined
+    // Recorded for the record only: the measured failure was this lookup being
+    // undefined while the store itself was present.
+    ledgerDiagnostics.callbackLedgerVisible = domainCtx.get('s2sLedger') !== undefined
+    if (ledger === undefined) {
+      // Distinct wording, so a reading cannot be mistaken for "open failed".
+      ledgerDiagnostics.openError = 'not attempted: ctx.get(\'s2sLedger\') was undefined at callback time'
+      return
+    }
+    ledgerDiagnostics.openCalled = true
     void ledger.open().then(function() {
       ledgerDiagnostics.openSucceeded = true
     }).catch(function(error: unknown) {

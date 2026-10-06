@@ -16,16 +16,31 @@
  * time and readers must observe the latest values.
  */
 export interface LedgerDiagnostics {
+  /**
+   * Whether the ledger service was visible from `apply()` scope — the reference
+   * the fix actually uses. If this is false on the real host, the fix is void and
+   * the problem is service lifecycle, not timing.
+   */
+  outerLedgerVisible?: boolean
+  /**
+   * Whether `domainCtx.get('s2sLedger')` worked *inside* the inject callback.
+   *
+   * Kept alongside `outerLedgerVisible` because the review requires the two to be
+   * distinguishable: the measured failure was this lookup returning undefined
+   * while the store was present, and the fix works around that rather than
+   * explaining it.
+   */
+  callbackLedgerVisible?: boolean
   /** Set synchronously inside `apply()`, so it is true even if the callback never runs. */
   injectRegistered?: boolean
   /** How many times the `storageDomain` injection callback ran. */
   injectFired?: number
   injectFiredAt?: number
-  /** Whether the ledger service was visible from inside that callback. */
-  ledgerVisibleInCallback?: boolean
+  /** Whether `open()` was reached — separates "never called" from "called and failed". */
+  openCalled?: boolean
   /** Whether `open()` resolved. */
   openSucceeded?: boolean
-  /** Why `open()` rejected, verbatim. */
+  /** Why `open()` rejected, or why it was never attempted, verbatim. */
   openError?: string
 }
 

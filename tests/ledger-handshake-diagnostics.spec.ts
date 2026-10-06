@@ -64,14 +64,17 @@ describe('s2s_status ledger handshake diagnostics', () => {
     await ctx.fiber.dispose()
   })
 
-  it('★ distinguishes "fired" from "registered", and carries the open error verbatim', async () => {
-    // The two facts that separate the candidate causes of the failed fix:
-    // register=true + fired=0 means the injection never resolved;
-    // fired>=1 + openOk=false means it resolved but opening still failed.
+  it('★ distinguishes outer vs callback visibility, and open-called vs open-ok', async () => {
+    // The review requires these four to be separable. The measured real-host
+    // failure was: store PRESENT, injection fired, but the lookup INSIDE the
+    // callback returned undefined while the outer one is the one the fix uses.
+    // `openCalled` then separates "never reached" from "reached and failed".
     ledgerDiagnostics.injectRegistered = true
     ledgerDiagnostics.injectFired = 1
     ledgerDiagnostics.injectFiredAt = Date.UTC(2026, 9, 5, 0, 0, 0)
-    ledgerDiagnostics.ledgerVisibleInCallback = true
+    ledgerDiagnostics.outerLedgerVisible = true
+    ledgerDiagnostics.callbackLedgerVisible = false
+    ledgerDiagnostics.openCalled = true
     ledgerDiagnostics.openError = 's2s ledger: used before open()'
 
     const { ctx, status } = makeStatus()
@@ -80,9 +83,30 @@ describe('s2s_status ledger handshake diagnostics', () => {
     expect(line).toContain('register=true')
     expect(line).toContain('fired=1')
     expect(line).toContain('at=2026-10-05T00:00:00.000Z')
-    expect(line).toContain('ledgerVisible=true')
+    expect(line).toContain('outerLedgerVisible=true')
+    expect(line).toContain('callbackLedgerVisible=false')
+    expect(line).toContain('openCalled=true')
     expect(line).toContain('openOk=false')
     expect(line).toContain('openError=s2s ledger: used before open()')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ says open was NOT called when the ledger was invisible from apply() scope', async () => {
+    // The verdict's escape hatch: if the outer lookup is also invisible, this is
+    // not a fix and the next step is service lifecycle. The line must say so
+    // rather than implying an open() attempt failed.
+    ledgerDiagnostics.injectRegistered = true
+    ledgerDiagnostics.injectFired = 1
+    ledgerDiagnostics.outerLedgerVisible = false
+    ledgerDiagnostics.callbackLedgerVisible = false
+    ledgerDiagnostics.openError = 'not attempted: the ledger service was not visible from apply() scope either'
+
+    const { ctx, status } = makeStatus()
+    const line = handshakeLine((await status.execute({}, { agent: { id: 's' } })).text)
+
+    expect(line).toContain('openCalled=false')
+    expect(line).toContain('openOk=false')
+    expect(line).toContain('not attempted')
     await ctx.fiber.dispose()
   })
 
