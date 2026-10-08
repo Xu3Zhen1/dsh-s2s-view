@@ -156,10 +156,15 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       if (result.turns > 0) recordProbe(ctx, domainCtx, 'ready-after-' + result.turns + '-turns')
       ledgerDiagnostics.openCalled = true
+      ledgerDiagnostics.openCalledAt = Date.now()
+      recordProbe(ctx, domainCtx, 'open-called')
       return result.value.open().then(function() {
         ledgerDiagnostics.openSucceeded = true
+        ledgerDiagnostics.openSucceededAt = Date.now()
+        recordProbe(ctx, domainCtx, 'open-succeeded')
       }).catch(function(error: unknown) {
         ledgerDiagnostics.openError = String(error)
+        recordProbe(ctx, domainCtx, 'open-error')
         // Loud, never fatal: a silently absent ledger turns every later status
         // read into an invention.
         domainCtx.logger.warn(

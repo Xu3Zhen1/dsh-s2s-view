@@ -15,7 +15,7 @@ import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics, recordProbe } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, recordFirstS2sToolCall, recordProbe } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -367,6 +367,36 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + ' ctx.get(storage)=' + probe('storage')
             + ' storage.domain=' + hubProbe)
 
+          // The cold-start clock. Rendered as ISO so it can be compared against
+          // the host process's Start time by eye; the criterion itself is
+          // procStart <= openCalledAt <= openSucceededAt < firstS2sToolCallAt.
+          // `firstS2sToolCallAt` is sampled on the tool pipeline, NOT here — a
+          // stamp written by this handler would be produced by the act of
+          // reading it, which is the observer effect this replaced.
+          const iso = function(ms: number | undefined): string {
+            return ms === undefined ? 'n/a' : new Date(ms).toISOString()
+          }
+          const order = (function(): string {
+            const p = d.procStart
+            const c = d.openCalledAt
+            const s = d.openSucceededAt
+            const f = d.firstS2sToolCallAt
+            if (p === undefined || c === undefined || s === undefined) return 'incomplete'
+            if (f === undefined) return 'unknown (no s2s_* tool call observed yet)'
+            const monotone = p <= c && c <= s
+            const cold = s < f
+            return 'procStart<=openCalledAt<=openSucceededAt=' + String(monotone)
+              + ' openSucceededAt<firstS2sToolCallAt=' + String(cold)
+              + ((monotone && cold) ? ' => COLD-START-OK' : ' => COLD-START-NOT-PROVEN')
+          })()
+          lines.push('handshake-clock: procStart=' + iso(d.procStart)
+            + ' openCalledAt=' + iso(d.openCalledAt)
+            + ' openOkAt=' + iso(d.openSucceededAt)
+            + ' firstS2sToolCallAt=' + iso(d.firstS2sToolCallAt)
+            + (d.firstS2sToolCallName === undefined ? '' : ' (' + d.firstS2sToolCallName + ')')
+            + ' injectFiredAt=' + iso(d.injectFiredAt))
+          lines.push('handshake-coldstart: ' + order)
+
           // The series. Each row answers "can we see the ledger here, and if not,
           // does the implementation exist anyway, and what state is its fiber in".
           // `implPresent=true` + `selfGet=false` ⇒ registered but gated (lifecycle).
@@ -508,7 +538,23 @@ export const name = 's2s-tools'
 export const inject = ['s2sBroker', 's2sDiscovery', 'tools']
 
 export function apply(ctx: Context): void {
-  const tools = ctx.get('tools') as { register(definition: ToolDefinition): () => void }
+  const tools = ctx.get('tools') as { register(definition: ToolDefinition): () => void; on?(event: string, listener: (...args: never[]) => unknown): () => void }
+  // Independent cold-start sampler. Registered on the tool pipeline rather than
+  // inside `s2s_status` so the stamp is produced by the FIRST s2s_* call of any
+  // kind — reading the status must not be what creates the boundary it is
+  // measured against. Optional call because a test double may not implement it.
+  if (typeof tools.on === 'function') {
+    try {
+      tools.on('tools/pre-execute', function(exec: { name?: string }) {
+        const calledName = exec?.name
+        if (typeof calledName === 'string' && calledName.indexOf('s2s_') === 0) {
+          recordFirstS2sToolCall(calledName)
+        }
+      })
+    } catch {
+      // Diagnostics never break mounting.
+    }
+  }
   const broker = ctx.get('s2sBroker') as S2sBroker
   const discovery = ctx.get('s2sDiscovery') as S2sDiscoveryService
   const lifecycle = ctx.get('s2sLifecycle') as S2sLifecycleService | undefined

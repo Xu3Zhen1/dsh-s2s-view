@@ -72,6 +72,31 @@ export interface LedgerDiagnostics {
   /** Why `open()` rejected, or why it was never attempted, verbatim. */
   openError?: string
   /**
+   * When this process began, sampled from `process.uptime()` at module load.
+   *
+   * The cold-start criterion needs a clock that is independent of the plugin's
+   * own lifecycle hooks: `procStart` is it. `Date.now() - process.uptime()*1000`
+   * is the process's own start instant, so every handshake timestamp must be
+   * `>= procStart` and a reading from a previous process cannot satisfy that.
+   */
+  procStart?: number
+  /** Wall-clock `Date.now()` when `open()` was invoked. */
+  openCalledAt?: number
+  /** Wall-clock `Date.now()` when `open()` resolved successfully. */
+  openSucceededAt?: number
+  /**
+   * Wall-clock `Date.now()` of the first `s2s_*` tool call in this process.
+   *
+   * Sampled from the `tools/pre-execute` waterfall rather than from inside
+   * `s2s_status`. That distinction is the whole point: a stamp written by the
+   * status handler would be produced BY the act of reading the status, so it
+   * could never show that `open()` succeeded before any tool ran (the original
+   * criterion had exactly that observer effect).
+   */
+  firstS2sToolCallAt?: number
+  /** Name of that first tool call, for the record. */
+  firstS2sToolCallName?: string
+  /**
    * The same reading taken at four points in the lifecycle, because a single
    * reading cannot tell "never registered" from "registered then invisible".
    *
@@ -83,6 +108,34 @@ export interface LedgerDiagnostics {
 
 /** Shared, mutable handshake record. */
 export const ledgerDiagnostics: LedgerDiagnostics = {}
+
+// Sampled once, at module load: `process.uptime()` counts from process start, so
+// this is the process's own beginning and no earlier reading can precede it.
+// Wrapped because a hostile/odd embedding may not expose `process`.
+try {
+  ledgerDiagnostics.procStart = Date.now() - Math.round(process.uptime() * 1000)
+} catch {
+  // Leave it undefined; the handshake renders it as unknown rather than lying.
+}
+
+/**
+ * Record the first `s2s_*` tool invocation of this process, once.
+ *
+ * Idempotent by design: the criterion compares against the FIRST call, so later
+ * calls must not move the stamp. Never throws — this runs inside the tool
+ * pipeline, and a diagnostic must not be able to break a tool call.
+ *
+ * @param toolName - the name of the tool about to execute.
+ */
+export function recordFirstS2sToolCall(toolName: string): void {
+  try {
+    if (ledgerDiagnostics.firstS2sToolCallAt !== undefined) return
+    ledgerDiagnostics.firstS2sToolCallAt = Date.now()
+    ledgerDiagnostics.firstS2sToolCallName = toolName
+  } catch {
+    // Diagnostics never break the caller.
+  }
+}
 
 /** How many probe rows to keep. Four lifecycle points; the cap only guards against repeats. */
 const MAX_PROBES = 12
