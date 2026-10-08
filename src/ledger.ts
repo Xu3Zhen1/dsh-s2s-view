@@ -156,6 +156,14 @@ export class S2sLedger extends Service {
    */
   private domain: Domain<typeof ledgerDomain> | undefined
   /**
+   * In-flight `open()`, shared by concurrent callers.
+   *
+   * `open()` awaits the facility, so the `domain` guard alone lets two callers
+   * through and the store answers `domain 's2s' is already open`. Holding the
+   * promise here makes a second caller join the first instead of racing it.
+   */
+  private opening: Promise<void> | undefined
+  /**
    * Per-session cache of the last log read, bounded by
    * `LEDGER_LIMITS.reconcileTtlMs`.
    *
@@ -404,18 +412,41 @@ export class S2sLedger extends Service {
    */
   async open(): Promise<void> {
     if (this.domain !== undefined) return
-    const facility = this.ctx.get('storageDomain') as
-      | { open(spec: typeof ledgerDomain): Promise<Domain<typeof ledgerDomain>> }
-      | undefined
-    if (facility === undefined) {
-      throw new S2sError(
-        's2s ledger: `storageDomain` is not available yet, so the ledger has no durable store. '
-        + 'Note the host provides it asynchronously — wait for it (ctx.inject([\'storageDomain\'], …)) '
-        + 'instead of calling open() at mount time, or history reads will have nothing durable to answer from.',
-        'S2S_LEDGER',
-      )
+    // ★ Concurrent callers must share ONE open. The guard above is not enough:
+    // `facility.open()` is awaited below, so a second caller arriving during that
+    // await also passes the guard and opens the same domain again — the store
+    // rejects it with `domain 's2s' is already open`. This became reachable once
+    // the mount path began waiting for its own service, because the wait can now
+    // overlap an explicit `open()` from elsewhere (T6b tests do exactly that).
+    if (this.opening === undefined) {
+      // Note: deliberately no `#private` method and no detached helper — a cordis
+      // `Service` instance can be a callable proxy, which rejects `#` brand
+      // checks with "Receiver must be an instance of class". A local closure keeps
+      // `this` bound to whatever object `open()` was invoked on.
+      const self = this
+      this.opening = (async function(): Promise<void> {
+        // Kept spelled `this.ctx.get('storageDomain')` on purpose: `ledger-backup`
+        // asserts that exact text to prove the ledger never chooses its own path
+        // (it asks the host for the store instead of self-hosting a file).
+        const facility = (function(this: S2sLedger) {
+          return this.ctx.get('storageDomain')
+        }).call(self) as
+          | { open(spec: typeof ledgerDomain): Promise<Domain<typeof ledgerDomain>> }
+          | undefined
+        if (facility === undefined) {
+          throw new S2sError(
+            's2s ledger: `storageDomain` is not available yet, so the ledger has no durable store. '
+            + 'Note the host provides it asynchronously — wait for it (ctx.inject([\'storageDomain\'], …)) '
+            + 'instead of calling open() at mount time, or history reads will have nothing durable to answer from.',
+            'S2S_LEDGER',
+          )
+        }
+        self.domain = await facility.open(ledgerDomain)
+      })()
+      // Cleared either way: a failed open must not wedge every later attempt.
+      void this.opening.catch(function() {}).finally(function() { self.opening = undefined })
     }
-    this.domain = await facility.open(ledgerDomain)
+    return this.opening
   }
 
   /** Close the domain. Safe to call when never opened. */

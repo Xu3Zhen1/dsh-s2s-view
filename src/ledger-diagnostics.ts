@@ -156,3 +156,65 @@ export function recordProbe(ctx: unknown, child: unknown, via: string): void {
     // Diagnostics never break the caller.
   }
 }
+
+/**
+ * How many turns to keep re-reading the ledger before giving up.
+ *
+ * The measured host series needed exactly one (retrievable on the next turn),
+ * but this is a bound, not a schedule: the loop re-reads and stops as soon as
+ * the service appears. Eight turns is free and still finite.
+ */
+export const LEDGER_READY_MAX_TURNS = 8
+
+/** Outcome of {@link waitForLedger}. */
+export interface LedgerWaitResult<T> {
+  /** The service, once retrievable. */
+  value: T | undefined
+  /** How many unsuccessful reads preceded success (`0` = visible immediately). */
+  turns: number
+  /**
+   * True when the bound was hit without the service ever appearing.
+   *
+   * Kept distinct from `value === undefined` alone so the caller can report
+   * "never became retrievable" rather than implying an `open()` failed.
+   */
+  exhausted: boolean
+}
+
+/**
+ * Re-read a service until it becomes retrievable, then hand it back.
+ *
+ * **Why this exists as a pure function.** The real defect was a lifecycle gate:
+ * cordis withholds a service while its *providing fiber* is not yet ACTIVE
+ * (`_getImpl`: `if (strict && impl.fiber.state !== 2) return`). On the measured
+ * host the service was invisible at callback time and visible one turn later.
+ *
+ * This cannot be exercised through a real cordis context in a unit test — six
+ * local probes could not reproduce the host's ordering, and cordis gives each
+ * fiber its own context object, so patching `get` in the test does not intercept
+ * the plugin's calls (that mistake produced a vacuous test that passed with the
+ * retry removed). Taking `read` as a parameter makes the seam testable with a
+ * deterministic fake while the production call site stays trivially thin.
+ *
+ * @param read — one fresh attempt; return `undefined` when not yet retrievable.
+ * @param maxTurns — bound on unsuccessful attempts (default {@link LEDGER_READY_MAX_TURNS}).
+ * @param wait — yields to the scheduler between attempts; injectable for tests.
+ * @param onTurn — called with the turn number after each unsuccessful read.
+ */
+export async function waitForLedger<T>(
+  read: () => T | undefined,
+  maxTurns: number = LEDGER_READY_MAX_TURNS,
+  wait: () => Promise<void> = function() { return Promise.resolve() },
+  onTurn?: (turn: number) => void,
+): Promise<LedgerWaitResult<T>> {
+  let turns = 0
+  for (;;) {
+    const value = read()
+    if (value !== undefined) return { value, turns, exhausted: false }
+    turns += 1
+    onTurn?.(turns)
+    if (turns >= maxTurns) return { value: undefined, turns, exhausted: true }
+    await wait()
+  }
+}
+

@@ -15,7 +15,7 @@ import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
 import { S2sLedger, type LedgerConfig } from './ledger.ts'
-import { ledgerDiagnostics, recordProbe } from './ledger-diagnostics.ts'
+import { LEDGER_READY_MAX_TURNS, ledgerDiagnostics, recordProbe, waitForLedger } from './ledger-diagnostics.ts'
 import * as toolsPlugin from './tools.ts'
 import * as digestPlugin from './digest.ts'
 
@@ -102,53 +102,71 @@ export function apply(ctx: Context, config: Config = {}): void {
   // callback simply never runs and the tools keep working untracked (I1/G9 —
   // absence is reported by `s2s_status`, never invented).
   //
-  // ★ Last directed real-host probe round (review verdict: "continue once, but
-  // make this the final directed round").
+  // ★ LIFECYCLE-AWARE OPEN — the fix the measured series points to.
   //
-  // Two rounds of fixes failed on the host while every local model passed, and a
-  // single reading per round could not separate the remaining explanations. So
-  // this round records a SERIES — the same reading at four lifecycle points —
-  // plus the one thing that distinguishes the surviving hypotheses: whether the
-  // service implementation EXISTS but is gated off, versus never being visible at
-  // all. See `LedgerProbe` for why that pair is the discriminator.
+  // The series from f256fce on the real host:
+  //   apply-entry             selfGet=false  selfFiberState=1
+  //   storage-domain-callback selfGet=false  selfFiberState=1
+  //   callback-microtask      selfGet=true   selfFiberState=2
+  //   callback-macrotask      selfGet=true   selfFiberState=2
+  //   tools-first-execution   selfGet=true   selfFiberState=2
   //
-  // Stop-loss agreed with the review: if `implPresent=true` with a non-ACTIVE
-  // fiber, pick a lifecycle-compatible fix and verify once. If the impl is absent,
-  // or the states contradict, or the mechanism still cannot be told apart —
-  // stop chasing cordis and evaluate the self-built JSON backend instead.
+  // `selfGet` flips false->true in lockstep with our OWN fiber reaching state 2.
+  // That is cordis `_getImpl`:
+  //     const impl = key && this.store[key]
+  //     if (strict && impl.fiber.state !== 2) return   // <- the gate
+  // So the service is registered but withheld until its providing fiber is
+  // ACTIVE — and at callback time (in the host's ordering) that fiber was still
+  // 1. Waiting for `storageDomain` was therefore never sufficient, and looking
+  // through the outer `ctx` could not help: it is the SAME fiber either way.
+  // Both earlier fixes changed WHERE to look; the defect was WHEN.
+  //
+  // So gate on both conditions: the store is available AND our own ledger is
+  // actually retrievable. `_updateState` notifies dependents when a fiber becomes
+  // ACTIVE, so waiting one turn is enough in practice — but this does not ASSUME
+  // that: it re-checks and gives up after a bounded number of turns rather than
+  // sleeping a magic interval forever.
   recordProbe(ctx, undefined, 'apply-entry')
   ledgerDiagnostics.injectRegistered = true
   ctx.inject(['storageDomain'], function(domainCtx) {
     ledgerDiagnostics.injectFired = (ledgerDiagnostics.injectFired ?? 0) + 1
     ledgerDiagnostics.injectFiredAt = Date.now()
     recordProbe(ctx, domainCtx, 'storage-domain-callback')
-    // Microtask and macrotask re-reads: if the service becomes visible one tick
-    // later, the cause is scheduling, not registration — a distinction no
-    // same-tick reading can make.
-    void Promise.resolve().then(function() { recordProbe(ctx, domainCtx, 'callback-microtask') })
-    setTimeout(function() { recordProbe(ctx, domainCtx, 'callback-macrotask') }, 0)
-    // Captured through the outer `ctx`, NOT `domainCtx` — see the note above.
-    const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
-    ledgerDiagnostics.outerLedgerVisible = ledger !== undefined
+
+    // Wait for our own service to become retrievable, then open. The loop itself
+    // is `waitForLedger` so its behaviour is unit-testable with a deterministic
+    // fake `read`; cordis gives every fiber its own context object, so a test
+    // cannot intercept this call site by patching `get`.
+    const first = ctx.get('s2sLedger') as S2sLedger | undefined
+    ledgerDiagnostics.outerLedgerVisible = first !== undefined
     // Recorded for the record only: the measured failure was this lookup being
     // undefined while the store itself was present.
     ledgerDiagnostics.callbackLedgerVisible = domainCtx.get('s2sLedger') !== undefined
-    if (ledger === undefined) {
-      // Distinct wording, so a reading cannot be mistaken for "open failed".
-      ledgerDiagnostics.openError = 'not attempted: ctx.get(\'s2sLedger\') was undefined at callback time'
-      return
-    }
-    ledgerDiagnostics.openCalled = true
-    void ledger.open().then(function() {
-      ledgerDiagnostics.openSucceeded = true
-    }).catch(function(error: unknown) {
-      ledgerDiagnostics.openError = String(error)
-      // Loud, never fatal: a silently absent ledger turns every later status
-      // read into an invention.
-      domainCtx.logger.warn(
-        `s2s: the durable ledger could not be opened (${String(error)}); `
-        + 'messages will not be tracked and s2s_status will have nothing to report.',
-      )
+
+    void waitForLedger<S2sLedger>(
+      function() { return ctx.get('s2sLedger') as S2sLedger | undefined },
+      LEDGER_READY_MAX_TURNS,
+      function() { return new Promise<void>(function(resolve) { Promise.resolve().then(resolve) }) },
+      function(turn) { recordProbe(ctx, domainCtx, 'wait-turn-' + turn) },
+    ).then(function(result) {
+      if (result.value === undefined) {
+        ledgerDiagnostics.openError = 'not attempted: ctx.get(\'s2sLedger\') was still undefined after '
+          + result.turns + ' turns (the service never became retrievable)'
+        return
+      }
+      if (result.turns > 0) recordProbe(ctx, domainCtx, 'ready-after-' + result.turns + '-turns')
+      ledgerDiagnostics.openCalled = true
+      return result.value.open().then(function() {
+        ledgerDiagnostics.openSucceeded = true
+      }).catch(function(error: unknown) {
+        ledgerDiagnostics.openError = String(error)
+        // Loud, never fatal: a silently absent ledger turns every later status
+        // read into an invention.
+        domainCtx.logger.warn(
+          `s2s: the durable ledger could not be opened (${String(error)}); `
+          + 'messages will not be tracked and s2s_status will have nothing to report.',
+        )
+      })
     })
   })
   ctx.plugin(toolsPlugin)
