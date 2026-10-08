@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { buildTools } from '../src/tools.ts'
 import { S2sLedger } from '../src/ledger.ts'
-import { ledgerDiagnostics, type LedgerDiagnostics } from '../src/ledger-diagnostics.ts'
+import { ledgerDiagnostics, probeLedger, type LedgerDiagnostics } from '../src/ledger-diagnostics.ts'
 
 /**
  * The `handshake:` line on `s2s_status`.
@@ -108,6 +108,40 @@ describe('s2s_status ledger handshake diagnostics', () => {
     expect(line).toContain('openOk=false')
     expect(line).toContain('not attempted')
     await ctx.fiber.dispose()
+  })
+
+  it('★ renders the probe SERIES with the lifecycle discriminator', async () => {
+    // The review's requirement: a single reading cannot tell "never registered"
+    // from "registered then invisible". `implPresent` + `implFiberState` are what
+    // separate lifecycle gating from absence, so the line must carry them.
+    ledgerDiagnostics.probes = [
+      { at: 'x', t: 1, selfGet: false, childGet: false, implPresent: false, implFiberState: null, selfFiberState: 2, via: 'apply-entry' },
+      { at: 'y', t: 2, selfGet: false, childGet: false, implPresent: true, implFiberState: 4, selfFiberState: 2, via: 'storage-domain-callback' },
+    ]
+
+    const { ctx, status } = makeStatus()
+    const text = (await status.execute({}, { agent: { id: 's' } })).text
+    const rows = text.split('\n').filter((l) => l.startsWith('handshake-series:'))
+
+    // One row per recorded reading, in order, plus the row this very call records.
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    // Format is `handshake-series: <via> <facts…>` — the via is positional.
+    expect(rows[0]).toContain('handshake-series: apply-entry ')
+    expect(rows[0]).toContain('implPresent=false')
+    expect(rows[1]).toContain('handshake-series: storage-domain-callback ')
+    // The discriminator: impl exists but its fiber is not ACTIVE (2).
+    expect(rows[1]).toContain('implPresent=true')
+    expect(rows[1]).toContain('implFiberState=4')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ probe series never throws on a shape it does not understand', async () => {
+    // Diagnostics must not be the thing that breaks the tool they explain.
+    const weird = probeLedger({ get() { throw new Error('boom') } }, undefined, 'hostile')
+    expect(weird.selfGet).toBe(false)
+    expect(weird.implPresent).toBe(false)
+    // A missing ctx must not throw either.
+    expect(probeLedger(undefined, undefined, 'none').selfGet).toBe(false)
   })
 
   it('★ includes live probes so a model of the host is never needed', async () => {

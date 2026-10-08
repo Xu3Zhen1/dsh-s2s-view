@@ -15,7 +15,7 @@ import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, recordProbe } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -325,17 +325,18 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
 
         // ★ Ledger handshake diagnostics.
         //
-        // The first attempt at the race fix passed every local probe and did
-        // nothing on the real host. Since the plugin logger is never persisted,
-        // "the callback never fired" and "it fired but the store still was not
-        // there" look identical afterwards. This line carries the handshake out
-        // through the tool surface so the next iteration is driven by evidence
-        // from the running process rather than by local models of it.
+        // Two fixes failed on the real host while every local model passed. A
+        // single reading per round could not separate the remaining causes, so
+        // this prints a SERIES and the one discriminator that matters: whether
+        // the service implementation exists but is gated off (lifecycle) versus
+        // never being reachable at all. This tool's own execution is the fourth
+        // lifecycle point — the one where `tools.ts` is known to succeed.
         //
         // Guarded on `ctx` because a diagnostic must never be the thing that
         // breaks the tool it is meant to explain — a harness that builds the
         // tools without a context still has to be able to ask for status.
         {
+          recordProbe(ctx, undefined, 'tools-first-execution')
           const d = ledgerDiagnostics
           const probe = function(name: string): string {
             if (ctx === undefined) return 'n/a (no ctx)'
@@ -365,6 +366,24 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + '  |  live probes: ctx.get(storageDomain)=' + probe('storageDomain')
             + ' ctx.get(storage)=' + probe('storage')
             + ' storage.domain=' + hubProbe)
+
+          // The series. Each row answers "can we see the ledger here, and if not,
+          // does the implementation exist anyway, and what state is its fiber in".
+          // `implPresent=true` + `selfGet=false` ⇒ registered but gated (lifecycle).
+          // `implPresent=false` ⇒ never reachable on this store (a different problem).
+          const rows = d.probes ?? []
+          if (rows.length === 0) {
+            lines.push('handshake-series: (no readings recorded)')
+          } else {
+            for (const r of rows) {
+              lines.push('handshake-series: ' + r.via
+                + ' selfGet=' + String(r.selfGet)
+                + ' childGet=' + String(r.childGet)
+                + ' implPresent=' + String(r.implPresent)
+                + ' implFiberState=' + String(r.implFiberState)
+                + ' selfFiberState=' + String(r.selfFiberState))
+            }
+          }
         }
 
         return { text: lines.join('\n') }
