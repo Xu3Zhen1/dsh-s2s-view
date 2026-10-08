@@ -206,12 +206,33 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
         const from = args.from ?? String(exec.agent?.id ?? 'unknown')
         const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+        // Record before queueing, exactly as `s2s_message` does. Without this the
+        // dormant `drain()` reaches `markInboxed()` with no row to advance: the
+        // wake was delivered, the ledger kept nothing, and `s2s_reconcile`
+        // reported `examined=0` forever. Measured on the real host — the target's
+        // log held `[s2s-lifecycle message] msgId=wake-…` while the ledger had
+        // zero rows for it. `markInboxed` must not be the one to create the row:
+        // that would fabricate a `record` and hide a missing one.
+        const recorded = await noteLedger(ledger, 'record', function() {
+          return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text })
+        })
         const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
         const queued = await lifecycle.queuedCount(resolved.sessionId)
         // T9: same restraint as `s2s_message` — a wake hands the queue over, it
         // does not put anything in the target's log on its own.
+        //
+        // The confirmation pointer is only offered when this process actually
+        // recorded the row. An unopened or absent ledger makes `record()` a
+        // no-op, and naming `s2s_reconcile` in that state would point the reader
+        // at a source that structurally cannot answer — the overclaim I1 forbids,
+        // one level removed (the claim is about the evidence, not the delivery).
+        // That is why the gate is `noteLedger`'s own return, not `ledger.isOpen`:
+        // an open ledger whose write threw is just as untracked.
+        const confirm = recorded
+          ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
+          : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
         return { text: outcome === 'resumed'
-          ? 'Session "' + labelOf(resolved) + '" resumed and the queued message(s) were handed to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+          ? 'Session "' + labelOf(resolved) + '" resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm
           : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' }
       },
     }),
@@ -243,6 +264,23 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + 'Cause: no `storageDomain` service (or its open failed). s2s_status/history have nothing durable to read.')
         } else {
           lines.push('ledger: open (backend=' + String(ledger.backend) + ').')
+        }
+
+        // ★ Untracked deliveries — the read-back for a failure that used to be
+        // invisible. `markInboxed()` warns through the plugin logger when its row
+        // is missing, and that logger is never persisted, so "the delivery was
+        // tracked" and "it silently was not" left identical evidence. Measured on
+        // the real host: a dormant wake landed in the target's log while the
+        // ledger held zero rows for it. Printed only when non-empty, because a
+        // permanent "0" line trains the reader to skip it.
+        const untracked = ledgerDiagnostics.untrackedDeliveries ?? []
+        if (untracked.length > 0) {
+          lines.push('ledger UNTRACKED deliveries: ' + untracked.length + ' delivery(ies) could not be tracked '
+            + '(no row to advance at handover — the sending entry never recorded it):')
+          for (const u of untracked) {
+            lines.push('  ' + u.msgId + ' -> ' + u.resolvedSessionId + '  at=' + new Date(u.at).toISOString())
+          }
+          lines.push('  These appear in the target\'s session log but are absent from the ledger, so s2s_reconcile cannot see them. Read them with s2s_history.')
         }
 
         // History durability: T11 gave history a durable read path, so the old
@@ -310,8 +348,14 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             lines.push('sweep: DISARMED (interval=' + sw.intervalMs + 'ms) — no automatic pass will run; '
               + 'rows advance only when s2s_reconcile is called by hand.')
           } else if (sw.last === undefined) {
+            // The schedule is printed even with nothing to report yet: the
+            // interval is 1h and the deadline 24h, so within a verification
+            // window "armed, not yet due" and "never armed" would otherwise look
+            // identical — both are simply a missing `last` (G9).
             lines.push('sweep: armed every ' + Math.round(sw.intervalMs / 1000) + 's, but has NOT run yet in this process '
-              + '(nothing recorded since the last restart).')
+              + '(nothing recorded since the last restart).'
+              + (sw.nextSweepAt === undefined ? '' : ' Next pass due at ' + new Date(sw.nextSweepAt).toISOString() + '.')
+              + ' A row may stay unreadable for ' + Math.round(sw.landedDeadlineMs / 3600000) + 'h before it is a zombie.')
           } else {
             const ageS = Math.round((sampledAt - sw.last.at) / 1000)
             const when = new Date(sw.last.at).toISOString()
@@ -319,7 +363,9 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               + ' (' + ageS + 's ago), reconciled=' + sw.last.reconciled + ' expired=' + sw.last.expired
               + (sw.last.skipped
                 ? ' — SKIPPED: the ledger is not open, so the sweep ran but could do nothing. The timer is alive; its effect is not.'
-                : ' — executed against the store.'))
+                : ' — executed against the store.')
+              + (sw.nextSweepAt === undefined ? '' : ' Next pass due at ' + new Date(sw.nextSweepAt).toISOString() + '.')
+              + ' A row may stay unreadable for ' + Math.round(sw.landedDeadlineMs / 3600000) + 'h before it is a zombie.')
           }
         }
 

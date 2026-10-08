@@ -20,6 +20,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { S2sError } from './error.ts'
 import { readSessionLog, type HistoryEntry } from './history.ts'
+import { recordUntrackedDelivery } from './ledger-diagnostics.ts'
 import {
   LEDGER_LIMITS,
   MESSAGES_TABLE,
@@ -62,17 +63,23 @@ import {
  * @param ledger - the ledger service, or `undefined` when none is mounted.
  * @param operation - the ledger method name, for the warning.
  * @param run - the actual call, invoked only when a ledger is present.
+ * @returns whether the write actually happened. `false` covers both "no ledger"
+ *   and "the write failed" — callers need that distinction to avoid pointing a
+ *   reader at evidence that does not exist (a confirmation pointer is only valid
+ *   when a row was really written).
  */
 export async function noteLedger(
   ledger: S2sLedger | undefined,
   operation: string,
   run: () => Promise<void>,
-): Promise<void> {
-  if (ledger === undefined) return
+): Promise<boolean> {
+  if (ledger === undefined) return false
   try {
     await run()
+    return true
   } catch (error: unknown) {
     ledger.warn(operation, error)
+    return false
   }
 }
 
@@ -237,12 +244,34 @@ export class S2sLedger extends Service {
    * Exposed as a read-only view so `s2s_status` can state whether a sweep is
    * even *armed* and what the last one achieved — the difference between "this
    * feature exists in the bundle" and "this feature is running here".
+   *
+   * `nextSweepAt` and `landedDeadlineMs` were added because the two constants
+   * make the sweep unobservable inside a verification window: the interval is 1h
+   * and the deadline 24h, so "the timer is armed but has not fired yet" and "the
+   * timer is not armed at all" both show up as a missing `last`. Publishing when
+   * the next pass is *due* — and how long a row may stay unreadable before it is
+   * a zombie — lets a reader see that the schedule is real instead of inferring
+   * it from silence. Purely additive: no behaviour depends on these fields.
    */
-  get sweepStatus(): { armed: boolean; intervalMs: number; last?: { at: number; reconciled: number; expired: number; skipped: boolean } } {
+  get sweepStatus(): {
+    armed: boolean
+    intervalMs: number
+    last?: { at: number; reconciled: number; expired: number; skipped: boolean }
+    /** Epoch ms of the next due pass; absent when the sweep is disarmed. */
+    nextSweepAt?: number
+    /** How long a row may stay unreadable before it is declared a zombie. */
+    landedDeadlineMs: number
+  } {
+    const last = this.lastSweep
+    // Due time is derived from the last pass when there was one, otherwise from
+    // now: the timer's first tick is one full interval after construction.
+    const base = last === undefined ? Date.now() : last.at
     return {
       armed: this.timer !== undefined,
       intervalMs: this.timerIntervalMs,
-      ...(this.lastSweep === undefined ? {} : { last: this.lastSweep }),
+      ...(last === undefined ? {} : { last }),
+      ...(this.timer === undefined ? {} : { nextSweepAt: base + this.timerIntervalMs }),
+      landedDeadlineMs: LEDGER_LIMITS.landedDeadlineMs,
     }
   }
 
@@ -562,10 +591,20 @@ export class S2sLedger extends Service {
         // Reachable if a caller delivers without recording first. Not fatal to the
         // delivery, but it must not pass unremarked — a ledger silently missing
         // rows is worse than one that says it is missing them (G9).
+        //
+        // The warning alone was not enough, and that was measured: `s2s_resume`
+        // delivered without ever calling `record()`, this branch swallowed the
+        // transition, and the plugin logger is never persisted — so the ledger
+        // showed zero rows while the target's log held the message, with nothing
+        // anywhere saying why. `recordUntrackedDelivery` is the read-back that
+        // makes this branch externally visible (`s2s_status`). It is a diagnostic,
+        // not a fallback: writing the row here would invent a `record` that never
+        // happened and hide the caller's bug.
         this.ctx.logger.warn(
           `s2s ledger: markInboxed("${msgId}") found no recorded row; the delivery is not tracked. `
           + 'Record the message before delivering it.',
         )
+        recordUntrackedDelivery(msgId, resolvedSessionId)
         return
       }
       if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return

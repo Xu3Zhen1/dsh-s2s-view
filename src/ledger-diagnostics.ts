@@ -117,6 +117,33 @@ export interface LedgerDiagnostics {
    * every explanation stayed equally consistent with it.
    */
   probes?: LedgerProbe[]
+  /**
+   * Deliveries whose `markInboxed()` found no row to advance.
+   *
+   * This is the G9 hole that let a real defect hide: `s2s_resume` delivered a
+   * message without ever calling `record()`, so `markInboxed` hit its
+   * `row === undefined` branch, warned through the plugin logger — and the
+   * plugin logger is **never persisted**, so afterwards "it was tracked" and
+   * "it silently was not" had identical evidence. Measured on the real host:
+   * the target's log carried the message while the ledger held zero rows for it
+   * and `s2s_reconcile` reported `examined=0`.
+   *
+   * These entries are read back by `s2s_status`, so the failure is obtainable
+   * from the running process. Deliberately process-scoped and bounded: this is a
+   * *diagnostic read-back*, not a second persistence protocol — the ledger row
+   * remains the only durable record of a delivery.
+   */
+  untrackedDeliveries?: UntrackedDelivery[]
+}
+
+/** One `markInboxed()` that had nothing to advance. */
+export interface UntrackedDelivery {
+  /** The id whose row was missing. */
+  msgId: string
+  /** Where the delivery nevertheless went. */
+  resolvedSessionId: string
+  /** Epoch ms; sampled here because nothing else records this event. */
+  at: number
 }
 
 /** Shared, mutable handshake record. */
@@ -152,6 +179,37 @@ export function recordFirstS2sToolCall(toolName: string): void {
 
 /** How many probe rows to keep. Four lifecycle points; the cap only guards against repeats. */
 const MAX_PROBES = 12
+
+/**
+ * How many untracked-delivery entries to keep.
+ *
+ * Bounded rather than grown: this exists so a reader can see that the failure
+ * happens *and which message it happened to*, not as an audit log. The durable
+ * per-message record is the ledger row — the whole point is that there wasn't
+ * one.
+ */
+const MAX_UNTRACKED_DELIVERIES = 10
+
+/**
+ * Record a delivery that could not be tracked because its row was never written.
+ *
+ * Called from the ledger's `markInboxed()` when `table.get(msgId)` misses. It
+ * never throws: this runs on the delivery path, and a diagnostic must not be
+ * able to turn "untracked" into "undelivered".
+ *
+ * @param msgId - the id whose row was absent.
+ * @param resolvedSessionId - the session the message was handed to anyway.
+ */
+export function recordUntrackedDelivery(msgId: string, resolvedSessionId: string): void {
+  try {
+    const list = ledgerDiagnostics.untrackedDeliveries ?? []
+    list.push({ msgId, resolvedSessionId, at: Date.now() })
+    while (list.length > MAX_UNTRACKED_DELIVERIES) list.shift()
+    ledgerDiagnostics.untrackedDeliveries = list
+  } catch {
+    // Diagnostics never break the caller.
+  }
+}
 
 /**
  * Read the service-resolution state without ever throwing.

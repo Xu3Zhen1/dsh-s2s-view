@@ -311,4 +311,47 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     expect(after.text).toContain('The timer is alive; its effect is not')
     await ctx.fiber.dispose()
   })
+
+  it('★ publishes the sweep schedule, so "not due yet" is distinguishable from "not armed"', async () => {
+    // Within a verification window the 1h interval means the callback cannot be
+    // observed, and silence is exactly what an un-armed timer would also produce.
+    // Publishing the due time and the zombie deadline is what turns that silence
+    // into a checkable schedule (G9).
+    const root = await mkdtemp(join(tmpdir(), 's2s-sweep-schedule-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx, { timerIntervalMs: 60_000 })
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('Next pass due at')
+    expect(out.text).toContain('24h before it is a zombie')
+
+    // The value must come from the single source of truth, not a copied literal.
+    const { LEDGER_LIMITS } = await import('../src/ledger-schema.ts')
+    expect(ledger.sweepStatus.landedDeadlineMs).toBe(LEDGER_LIMITS.landedDeadlineMs)
+    await ctx.fiber.dispose()
+  })
+
+  it('a disarmed sweep publishes no due time (it has none)', async () => {
+    // Negative control for the field above: with the timer off there is no next
+    // pass, and inventing one would claim a schedule that does not exist.
+    const root = await mkdtemp(join(tmpdir(), 's2s-sweep-disarmed-schedule-'))
+    dirs.push(root)
+    const ctx = new Context()
+    const ledger = new S2sLedger(ctx, { timerIntervalMs: 0 })
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    expect(ledger.sweepStatus.nextSweepAt).toBeUndefined()
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('sweep: DISARMED')
+    expect(out.text).not.toContain('Next pass due at')
+    await ctx.fiber.dispose()
+  })
 })
