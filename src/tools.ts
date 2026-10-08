@@ -382,7 +382,16 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             const s = d.openSucceededAt
             const f = d.firstS2sToolCallAt
             if (p === undefined || c === undefined || s === undefined) return 'incomplete'
-            if (f === undefined) return 'unknown (no s2s_* tool call observed yet)'
+            if (f === undefined) {
+              // Distinguish "no call yet" from "the sampler never attached": the
+              // latter would otherwise look identical forever, which is how the
+              // first version of this sampler failed silently on the real host.
+              if (d.toolCallSamplerAttached !== true) {
+                return 'unknown (the tool-call sampler is NOT attached'
+                  + (d.toolCallSamplerError === undefined ? '' : ': ' + d.toolCallSamplerError) + ')'
+              }
+              return 'unknown (no s2s_* tool call observed yet)'
+            }
             const monotone = p <= c && c <= s
             const cold = s < f
             return 'procStart<=openCalledAt<=openSucceededAt=' + String(monotone)
@@ -394,7 +403,10 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + ' openOkAt=' + iso(d.openSucceededAt)
             + ' firstS2sToolCallAt=' + iso(d.firstS2sToolCallAt)
             + (d.firstS2sToolCallName === undefined ? '' : ' (' + d.firstS2sToolCallName + ')')
-            + ' injectFiredAt=' + iso(d.injectFiredAt))
+            + ' injectFiredAt=' + iso(d.injectFiredAt)
+            + ' sampler=' + (d.toolCallSamplerAttached === true
+              ? 'attached'
+              : 'NOT-ATTACHED' + (d.toolCallSamplerError === undefined ? '' : '(' + d.toolCallSamplerError + ')')))
           lines.push('handshake-coldstart: ' + order)
 
           // The series. Each row answers "can we see the ledger here, and if not,
@@ -538,22 +550,37 @@ export const name = 's2s-tools'
 export const inject = ['s2sBroker', 's2sDiscovery', 'tools']
 
 export function apply(ctx: Context): void {
-  const tools = ctx.get('tools') as { register(definition: ToolDefinition): () => void; on?(event: string, listener: (...args: never[]) => unknown): () => void }
-  // Independent cold-start sampler. Registered on the tool pipeline rather than
-  // inside `s2s_status` so the stamp is produced by the FIRST s2s_* call of any
-  // kind — reading the status must not be what creates the boundary it is
-  // measured against. Optional call because a test double may not implement it.
-  if (typeof tools.on === 'function') {
-    try {
-      tools.on('tools/pre-execute', function(exec: { name?: string }) {
-        const calledName = exec?.name
-        if (typeof calledName === 'string' && calledName.indexOf('s2s_') === 0) {
-          recordFirstS2sToolCall(calledName)
-        }
-      })
-    } catch {
-      // Diagnostics never break mounting.
-    }
+  const tools = ctx.get('tools') as { register(definition: ToolDefinition): () => void }
+  // Independent cold-start sampler, registered on the tool pipeline rather than
+  // inside `s2s_status`: the stamp must be produced by the FIRST s2s_* call of
+  // any kind, because a stamp written by the status handler is created BY the
+  // act of reading the status and can never establish that `open()` came first.
+  //
+  // The listener goes on `ctx` — the event bus — NOT on the `tools` service.
+  // `ToolRuntime` exposes only `register()`. An earlier version called
+  // `tools.on(...)` behind a `typeof === 'function'` guard with a swallowing
+  // `catch`, so the sampler was never attached and the failure was invisible:
+  // `firstS2sToolCallAt` stayed `n/a` on the real host with no error anywhere.
+  // A silent no-op is exactly what G9 forbids, so attachment is now recorded
+  // and any failure is surfaced in `s2s_status` instead of being dropped.
+  try {
+    // `tools/pre-execute` is a WATERFALL: a listener owns the continuation and
+    // must call `next()` and return its decision. Returning `void` type-errors
+    // here, and would have broken every tool call had the listener ever been
+    // attached — which the previous silent non-attachment conveniently hid.
+    const dispose = ctx.on('tools/pre-execute', function(
+      exec: { name?: string },
+      next: () => Promise<unknown>,
+    ) {
+      const calledName = exec?.name
+      if (typeof calledName === 'string' && calledName.indexOf('s2s_') === 0) {
+        recordFirstS2sToolCall(calledName)
+      }
+      return next()
+    } as never)
+    ledgerDiagnostics.toolCallSamplerAttached = typeof dispose === 'function'
+  } catch (error: unknown) {
+    ledgerDiagnostics.toolCallSamplerError = String(error)
   }
   const broker = ctx.get('s2sBroker') as S2sBroker
   const discovery = ctx.get('s2sDiscovery') as S2sDiscoveryService

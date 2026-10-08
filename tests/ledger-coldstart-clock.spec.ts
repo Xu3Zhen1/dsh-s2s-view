@@ -160,6 +160,7 @@ describe('cold-start clock', () => {
     // reporting OK would invent one.
     const base = Date.UTC(2026, 9, 9, 0, 0, 0)
     delete ledgerDiagnostics.firstS2sToolCallAt
+    ledgerDiagnostics.toolCallSamplerAttached = true
     ledgerDiagnostics.procStart = base
     ledgerDiagnostics.openCalledAt = base + 1000
     ledgerDiagnostics.openSucceededAt = base + 2000
@@ -171,6 +172,77 @@ describe('cold-start clock', () => {
     expect(verdict).toContain('unknown')
     expect(verdict).not.toContain('COLD-START-OK')
     await ctx.fiber.dispose()
+  })
+
+  it('★★ tells "sampler never attached" apart from "no call yet"', async () => {
+    // The real-host failure this pins: the first sampler called `tools.on(...)`
+    // — the `tools` service has no `on`; listeners belong on `ctx` — behind a
+    // swallowing catch, so it never attached and `firstS2sToolCallAt` stayed
+    // `n/a` forever with no error anywhere. "No call yet" and "never attached"
+    // are indistinguishable from the timestamp alone, and only one of them is
+    // benign, so the line has to say which.
+    const base = Date.UTC(2026, 9, 9, 0, 0, 0)
+    delete ledgerDiagnostics.firstS2sToolCallAt
+    ledgerDiagnostics.procStart = base
+    ledgerDiagnostics.openCalledAt = base + 1000
+    ledgerDiagnostics.openSucceededAt = base + 2000
+    ledgerDiagnostics.toolCallSamplerAttached = false
+    ledgerDiagnostics.toolCallSamplerError = 'ctx.on is not a function'
+
+    const { ctx, status } = makeStatus()
+    const text = (await status.execute({}, { agent: { id: 's' } })).text
+    const verdict = lineWith(text, 'handshake-coldstart:')
+    const clock = lineWith(text, 'handshake-clock:')
+
+    expect(verdict).toContain('the tool-call sampler is NOT attached')
+    expect(verdict).toContain('ctx.on is not a function')
+    expect(verdict).not.toContain('no s2s_* tool call observed yet')
+    expect(clock).toContain('sampler=NOT-ATTACHED')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ the sampler is attached to ctx, so apply() records it as attached', async () => {
+    // Guards the fix itself: mounting the tools plugin must leave the sampler
+    // ATTACHED. If the listener is moved back onto the service (which exposes
+    // only `register`), this goes red instead of failing silently on the host.
+    const { ctx } = makeStatus()
+    // buildTools() is called directly in the helper, so exercise the plugin
+    // entry point that owns the registration.
+    const { apply } = await import('../src/tools.ts')
+    const bus = new Context()
+    bus.provide('tools', { register: () => () => {} })
+    bus.provide('s2sBroker', { deliver: () => 'idle', history: () => [] })
+    bus.provide('s2sDiscovery', { list: async () => [], resolve: async () => ({ kind: 'not-found', name: 'x', candidates: [] }) })
+    apply(bus as never)
+    expect(ledgerDiagnostics.toolCallSamplerAttached).toBe(true)
+    await bus.fiber.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('★ end-to-end: a real s2s_* call stamps the first-call time on ctx', async () => {
+    // Drives the actual event bus rather than the helper, so this fails if the
+    // listener is attached to the wrong object or the event name is wrong.
+    delete ledgerDiagnostics.firstS2sToolCallAt
+    delete ledgerDiagnostics.firstS2sToolCallName
+    const bus = new Context()
+    bus.provide('tools', { register: () => () => {} })
+    bus.provide('s2sBroker', { deliver: () => 'idle', history: () => [] })
+    bus.provide('s2sDiscovery', { list: async () => [], resolve: async () => ({ kind: 'not-found', name: 'x', candidates: [] }) })
+    const { apply } = await import('../src/tools.ts')
+    apply(bus as never)
+
+    // `tools/pre-execute` is a waterfall, so dispatch it that way: this also
+    // proves the listener forwards `next()` instead of swallowing the call.
+    const decision = await bus.waterfall('tools/pre-execute', { name: 's2s_status' }, async () => 'allow')
+    expect(decision).toBe('allow')
+    expect(ledgerDiagnostics.firstS2sToolCallAt).toBeTypeOf('number')
+    expect(ledgerDiagnostics.firstS2sToolCallName).toBe('s2s_status')
+
+    // A non-s2s tool must not stamp it.
+    delete ledgerDiagnostics.firstS2sToolCallAt
+    await bus.waterfall('tools/pre-execute', { name: 'read_file' }, async () => 'allow')
+    expect(ledgerDiagnostics.firstS2sToolCallAt).toBeUndefined()
+    await bus.fiber.dispose()
   })
 
   it('★ says incomplete when open never ran, instead of implying a passing order', async () => {

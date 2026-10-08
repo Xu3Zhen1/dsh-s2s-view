@@ -97,6 +97,19 @@ export interface LedgerDiagnostics {
   /** Name of that first tool call, for the record. */
   firstS2sToolCallName?: string
   /**
+   * Whether the `tools/pre-execute` listener was actually attached.
+   *
+   * This exists because the first version of the sampler silently did nothing:
+   * it called `tools.on(...)` — the `tools` service exposes only `register()`;
+   * listeners belong on `ctx` — behind a type guard and a swallowing `catch`.
+   * On the real host `firstS2sToolCallAt` therefore stayed `n/a` with no error
+   * anywhere. G9 forbids a degradation that leaves no trace, so the outcome is
+   * now recorded and rendered.
+   */
+  toolCallSamplerAttached?: boolean
+  /** Why attaching the sampler failed, verbatim, when it did. */
+  toolCallSamplerError?: string
+  /**
    * The same reading taken at four points in the lifecycle, because a single
    * reading cannot tell "never registered" from "registered then invisible".
    *
