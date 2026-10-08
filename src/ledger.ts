@@ -33,17 +33,26 @@ import {
 /**
  * Run a ledger write **without ever failing the caller**.
  *
- * The ledger is optional infrastructure: the plan treats `storageDomain` as
- * optional (Q2 names a self-built JSON fallback) and the desktop profile mounts
- * no storage backend at all. When it is absent the `S2sLedger` service still
- * exists in the context — it simply never opened — so an unguarded `record()`
- * throws `s2s ledger: used before open()` and **the message is never delivered**.
+ * The ledger is optional infrastructure: `storageDomain` is an optional service,
+ * and a deployment may mount no storage backend at all. When it is absent the
+ * `S2sLedger` service still exists in the context — it simply never opened — so
+ * an unguarded `record()` throws `s2s ledger: used before open()` and **the
+ * message is never delivered**.
  *
- * That is a measured outage, not a hypothetical: a deployment with no storage
- * backend turned an optional bookkeeping step into a total delivery failure.
- * Bookkeeping must never outrank delivery. The failure stays visible (G9: no
- * silent degradation) through a warning naming the operation, and the caller
- * proceeds.
+ * That is a measured outage, not a hypothetical: a deployment with no usable
+ * storage backend turned an optional bookkeeping step into a total delivery
+ * failure. Bookkeeping must never outrank delivery. The failure stays visible
+ * (G9: no silent degradation) through a warning naming the operation, and the
+ * caller proceeds.
+ *
+ * ★ Corrected 2026-10-09: an earlier version of this comment stated as measured
+ * fact that "the desktop profile mounts no storage backend at all". That was the
+ * retracted diagnosis. `storageDomain` is present and usable on this host (three
+ * live probes read PRESENT); the ledger failed to open because cordis withholds
+ * a service while its providing fiber is not ACTIVE, so `open()` ran one turn too
+ * early. The ledger now opens. The guard is still required — optional
+ * infrastructure may genuinely be absent elsewhere — but it is not evidence that
+ * it is absent here.
  *
  * It lives next to the service rather than in one of its callers because both
  * delivery paths need it (the live path in `tools.ts`, the dormant path in

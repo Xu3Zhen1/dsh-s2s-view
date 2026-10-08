@@ -199,7 +199,7 @@ export async function readHistory(
   if (ledger === undefined) {
     sources.push({ name: 'ledger', ok: false, note: 'not mounted', count: 0 })
   } else if (!ledger.isOpen) {
-    sources.push({ name: 'ledger', ok: false, note: 'mounted but not open (no storageDomain?)', count: 0 })
+    sources.push({ name: 'ledger', ok: false, note: 'mounted but not open (see s2s_status `handshake:`; the host store is present)', count: 0 })
   } else {
     try {
       const rows = await ledger.query({ sessionId })

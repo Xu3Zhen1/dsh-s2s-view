@@ -189,7 +189,7 @@ describe('s2s_status reconcile exposure (T26)', () => {
     await ctx.fiber.dispose()
   })
 
-  it('★ names the absent backend when the ledger is mounted but not open', async () => {
+  it('★ separates a ledger that could not open from no ledger at all', async () => {
     const root = await mkdtemp(join(tmpdir(), 's2s-status-asof-closed-'))
     dirs.push(root)
     const ctx = new Context()

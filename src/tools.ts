@@ -442,7 +442,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
       output: OUTPUT,
       execute: async function(args) {
         if (ledger === undefined) return { text: 'No ledger is mounted, so there is nothing to reconcile: delivery state is not being tracked in this process.' }
-        if (!ledger.isOpen) return { text: 'The ledger is mounted but NOT OPEN (no storageDomain), so delivery state is not being tracked and there is nothing to reconcile. See s2s_status.' }
+        if (!ledger.isOpen) return { text: 'The ledger is mounted but NOT OPEN, so delivery state is not being tracked and there is nothing to reconcile. Run s2s_status and read its `handshake:` line for why it failed (do not assume the host lacks a store — `storageDomain` is present here).' }
         const resolved = (args.name !== undefined || args.session_id !== undefined) ? await resolve(args.name, args.session_id) : { kind: 'err' as const, reason: 'Provide a name or session_id.' }
         if (resolved.kind === 'err') return { text: resolved.reason }
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }

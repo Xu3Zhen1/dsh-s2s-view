@@ -41,9 +41,12 @@ function ctxWithLog(events: readonly unknown[], opts: { readFails?: boolean; noQ
 
 describe('s2s durable history (T11)', () => {
   it('★ reads deliveries back from the session log when no ledger is available', async () => {
-    // The exact deployment shape that produced the symptom: `desktop` mounts no
-    // `storageDomain`, so the ledger cannot open. Before T11 this returned
-    // nothing at all; the log is the source that survives a restart anyway.
+    // The deployment shape that produced the original symptom: the ledger could
+    // not open, so history had to fall back. (The cause was later established to
+    // be a cordis lifecycle gate, not an absent store — see src/index.ts — but
+    // the fallback still has to work whenever the ledger is unavailable.)
+    // Before T11 this returned nothing at all; the log is the source that
+    // survives a restart anyway.
     const ctx = ctxWithLog([
       s2sMessage('m-1', 'alice', '2026-10-03T10:00:00.000Z', 'first'),
       s2sMessage('m-2', 'bob', '2026-10-03T10:05:00.000Z', 'second', 'ctx'),

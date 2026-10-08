@@ -1,22 +1,37 @@
 # 账本备份与 schema 升级纪律（T25）
 
 **适用对象**：`dsh-s2s` 的消息账本（`S2sLedger`，域 `s2s`，格式版本 `1`）
-**日期**：2026-10-05
+**日期**：2026-10-05（初稿）· **2026-10-09 更正（见 §1.1）**
 **依据**：计划书 T25 —— 「文档写明 json/sqlite 的底层文件路径；升级演练一次」
 
 ---
 
 ## 1. 底层文件在哪里：**先说实话，再说将来的话**
 
-### 1.1 本机现状（2026-10-05 实测）：**没有任何账本文件存在**
+### 1.1 本机实况（**2026-10-09 更正**）：账本**已落盘**
+
+> **★ 撤回声明**：本文件 2026-10-05 初稿曾写「本机没有任何账本文件存在」，并据此得出
+> **「备份纪律的实际执行对象是空集」**。**该结论已撤回。**
+> 撤回原因不是环境变了，而是**当时对症状的归因错了**：当时 `s2s_status` 报
+> `none (ledger constructed but not open)`，被解释为「desktop 未挂 `storageDomain`」；
+> **真因是 cordis 的生命周期闸**——`_getImpl(name, strict=true)` 在**提供者 fiber 非 ACTIVE
+> （`state≠2`）**时扣住服务，而 `open()` 在回调里**当天就取**，那一刻 fiber 还是 1。
+> `storageDomain` **一直存在且可用**（实测三个 live probe 恒为 `PRESENT`）。
+> 修法 = `open()` 改为**等「store 可用 **且** 我方 ledger 可取」**、有界重试（`30798cf`）。
+> 病情与修法的完整取证见 `plan/` 下相关送审/回执；本文件只记录**与备份有关的事实**。
+
+**2026-10-09 实测（as-of 2026-10-09 02:22:23，宿主 `DeepSeek Harness.exe` Start 02:20:14）**：
 
 | 检查项 | 实测结果 |
 |---|---|
-| `desktop` profile 是否挂载 storage 家族（`cordis.patch.yml`） | **未挂载**（`storage`/`sqlite` 命中 **0**） |
-| `~/.dsh` 下是否存在任何 `.db` 文件 | **不存在**（全目录递归扫 `*.db` 命中 **0**） |
-| 运行中 `s2s_status` 的 `backend=` | `none (ledger constructed but not open)` |
+| 运行中 `s2s_status` 的 `backend=` | **`storage-domain`**（`ledger: open (backend=storage-domain).`） |
+| 账本文件路径 | **`~/.dsh/storages/s2s.json`** |
+| 该文件是否存在 | **存在**（29864 B，mtime 2026-10-09 02:22:15） |
+| 域结构 | `unit.name = "s2s"`、`unit.version = 1`、`tables.messages` / `tables.sessions` |
 
-⇒ **当前部署下账本从未落盘**，所以**不存在**"本机账本文件路径"这回事。任何给出具体路径的说法都必须是推断，不能写成实测。
+⇒ **本机账本文件路径这一条现在是实测，不是推断**。但**引用其大小/记录数必须标 as-of 时刻**——
+该文件在持续写入，实测同一文件在不同时刻为 **7430 B → 17233 B → 21008 B → 25591 B → 29864 B**。
+**任何"账本有多大/多少条"的说法，缺 as-of 即不可复核。**
 
 ### 1.2 两种后端各自的落点（按谁来定路径区分）
 
@@ -24,30 +39,54 @@
 
 | 后端 | 路径由谁决定 | 落点 | 本项目实况 |
 |---|---|---|---|
-| **A. `storageDomain` + sqlite**（计划书 Q2 选定） | 宿主 profile 里 sqlite backend 的 `path` 配置（键名就是 `path`） | 该 `path` 指向的单个 SQLite 文件 | **未挂载 ⇒ 未落盘** |
-| **B. `storageDomain` + JSON**（宿主已提供） | 同上，JSON backend 的目录/文件配置 | 该配置指向的 JSON 文件 | **未挂载 ⇒ 未落盘** |
-| **C. 自建 JSON**（计划书 §R7 备案的降级路径） | 本项目自定 | 迄今**未实现**；若实现，应与现有三处同风格（`~/.dsh/s2s/mailbox`、`s2s/schedules`、title-cache） | **未实现** |
+| **A. `storageDomain` + sqlite**（计划书 Q2 选定） | 宿主 profile 里 sqlite backend 的 `path` 配置（键名就是 `path`） | 该 `path` 指向的单个 SQLite 文件 | **不是当前实况**（本机走的是 B） |
+| **B. `storageDomain` + JSON**（宿主已提供） | 同上，JSON backend 的**目录**配置（`root`） | `root` 下**每个 unit 一个 `<unit>.json`**（`single` 布局）或 `<unit>/` 树（`per-record`） | **★ 当前实况**：`root = ~/.dsh/storages`，unit `s2s` → **`s2s.json`**（`single`） |
+| **C. 自建 JSON**（计划书 §R7 备案的降级路径） | 本项目自定 | 迄今**未实现** | **未实现，且已裁定不实现**（见下） |
 
-**★ 一条重要的实测修正（写给后续维护者）**：计划书 R7 / §955 把"降级"写成**自建 JSON**，但**宿主已经自带 `@deepseek-ai/dsh-storage-json`（JSON 文件 KV 后端）**（`app.asar` 内实测命中）。⇒ 真要补降级路径，**应优先复用宿主已有的 JSON 后端，而不是自建一套**（零新依赖、且与 `storageDomain` 的 schema 校验/事件语义一致）。这是**待拍板的变更**，本文只记录事实，不擅自改设计。
+**★ 一条重要的实测修正（写给后续维护者）**：计划书 R7 / §955 把"降级"写成**自建 JSON**，但**宿主已经自带 `@deepseek-ai/dsh-storage-json`（JSON 文件 KV 后端）**。**2026-10-09 补充**：本机**实际跑的就是这个后端**（`backend=storage-domain`，落点 `~/.dsh/storages/s2s.json`）⇒ 该"降级路径"的**前提（宿主后端缺席）已被证伪**。审查方裁定：**Q9 收口为「后端缺席时的未来降级备案」，当前不切自建 JSON。**
 
-**⇒ 运维含义**：在没有挂载 storage 家族的部署里，**备份纪律的实际执行对象是空集**——不是"文件很重要但要记得备份"，而是"文件根本不存在"。这一条必须写在文档开头，否则运维会去找一个不存在的文件。
+**⇒ 运维含义（已更正）**：**备份纪律的实际执行对象不再是空集**——本机确有账本文件
+`~/.dsh/storages/s2s.json`，**应当纳入备份**。但请注意两点：
+1. **它可能是惰性创建的**：`dsh-storage-json` 的 `openUnit()` 只无条件 `mkdir(root)`，
+   **unit 文件按首次写入才落**。⇒ `backend=storage-domain` 但文件尚不存在是**正常**的
+   （实测：账本打开后、写入第一条消息之前，`~/.dsh/storages/` 顶层仍为原基线 3 项）。
+   **看不到文件 ≠ 没在跑**。反过来，**看到文件才是"已写入过"的证据**。
+2. **文件在持续增长**：引用大小/记录数须带 as-of 时刻（见 §1.1）。
 
-### 1.3 一旦挂载后的备份操作（可照做）
-
-挂载 storage 家族**并重启**后：
+### 1.3 备份操作（可照做，**2026-10-09 起本机已适用**）
 
 1. **先确认文件真的出现了**，不要假设：
    - 读 `s2s_status` 的 `backend=` 行 —— 应为 `storage-domain`（而非 `none (…)`）；
-   - 再按 profile 里配置的 `path` 去看那个文件是否存在、大小是否非 0。
-2. **备份 = 在停机状态下整文件复制**（SQLite 用文件拷贝即可，但**必须在宿主停止、或至少没有写入时**做；运行中热拷可能得到撕裂文件）。
+   - 再到 `root`（本机 `~/.dsh/storages/`）下看 **`s2s.json`** 是否存在、大小是否非 0。
+   - ⚠️ **`backend=storage-domain` 但文件不存在是可能的**（惰性创建，见 §1.2）——
+     此时**先投递一条消息触发首次写入**再复查，不要直接判"没落盘"。
+2. **备份 = 在停机状态下整文件复制**（JSON 是**整文件原子替换**语义，见 §1.4；仍**必须在宿主停止、
+   或至少没有写入时**做 —— 运行中热拷可能抓到替换的中间态）。
    ```
-   # 停机后
-   copy "<profile 配置的 path>" "<同一路径>.bak-<YYYYMMDD-HHMMSS>"
+   # 停机后（Windows）
+   copy "%USERPROFILE%\.dsh\storages\s2s.json" "%USERPROFILE%\.dsh\storages\s2s.json.bak-<YYYYMMDD-HHMMSS>"
    ```
 3. **备份后必须验证**，不是复制完就算：
    - 大小非 0；
-   - 记录备份文件的 SHA256 与时间戳，作为回滚凭据。
+   - 记录备份文件的 SHA256 与时间戳，作为回滚凭据；
+   - **同时记下该时刻的 as-of**（文件在增长，缺时刻的读数不可复核）。
 4. **命名与保留**：`.bak-<时间戳>` 后缀（与 profile 现有 `*.bak-2026xxxx` 惯例一致）；升级前的那一份**在验证新版本可用之前不要删**。
+
+### 1.4 写入协议：为什么"await 返回"就等于"已落盘"
+
+`@deepseek-ai/dsh-storage-json` 的 `writeAtomic()`（`packages/storage/storage-json/src/atomic.ts`）协议：
+
+```
+写同目录临时文件  →  handle.writeFile(data)  →  await handle.sync()   ← fsync，强制刷盘
+                 →  await handle.close()
+                 →  await rename(tmp, target)   ← 原子替换（Windows 映射 MoveFileExW REPLACE_EXISTING）
+                 →  fsyncDirectory()            ← POSIX 下 fsync 父目录（Windows 跳过）
+```
+
+其文档注释写明：*"@returns resolution after the replacement is **crash-durable**"*。
+
+⇒ **写入路径的 `await` 返回即已落盘**，验收时**无需额外等待重启**即可判定写入成功。
+这一条是 2026-10-09 实测确认的（该次验证：唯一标记写后由独立磁盘读回命中）。
 
 ---
 
