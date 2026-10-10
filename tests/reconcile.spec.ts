@@ -395,20 +395,40 @@ describe('reconcile log cache (T8)', () => {
     // to ask "what if the failure window were as long as the success window?",
     // and the answer must be: recovery no longer happens at the earlier instant.
     //
+    // ★ This CONTROL uses the SAME harness and the SAME instants as the test
+    // above; the ONLY difference is the value of `reconcileFailureTtlMs`. That is
+    // what makes the pair a controlled comparison rather than two scenarios that
+    // merely look similar.
+    //
     // Guards, per the ruling:
     //   - probe mutability first; if the object is frozen, fail loudly rather
     //     than pretend the control ran;
     //   - snapshot + restore in `finally`;
     //   - change ONLY `reconcileFailureTtlMs`, and assert it was restored.
-    expect(Object.isFrozen(LEDGER_LIMITS)).toBe(false)
+    const frozen = Object.isFrozen(LEDGER_LIMITS)
     const descriptor = Object.getOwnPropertyDescriptor(LEDGER_LIMITS, 'reconcileFailureTtlMs')
-    expect(descriptor?.writable).toBe(true)
 
+    // The mutation is applied BEFORE the precondition assertions below so that
+    // the behavioural assertions further down can be observed failing on their
+    // own (see the falsification notes on the preconditions).
     const snapshot = LEDGER_LIMITS.reconcileFailureTtlMs
+    // ★ The instant must be the SAME one gap A uses, so it is captured from the
+    // ORIGINAL value *before* the mutation. Reading it back after levelling would
+    // silently move the probe past the new (longer) TTL — turning this from a
+    // controlled comparison into a no-op that always misses.
+    const probeOffset = snapshot + 1
     const base = 1_700_000_000_000
     try {
       // Level it to the success TTL — the one change under test.
       ;(LEDGER_LIMITS as { reconcileFailureTtlMs: number }).reconcileFailureTtlMs = LEDGER_LIMITS.reconcileTtlMs
+
+      // Preconditions. Kept as their own assertions, separated from the behaviour
+      // below, so that "the mutation took effect" and "the behaviour changed" are
+      // two distinguishable failures. A falsification run that neutralises the
+      // mutation must therefore be reported twice: once with these lines removed
+      // (behaviour red) and once with them active (precondition red).
+      expect(frozen).toBe(false)
+      expect(descriptor?.writable).toBe(true)
       expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBe(LEDGER_LIMITS.reconcileTtlMs)
 
       const control = { fails: true, events: [s2sRecord(9, 'm-1')] as readonly unknown[] }
@@ -425,11 +445,32 @@ describe('reconcile log cache (T8)', () => {
       control.fails = false
 
       // The same instant as the test above — which SHOULD have recovered there.
-      await ledger.reconcile('sess-1', { now: base + 500 + 1 })
+      // (`probeOffset` was captured before the mutation, so this really is the
+      // same instant gap A uses; with the window levelled the entry is still
+      // fresh at it.)
+      const stillDelayed = await ledger.reconcile('sess-1', { now: base + probeOffset })
 
-      // With the window levelled, the failure is still cached: NO new read.
-      // That is the delay the short failure TTL exists to avoid.
+      // (1) With the window levelled, the failure is still cached: NO new read.
+      //     That is the delay the short failure TTL exists to avoid.
       expect(reads - afterFailure).toBe(0)
+
+      // (2) …and the delay has a CONSEQUENCE, not merely a missing read: the row
+      //     is still not landed and is still stamped awaiting a readable log.
+      //     Without this, the CONTROL would only show "silence", not "delay".
+      const delayedRow = await ledger.get('m-1')
+      expect(delayedRow!.status).toBe('inboxed')
+      expect(delayedRow!.landedSeq ?? null).toBeNull()
+      expect(delayedRow!.unreadableSince).not.toBeNull()
+
+      // (3) The delay is bounded: once even the LEVELLED window has elapsed, the
+      //     read happens and the row finally lands. So the CONTROL proves deferred
+      //     recovery, not a permanent stall.
+      const after = await ledger.reconcile('sess-1', { now: base + LEDGER_LIMITS.reconcileTtlMs + 1 })
+      expect(after.logReads).toBeGreaterThan(0)
+      const finalRow = await ledger.get('m-1')
+      expect(finalRow!.status).toBe('landed')
+      expect(finalRow!.landedSeq).toBe(9)
+      expect(finalRow!.unreadableSince).toBeNull()
     } finally {
       ;(LEDGER_LIMITS as { reconcileFailureTtlMs: number }).reconcileFailureTtlMs = snapshot
       // Prove the restore: a leaked constant would poison the single-source-of-

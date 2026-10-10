@@ -171,6 +171,31 @@ describe('s2s_reconcile (T26 wiring)', () => {
     const out = await by('s2s_reconcile').execute({ name: 'a', use_cache: false }, { agent: { id: 'sess-a' } })
 
     expect(out.text).toContain('cache=bypassed')
+    // T8-2: bypassing is also a miss, and it cost one read. Asserted together so
+    // the two fields cannot be collapsed into one another again.
+    expect(out.text).toContain('cacheHit=miss')
+    expect(out.text).toContain('logReads=1')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ ★ separates "what the caller asked for" from "what actually happened" (T8-2)', async () => {
+    // The defect this guards: `cache=honoured|bypassed` reports only the request,
+    // and was read as evidence of a hit. Honouring the cache is not a hit — the
+    // second call inside the TTL is. Both are printed, and they must differ here:
+    // the caller asked for the cache AND got a miss, because nothing was cached.
+    const { ctx, ledger, by } = await harness({ events: [s2sRecord(7, 'm-1')] })
+    await inboxed(ledger, 'm-1')
+
+    const first = await by('s2s_reconcile').execute({ name: 'a' }, { agent: { id: 'sess-a' } })
+    expect(first.text).toContain('cache=honoured')
+    expect(first.text).toContain('cacheHit=miss')
+    expect(first.text).toContain('logReads=1')
+
+    // Second call inside the TTL: still honoured, but now a real hit with no read.
+    const second = await by('s2s_reconcile').execute({ name: 'a' }, { agent: { id: 'sess-a' } })
+    expect(second.text).toContain('cache=honoured')
+    expect(second.text).toContain('cacheHit=hit')
+    expect(second.text).toContain('logReads=0')
     await ctx.fiber.dispose()
   })
 })
@@ -211,6 +236,27 @@ describe('s2s_status reconcile exposure (T26)', () => {
     const out = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('reconcile: available via s2s_reconcile')
     expect(out.text).toContain('NOT proof of delivery')
+    await ctx.fiber.dispose()
+  })
+
+  it('★ ★ exposes the log-read cache on s2s_status without running a pass (T8-2)', async () => {
+    // Reading the cache through `s2s_reconcile` would be self-defeating: the act
+    // of reconciling mutates the very cache being inspected. So `s2s_status`
+    // reports it directly, and the TTLs are printed so the numbers are
+    // interpretable without reading the source.
+    const { ctx, ledger, by } = await harness({ events: [s2sRecord(7, 'm-1')] })
+    await inboxed(ledger, 'm-1')
+
+    const before = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(before.text).toContain('reconcile cache: 0 session(s) cached, 0 usable now')
+    expect(before.text).toContain('success TTL=5s')
+    expect(before.text).toContain('failure TTL=0.5s')
+
+    // One pass populates it; the status read must reflect that and must not
+    // consume it.
+    await by('s2s_reconcile').execute({ name: 'a' }, { agent: { id: 'sess-a' } })
+    const after = await by('s2s_status').execute({}, { agent: { id: 'sess-a' } })
+    expect(after.text).toContain('reconcile cache: 1 session(s) cached, 1 usable now')
     await ctx.fiber.dispose()
   })
 
