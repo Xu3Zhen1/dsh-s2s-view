@@ -335,6 +335,17 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           : 'reconcile: unavailable — it needs the ledger, which is not open, so deliveries cannot advance beyond what '
             + 'the target log itself shows (read them with s2s_history).')
 
+        // T8-2: the log-read cache, readable without running a pass. Reading it
+        // through `s2s_reconcile` would be self-defeating here — the act of
+        // reconciling mutates the cache being inspected.
+        if (ledgerAnswers) {
+          const lc = ledger.logCacheStatus(sampledAt)
+          lines.push('reconcile cache: ' + lc.sessions + ' session(s) cached, ' + lc.fresh + ' usable now'
+            + (lc.oldestAgeMs === undefined ? '' : ' (oldest entry ' + Math.round(lc.oldestAgeMs / 1000) + 's old)')
+            + ' — success TTL=' + (lc.successTtlMs / 1000) + 's, failure TTL=' + (lc.failureTtlMs / 1000)
+            + 's. A failed read uses the shorter TTL on purpose, so a momentary outage recovers quickly.')
+        }
+
         // Sweep exposure (T24). The ledger arms a timer, but "armed" and
         // "achieving something" are different facts, and on a host without
         // `storageDomain` every tick returns early — so this line must report the
@@ -505,7 +516,14 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           'examined=' + result.examined,
           'landed=' + result.landed,
           'log=' + (result.unreadable ? 'UNREADABLE' : 'readable (' + (result.seenInLog ?? 0) + ' deliver(ies) visible)'),
+          // T8-2: the two facts must not be conflated. `cache=` is what the CALLER
+          // asked for; `cacheHit`/`logReads` are what the pass actually did. A
+          // caller can honour the cache and still miss, so `cache=honoured` was
+          // never evidence of a hit — it was once read that way and gave a wrong
+          // answer. Both are printed so the difference is visible.
           'cache=' + (args.use_cache === false ? 'bypassed' : 'honoured'),
+          'cacheHit=' + (result.cacheHit ? 'hit' : 'miss'),
+          'logReads=' + result.logReads,
         ]
         return { text: head + '\n' + detail.join('  ') }
       },

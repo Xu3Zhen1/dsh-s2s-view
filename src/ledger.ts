@@ -134,6 +134,25 @@ export interface ReconcileResult {
   readonly unreadable: boolean
   /** Deliveries visible in the log, when it was readable. */
   readonly seenInLog?: number
+  /**
+   * Whether this pass reused a cached log read instead of reading again.
+   *
+   * Distinct from the tool's `cache=honoured|bypassed`, which only reports what
+   * the *caller asked for* (`use_cache: false`). That field was once mistaken
+   * for evidence of a hit — it is not: a caller can ask for the cache and still
+   * miss, and a cache entry can exist while being too old to use. This one is
+   * computed from the actual freshness test, so it is the hit/miss fact.
+   */
+  readonly cacheHit: boolean
+  /**
+   * How many times this pass actually read the target's log.
+   *
+   * `0` when a fresh cache entry was reused, `1` otherwise. Reported as a count
+   * rather than a boolean because it is the measurable thing: it makes "the
+   * second call inside the TTL did not re-read" checkable directly, instead of
+   * inferred from timing.
+   */
+  readonly logReads: number
 }
 
 /** What one `expireZombies()` sweep examined and killed (T24). */
@@ -417,6 +436,48 @@ export class S2sLedger extends Service {
   /** The backing store in use, or `undefined` before a successful `open()`. */
   get backend(): S2sLedgerBackend | undefined {
     return this.domain === undefined ? undefined : 'storage-domain'
+  }
+
+  /**
+   * How the log-read cache looks right now, for self-report (T8-2).
+   *
+   * Read-only view of state `reconcile()` already maintains — it answers none of
+   * the questions `s2s_reconcile` answers per call (that tool reports the
+   * hit/miss and read count of *its own* pass). This exists so `s2s_status` can
+   * show whether any entry is live at all without running a pass and thereby
+   * changing the very thing being observed.
+   *
+   * `entries` is deliberately not exposed: only whether an entry is *usable now*
+   * matters here, and the payload belongs to `s2s_history`.
+   *
+   * @param now - injected clock, so the freshness test matches `reconcile`'s.
+   */
+  logCacheStatus(now: number = Date.now()): {
+    sessions: number
+    fresh: number
+    /** Age of the oldest entry in ms, or `undefined` when empty. */
+    oldestAgeMs?: number
+    successTtlMs: number
+    failureTtlMs: number
+  } {
+    let fresh = 0
+    let oldest: number | undefined
+    for (const [, entry] of this.logCache) {
+      if (oldest === undefined || entry.at < oldest) oldest = entry.at
+      // Mirrors reconcile()'s decision exactly: a failed read (no `entries`) is
+      // usable only inside the shorter failure TTL.
+      const ttl = entry.entries === undefined
+        ? Math.min(LEDGER_LIMITS.reconcileTtlMs, LEDGER_LIMITS.reconcileFailureTtlMs)
+        : LEDGER_LIMITS.reconcileTtlMs
+      if (now - entry.at < ttl) fresh += 1
+    }
+    return {
+      sessions: this.logCache.size,
+      fresh,
+      ...(oldest === undefined ? {} : { oldestAgeMs: now - oldest }),
+      successTtlMs: LEDGER_LIMITS.reconcileTtlMs,
+      failureTtlMs: LEDGER_LIMITS.reconcileFailureTtlMs,
+    }
   }
 
   /** Whether the ledger is ready to serve reads and writes. */
@@ -723,6 +784,12 @@ export class S2sLedger extends Service {
         landed,
         unreadable,
         ...(entries === undefined ? {} : { seenInLog: entries.length }),
+        // Read-only observability (T8-2). `fresh` is the actual decision this pass
+        // made; `logReads` counts the read that only happened when it was not.
+        // Both are derived from the pass itself, so neither can drift from what
+        // the code did — which is the whole point of reporting them.
+        cacheHit: fresh,
+        logReads: fresh ? 0 : 1,
       }
     })
   }

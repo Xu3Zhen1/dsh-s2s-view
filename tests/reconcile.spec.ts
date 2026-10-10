@@ -340,4 +340,101 @@ describe('reconcile log cache (T8)', () => {
 
     expect(reads).toBe(2) // one read per distinct session
   })
+
+  it('★★ failure recovery is not delayed by the SUCCESS ttl (the gap cannot sustain itself)', async () => {
+    // The proposition, stated as one test rather than two files' worth of facts:
+    // a failed read recovers as soon as `reconcileFailureTtlMs` elapses, which is
+    // strictly EARLIER than `reconcileTtlMs` would have allowed a re-read. If the
+    // failure were cached for the success window, the row would sit at a stale
+    // `inboxed` purely because nobody looked again — the defect the short TTL
+    // exists to prevent.
+    //
+    // Two facts, both asserted HERE:
+    //   (1) at T + failureTtl + 1 a real read happens again (recovery occurs);
+    //   (2) failureTtl + 1 < successTtl (that recovery is earlier than the
+    //       success window would have permitted).
+    const base = 1_700_000_000_000
+    const control = { fails: true, events: [s2sRecord(9, 'm-1')] as readonly unknown[] }
+    const { ledger, ctx } = await harness({ control })
+    let reads = 0
+    const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+    const inner = query.readSession.bind(query)
+    query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'x' })
+    await ledger.markInboxed('m-1', 'sess-1')
+
+    // Fail once: the row is stamped unreadable and stays `inboxed`.
+    const failed = await ledger.reconcile('sess-1', { now: base })
+    expect(failed.unreadable).toBe(true)
+    expect((await ledger.get('m-1'))!.unreadableSince).toBe(base)
+    const afterFailure = reads
+
+    // The log recovers.
+    control.fails = false
+
+    // (1) One millisecond PAST the failure TTL: the read happens again.
+    const recoveryAt = base + LEDGER_LIMITS.reconcileFailureTtlMs + 1
+    const recovered = await ledger.reconcile('sess-1', { now: recoveryAt })
+    expect(reads - afterFailure).toBe(1)
+
+    // (2) …and that instant is strictly earlier than the success TTL would allow.
+    expect(recoveryAt - base).toBeLessThan(LEDGER_LIMITS.reconcileTtlMs)
+    expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBeLessThan(LEDGER_LIMITS.reconcileTtlMs)
+
+    // The recovery is real, not merely a re-read: the row advances and the stamp clears.
+    expect(recovered.unreadable).toBe(false)
+    const row = await ledger.get('m-1')
+    expect(row!.status).toBe('landed')
+    expect(row!.landedSeq).toBe(9)
+    expect(row!.unreadableSince).toBeNull()
+  })
+
+  it('★★ CONTROL: levelling the failure ttl to the success ttl delays recovery (that is what the short ttl buys)', async () => {
+    // Negative control for the test above. Mutating the constant is the only way
+    // to ask "what if the failure window were as long as the success window?",
+    // and the answer must be: recovery no longer happens at the earlier instant.
+    //
+    // Guards, per the ruling:
+    //   - probe mutability first; if the object is frozen, fail loudly rather
+    //     than pretend the control ran;
+    //   - snapshot + restore in `finally`;
+    //   - change ONLY `reconcileFailureTtlMs`, and assert it was restored.
+    expect(Object.isFrozen(LEDGER_LIMITS)).toBe(false)
+    const descriptor = Object.getOwnPropertyDescriptor(LEDGER_LIMITS, 'reconcileFailureTtlMs')
+    expect(descriptor?.writable).toBe(true)
+
+    const snapshot = LEDGER_LIMITS.reconcileFailureTtlMs
+    const base = 1_700_000_000_000
+    try {
+      // Level it to the success TTL — the one change under test.
+      ;(LEDGER_LIMITS as { reconcileFailureTtlMs: number }).reconcileFailureTtlMs = LEDGER_LIMITS.reconcileTtlMs
+      expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBe(LEDGER_LIMITS.reconcileTtlMs)
+
+      const control = { fails: true, events: [s2sRecord(9, 'm-1')] as readonly unknown[] }
+      const { ledger, ctx } = await harness({ control })
+      let reads = 0
+      const query = ctx.get('sessionQuery') as { readSession(id: string): Promise<unknown> }
+      const inner = query.readSession.bind(query)
+      query.readSession = async (id: string) => { reads += 1; return await inner(id) }
+
+      await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'x' })
+      await ledger.markInboxed('m-1', 'sess-1')
+      await ledger.reconcile('sess-1', { now: base })
+      const afterFailure = reads
+      control.fails = false
+
+      // The same instant as the test above — which SHOULD have recovered there.
+      await ledger.reconcile('sess-1', { now: base + 500 + 1 })
+
+      // With the window levelled, the failure is still cached: NO new read.
+      // That is the delay the short failure TTL exists to avoid.
+      expect(reads - afterFailure).toBe(0)
+    } finally {
+      ;(LEDGER_LIMITS as { reconcileFailureTtlMs: number }).reconcileFailureTtlMs = snapshot
+      // Prove the restore: a leaked constant would poison the single-source-of-
+      // truth guards in ledger-schema.spec / ledger-invariants.spec.
+      expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBe(snapshot)
+    }
+  })
 })
