@@ -14,11 +14,16 @@
  * - **E1 miss** — nothing cached for this name/id;
  * - **E2 wrong** — a cached mapping is contradicted (recorded as ambiguous);
  * - **E3 forced** — the caller asks for a re-read (`forget` / `force`);
- * - **E4 age** — the entry was last touched more than {@link TITLE_TTL_MS} ago.
+ * - **E4 age** — the entry's **`builtAt`** (when the title was actually read) is
+ *   older than {@link TITLE_TTL_MS}. Deliberately NOT `lastAccess`: a hit
+ *   refreshes that, so measuring from it made the budget unreachable for any
+ *   regularly-addressed session — the title would never be re-read and a rename
+ *   would never become visible.
  *
  * Accepted cost: a renamed session keeps answering to its previous name until
- * one of E1–E4 fires. Resolution by session id is never affected (ids are
- * immutable), and a stale entry never points at an unrelated session.
+ * one of E1–E4 fires (for a hot session, that is now bounded by E4 rather than
+ * indefinite). Resolution by session id is never affected (ids are immutable),
+ * and a stale entry never points at an unrelated session.
  *
  * @module dsh-s2s/title-cache
  */
@@ -135,8 +140,18 @@ export class TitleCache {
     this.load()
     const entry = this.entries.get(sessionId)
     if (entry === undefined) return undefined // E1
-    if (now - entry.lastAccess > TITLE_TTL_MS) return undefined // E4
+    // E4 is measured from `builtAt` — when the title was actually *read* — not
+    // from `lastAccess`. Using `lastAccess` made the budget self-defeating: the
+    // hit below refreshes it, so a session that is addressed by name regularly
+    // kept `now - lastAccess` at ~0 and E4 never fired. A hot session's title was
+    // therefore cached **forever**, and a rename left it answering to the old
+    // name permanently (measured: entries whose `builtAt` was 18+ days old while
+    // `lastAccess` stayed current). Freshness must age from the observation, not
+    // from the traffic.
+    if (now - entry.builtAt > TITLE_TTL_MS) return undefined // E4
     if (entry.lastAccess !== now) {
+      // Access metadata only: this must not extend how long the *title* is
+      // trusted, which is exactly the bug described above.
       entry.lastAccess = now
       this.markDirty()
     }

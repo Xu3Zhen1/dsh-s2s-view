@@ -146,10 +146,33 @@ describe('s2s discovery title cache', () => {
     await d.list()
     expect(counts.batch + counts.readTitle).toBe(0)
 
-    // The hit above refreshed `lastAccess`; age is measured from that access,
-    // so pass the TTL again from here to reach E4.
-    clock += TITLE_TTL_MS + 1000
+    // Age is measured from `builtAt` (when the title was read), NOT from the hit
+    // above. So a further TTL from the original read reaches E4.
+    clock += 1000 + 1000 // now past TTL since the read
     await d.list()
+    expect(counts.batch + counts.readTitle).toBeGreaterThan(0)
+  })
+
+  it('★ ★ E4 ages from builtAt, so a hot entry still expires (the forever-cache bug)', async () => {
+    // The defect this pins: E4 used to be measured from `lastAccess`, which every
+    // hit refreshed. A session addressed by name regularly therefore kept
+    // `now - lastAccess` at ~0 and E4 NEVER fired — its title was cached forever,
+    // so a rename never became visible (measured on the real host: entries whose
+    // `builtAt` was 18+ days old while `lastAccess` stayed current).
+    let clock = 1_000_000
+    const { d, counts } = await harness([rec('a', '/w')], { a: '标题' }, { now: () => clock })
+    await d.list()
+    counts.batch = 0
+    counts.readTitle = 0
+
+    // Address it repeatedly, each time well inside the TTL: under the old rule
+    // this refreshed `lastAccess` and postponed expiry indefinitely.
+    for (let i = 0; i < 5; i++) {
+      clock += TITLE_TTL_MS - 1000
+      await d.list()
+    }
+    // Five hits, total elapsed 5×(TTL−1s) > TTL since the read. The title must
+    // have been re-read at some point; the old rule re-read nothing at all.
     expect(counts.batch + counts.readTitle).toBeGreaterThan(0)
   })
 
