@@ -48,7 +48,9 @@ async function harness(records: unknown[], titles: Record<string, string>) {
 // Realistic uuids: the short id shown by listings is the first 8 chars of the
 // uuid part, which is exactly what the failing call passed.
 const ID_A = 'session-9f4b6738-79f2-474d-8018-14c9ac49af62'
-const ID_B = 'session-9f4b6740-1111-2222-3333-444455556666'
+// Same first uuid group as ID_A, so the 8-char short id `9f4b6738` genuinely
+// collides between them — that is the shortest form the listings display.
+const ID_B = 'session-9f4b6738-aaaa-bbbb-cccc-dddddddddddd'
 const ID_C = 'session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
 describe('④ id addressing: canonical, bare uuid, unique short prefix', () => {
@@ -84,7 +86,7 @@ describe('④ id addressing: canonical, bare uuid, unique short prefix', () => {
   it('refuses a short prefix that collides, and says which sessions collided', async () => {
     // Both uuids start with `9f4b67`, so the prefix is genuinely ambiguous.
     const d = await harness([rec(ID_A, '/w'), rec(ID_B, '/w')], { [ID_A]: '甲', [ID_B]: '乙' })
-    const r = await d.resolve(undefined, '9f4b67')
+    const r = await d.resolve(undefined, '9f4b6738')
     expect(r.kind).toBe('ambiguous')
     if (r.kind === 'ambiguous') expect(r.candidates.map(c => c.sessionId).sort()).toEqual([ID_A, ID_B].sort())
   })
@@ -102,11 +104,69 @@ describe('④ id addressing: canonical, bare uuid, unique short prefix', () => {
     expect(r.kind).toBe('not-found')
   })
 
+  it('★ SHAPE GATE: a letter-bearing fragment that prefixes an id is NOT an id', async () => {
+    // The reviewer's static-review blocker: the first id-prefix implementation
+    // accepted ANY string, so `session-abcdef12-…` would have resolved from the
+    // input `abcdef12`. A letter-bearing fragment is a title/path, never an id —
+    // the gate must reject it before prefix matching runs.
+    const d = await harness([rec(ID_A, '/w')], { [ID_A]: '甲' })
+    const r = await d.resolve(undefined, 'abcdef12')
+    expect(r.kind).toBe('not-found')
+  })
+
+  it('★ SHAPE GATE: a workspace path that prefixes an id is NOT an id', async () => {
+    const d = await harness([rec(ID_A, '/w')], { [ID_A]: '甲' })
+    // `9f4b` is a real prefix of ID_A, but `9f4b/path` carries a non-hex char.
+    const r = await d.resolve(undefined, '9f4b/path')
+    expect(r.kind).toBe('not-found')
+  })
+
+  it('★ SHAPE GATE: a Chinese title fragment is NOT an id', async () => {
+    const d = await harness([rec(ID_A, '/w')], { [ID_A]: '甲' })
+    const r = await d.resolve(undefined, '重做目标寻找方法')
+    expect(r.kind).toBe('not-found')
+  })
+
+  it('SHAPE GATE: a short hex prefix shorter than the displayed id is rejected', async () => {
+    // Below the 8-char minimum that `shortId()` prints, `9f` is too little
+    // evidence to select a session even though it is hex.
+    const d = await harness([rec(ID_A, '/w')], { [ID_A]: '甲' })
+    const r = await d.resolve(undefined, '9f')
+    expect(r.kind).toBe('not-found')
+  })
+
+  it('SHAPE GATE: a full-hex uuid shorter than 36 chars still resolves as a prefix', async () => {
+    // `9f4b6738-79f2-474d-8018` is a genuine (>= 8 char) hex prefix — a user
+    // truncating a uuid must keep working.
+    const d = await harness([rec(ID_A, '/w')], { [ID_A]: '甲' })
+    const r = await d.resolve(undefined, '9f4b6738-79f2-474d-8018')
+    expect(r.kind).toBe('ok')
+    if (r.kind === 'ok') expect(r.sessionId).toBe(ID_A)
+  })
+
+  it('★ SHAPE GATE: a letter fragment that WOULD prefix a non-uuid id stays not-found', async () => {
+    // The genuinely falsifying case for the gate. On a host whose ids are not
+    // UUIDs (the ruling explicitly allows that shape), a word like `build` is a
+    // prefix of `session-build-01` — without the gate it would resolve as an
+    // id-prefix, i.e. an arbitrary fragment selecting a session. The gate makes
+    // it not-found; only the full canonical id addresses such a session.
+    const d = await harness([rec('session-build-01', '/w')], { 'session-build-01': '甲' })
+    const r = await d.resolve(undefined, 'build')
+    expect(r.kind).toBe('not-found')
+  })
+
+  it('a non-uuid id still resolves by its full canonical form (shape gate does not break it)', async () => {
+    const d = await harness([rec('session-build-01', '/w')], { 'session-build-01': '甲' })
+    const r = await d.resolve(undefined, 'session-build-01')
+    expect(r.kind).toBe('ok')
+    if (r.kind === 'ok') expect(r.sessionId).toBe('session-build-01')
+  })
+
   it('an ambiguous id does NOT fall through to a title match', async () => {
     // A short id collides; a session also has that exact title. The id branch
     // must answer ambiguous rather than quietly resolve by title.
     const d = await harness([rec(ID_A, '/w'), rec(ID_B, '/w')], { [ID_A]: '9f4b67', [ID_B]: '乙' })
-    const r = await d.resolve(undefined, '9f4b67')
+    const r = await d.resolve(undefined, '9f4b6738')
     expect(r.kind).toBe('ambiguous')
   })
 })

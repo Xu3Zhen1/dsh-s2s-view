@@ -304,10 +304,11 @@ export class S2sDiscoveryService extends Service {
       if (exact !== undefined) return toOk(exact, 'exact')
 
       // Item ④: accept the bare UUID and the short id shown by `s2s_sessions`,
-      // but ONLY on a unique match. A prefix that hits more than one session is
-      // ambiguous, never a guess — and it must never fall through to name
+      // but ONLY on a unique match, and ONLY when the input is actually
+      // id-shaped (isIdShaped above). A prefix that hits more than one session
+      // is ambiguous, never a guess — and it must never fall through to name
       // resolution and pretend it succeeded.
-      if (!isCanonical) {
+      if (!isCanonical && isIdShaped(sessionId)) {
         const infos = await this.collect()
         // Compare against the normalized canonical id so an arbitrary title or
         // path can never be mistaken for one. Exact normalized match wins; only
@@ -540,6 +541,28 @@ function normalizeId(value: string): string {
 
 /** A UUID shape, so a prefix match is only ever attempted between real ids. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/**
+ * Whether a caller-supplied `session_id` is **id-shaped** at all (item ④).
+ *
+ * Only three forms are accepted, and this gate runs *before* any prefix
+ * matching: the canonical `session-<uuid>`, the bare UUID, and the short id the
+ * listings display (a pure hex prefix of one). Without this gate any string
+ * that merely happens to be a unique prefix of some session id would resolve —
+ * a title fragment or a path segment could select a session, which the ruling
+ * forbids ("不能把任意标题或路径当 id").
+ *
+ * @param raw - the caller-supplied string, untrimmed.
+ * @returns true when the value may take the id-resolution path.
+ */
+function isIdShaped(raw: string): boolean {
+  const bare = normalizeId(raw)
+  if (UUID_RE.test(bare)) return true // canonical or bare uuid
+  // Short form: a pure hex prefix of a uuid, at least the 8 chars that
+  // `shortId()` prints. Hex-only is what keeps words and paths out: a Chinese
+  // title, a workspace path or any letter-bearing fragment fails this test.
+  return /^[0-9a-f][0-9a-f-]*$/.test(bare) && bare.length >= 8
+}
 
 /**
  * Choose the candidates a `not-found` receipt should show (item ⑤).
