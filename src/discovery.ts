@@ -47,9 +47,39 @@ export interface S2sSessionInfo {
 
 export type S2sCandidate = Pick<S2sSessionInfo, 'sessionId' | 'title' | 'workspaceDir' | 'state'>
 
+/**
+ * How a successful resolution found its target.
+ *
+ * The ruling for the name-lookup fix requires the receipt to say which rule
+ * answered, because two of them are *fallbacks*: a caller that asked for an
+ * exact title and silently got a prefix match cannot tell an exact hit from an
+ * approximation, which is exactly the overclaim I1 forbids one level removed.
+ */
+export type S2sMatchKind =
+  /** The value matched exactly (title, or full/normalized id). */
+  | 'exact'
+  /** Only a `needle`-prefixed title matched, and exactly one did. */
+  | 'title-prefix'
+  /** Only a unique id *prefix* matched (e.g. the short id shown in listings). */
+  | 'id-prefix'
+
 export type S2sResolveResult =
-  | { readonly kind: 'ok'; readonly sessionId: string; readonly title?: string; readonly state: S2sSessionInfo['state']; readonly workspaceDir: string }
-  | { readonly kind: 'not-found'; readonly name: string; readonly candidates: S2sCandidate[] }
+  | {
+    readonly kind: 'ok'
+    readonly sessionId: string
+    readonly title?: string
+    readonly state: S2sSessionInfo['state']
+    readonly workspaceDir: string
+    readonly matchedBy: S2sMatchKind
+  }
+  | {
+    readonly kind: 'not-found'
+    readonly name: string
+    /** Capped, prefix-ranked suggestions (item ⑤) — never the whole corpus. */
+    readonly candidates: S2sCandidate[]
+    /** Size of the corpus the suggestions were drawn from, so a receipt can say "… and N more". */
+    readonly totalCandidates?: number
+  }
   | { readonly kind: 'ambiguous'; readonly name: string; readonly candidates: S2sCandidate[] }
 
 interface SessionRecordLike { readonly header: { readonly id: unknown; readonly cwd?: string }; readonly live: boolean }
@@ -252,20 +282,44 @@ export class S2sDiscoveryService extends Service {
 
   async resolve(name: string | undefined, sessionId: string | undefined): Promise<S2sResolveResult> {
     if (sessionId !== undefined && sessionId.length > 0) {
-      // L0 fast path: a cached hit that knows its workspace answers with no
-      // enumeration and no read at all.
-      const cached = this.cache.get(sessionId, this.now())
-      if (cached !== undefined && cached.workspaceDir !== undefined) {
-        return toOk({
-          sessionId,
-          ...(cached.title === undefined ? {} : { title: cached.title }),
-          state: this.stateOf(sessionId),
-          workspaceDir: cached.workspaceDir,
-        })
+      // L0 fast path: a cached entry that knows its workspace answers with no
+      // enumeration and no read at all. Keyed by *normalized* id so the canonical
+      // and bare spellings of the same session both hit. Exact only — a prefix
+      // must prove uniqueness against the corpus, which is done below.
+      const wantId = normalizeId(sessionId)
+      const isCanonical = sessionId.trim().toLowerCase().startsWith('session-')
+      {
+        const hit = this.cache.getByNormalizedId(sessionId, this.now())
+        if (hit !== undefined && hit.entry.workspaceDir !== undefined) {
+          return toOk({
+            sessionId: hit.key,
+            ...(hit.entry.title === undefined ? {} : { title: hit.entry.title }),
+            state: this.stateOf(hit.key),
+            workspaceDir: hit.entry.workspaceDir,
+          })
+        }
       }
-      // Fast path: an exact id needs only that session's title, not the corpus.
+      // Fast path: an exact canonical id needs only that session's title.
       const exact = await this.collectById(sessionId)
-      if (exact !== undefined) return toOk(exact)
+      if (exact !== undefined) return toOk(exact, 'exact')
+
+      // Item ④: accept the bare UUID and the short id shown by `s2s_sessions`,
+      // but ONLY on a unique match. A prefix that hits more than one session is
+      // ambiguous, never a guess — and it must never fall through to name
+      // resolution and pretend it succeeded.
+      if (!isCanonical) {
+        const infos = await this.collect()
+        // Compare against the normalized canonical id so an arbitrary title or
+        // path can never be mistaken for one. Exact normalized match wins; only
+        // then is a prefix considered.
+        const exactNorm = infos.filter(info => normalizeId(info.sessionId) === wantId)
+        if (exactNorm.length === 1) return toOk(exactNorm[0]!, 'exact')
+        if (exactNorm.length > 1) return { kind: 'ambiguous', name: sessionId, candidates: exactNorm.map(toCandidate) }
+        const prefixedById = infos.filter(info => normalizeId(info.sessionId).startsWith(wantId))
+        if (prefixedById.length === 1) return toOk(prefixedById[0]!, 'id-prefix')
+        if (prefixedById.length > 1) return { kind: 'ambiguous', name: sessionId, candidates: prefixedById.map(toCandidate) }
+        return { kind: 'not-found', name: sessionId, candidates: approxCandidates(infos, wantId), totalCandidates: infos.length }
+      }
     }
 
     // L0 fast path for name addressing: exactly one cached session owns this
@@ -291,15 +345,24 @@ export class S2sDiscoveryService extends Service {
     }
 
     const infos = await this.collect()
-    if (needle === undefined || needle.length === 0) return { kind: 'not-found', name: name ?? '', candidates: infos.map(toCandidate) }
+    if (needle === undefined || needle.length === 0) return { kind: 'not-found', name: name ?? '', candidates: approxCandidates(infos, ''), totalCandidates: infos.length }
     const matches = infos.filter(info => info.title?.trim().toLowerCase() === needle)
-    if (matches.length === 0) return { kind: 'not-found', name: name ?? '', candidates: infos.map(toCandidate) }
     if (matches.length > 1) {
       // E2: remember the ambiguity so the cache never resolves this name alone.
       for (const match of matches) this.cache.markAmbiguous(match.sessionId, this.now())
       return { kind: 'ambiguous', name: name ?? '', candidates: matches.map(toCandidate) }
     }
-    return toOk(matches[0]!)
+    if (matches.length === 1) return toOk(matches[0]!)
+
+    // Item ①: exact failed. Accept ONLY a title that *starts with* the needle,
+    // and only when exactly one candidate does. No arbitrary `contains` match —
+    // its false-hit risk is not supported as safe by current evidence. The
+    // receipt reports `matchedBy: 'title-prefix'` so the caller can tell an
+    // approximation from an exact hit.
+    const prefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true)
+    if (prefixed.length === 1) return toOk(prefixed[0]!, 'title-prefix')
+    if (prefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: prefixed.map(toCandidate) }
+    return { kind: 'not-found', name: name ?? '', candidates: approxCandidates(infos, needle), totalCandidates: infos.length }
   }
 
   /**
@@ -326,22 +389,33 @@ export class S2sDiscoveryService extends Service {
     return this.collectFromFs()
   }
 
-  /** One exact session id without reading every other session's title. */
+  /**
+   * One exact session id without reading every other session's title.
+   *
+   * "Exact" is judged on the **normalized** id (item ④): the canonical
+   * `session-<uuid>` and the bare UUID address the same session, so both are
+   * accepted here. Prefix matching is deliberately NOT done in this fast path —
+   * proving uniqueness requires the full corpus, which `resolve()` handles.
+   */
   private async collectById(sessionId: string): Promise<S2sSessionInfo | undefined> {
+    const want = normalizeId(sessionId)
     const query = this.queryService
     if (query !== undefined && typeof query.listSessions === 'function') {
       try {
         const records = await query.listSessions()
-        const record = records.find(entry => String(entry.header.id) === sessionId)
+        const record = records.find(entry => normalizeId(String(entry.header.id)) === want)
         if (record === undefined) return undefined
+        // Use the record's own canonical id, not the caller's spelling, so the
+        // returned row is always canonical.
+        const canonical = String(record.header.id)
         // L1 answers from the host's projection cache; L0 may answer with no
         // enumeration at all on a repeat call (handled by resolve()).
-        const title = await this.readTitleLayered(sessionId, record.header, undefined, record.header.cwd)
-        return toInfo(record, sessionId, title, this.stateOf(sessionId))
+        const title = await this.readTitleLayered(canonical, record.header, undefined, record.header.cwd)
+        return toInfo(record, canonical, title, this.stateOf(canonical))
       } catch { /* fall through to the full scan */ }
     }
     const infos = await this.collect()
-    return infos.find(entry => entry.sessionId === sessionId)
+    return infos.find(entry => normalizeId(entry.sessionId) === want)
   }
 
   /**
@@ -441,8 +515,69 @@ function toCandidate(info: S2sSessionInfo): S2sCandidate {
   return { sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), workspaceDir: info.workspaceDir, state: info.state }
 }
 
-function toOk(info: S2sSessionInfo): S2sResolveResult {
-  return { kind: 'ok', sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), state: info.state, workspaceDir: info.workspaceDir }
+function toOk(info: S2sSessionInfo, matchedBy: S2sMatchKind = 'exact'): S2sResolveResult {
+  return { kind: 'ok', sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), state: info.state, workspaceDir: info.workspaceDir, matchedBy }
+}
+
+/** How many approximate candidates a `not-found` receipt may carry (item ⑤). */
+const NOT_FOUND_CANDIDATE_LIMIT = 8
+
+/**
+ * Normalize a session id for comparison.
+ *
+ * The canonical form is `session-<uuid>`; listings show a short, prefix-less id
+ * (`tools.ts`'s `shortId`). Stripping the container prefix — and nothing else —
+ * lets both address the same session without ever treating an arbitrary title or
+ * path as an id (the ruling's explicit constraint).
+ *
+ * @param value - any caller-supplied id string.
+ * @returns the lowercase form without the `session-` prefix.
+ */
+function normalizeId(value: string): string {
+  const trimmed = value.trim().toLowerCase()
+  return trimmed.startsWith('session-') ? trimmed.slice('session-'.length) : trimmed
+}
+
+/** A UUID shape, so a prefix match is only ever attempted between real ids. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/**
+ * Choose the candidates a `not-found` receipt should show (item ⑤).
+ *
+ * Printing the entire corpus was itself part of the defect: on this host that is
+ * 239 rows, so the one plausible answer is buried and the caller retries the
+ * same name.
+ *
+ * Ranking is fixed and deliberately shallow, because the receipt must not imply
+ * a match rule the resolver does not use:
+ *
+ * 1. titles that **start with** the needle — the same rule item ① resolves by;
+ * 2. titles that **contain** the needle — *diagnostic only*. The ruling forbids
+ *    using a contains hit for delivery (its false-hit risk is unsupported), so
+ *    it may appear here as a hint and nowhere else;
+ * 3. the rest of the corpus, in listing order.
+ *
+ * Note (1) is normally empty on this path: if exactly one title were prefixed,
+ * item ① would have resolved it, and if several were, the result would be
+ * `ambiguous`. It is kept because the ordering must be stated in one place, and
+ * because (2) is what actually gives the stuck caller a lead.
+ *
+ * No similarity metric is invented: anything beyond these two explicit rules
+ * would be a heuristic this evidence does not support.
+ *
+ * @param infos - the full authoritative corpus.
+ * @param needle - the normalized query; empty means "no query to rank by".
+ * @returns at most {@link NOT_FOUND_CANDIDATE_LIMIT} candidates.
+ */
+function approxCandidates(infos: readonly S2sSessionInfo[], needle: string): S2sCandidate[] {
+  const titleOf = (info: S2sSessionInfo): string => info.title?.trim().toLowerCase() ?? ''
+  const prefixed = needle.length === 0 ? [] : infos.filter(info => titleOf(info).startsWith(needle))
+  const containing = needle.length === 0
+    ? []
+    : infos.filter(info => prefixed.includes(info) === false && titleOf(info).includes(needle))
+  const seen = new Set([...prefixed, ...containing])
+  const rest = infos.filter(info => seen.has(info) === false)
+  return [...prefixed, ...containing, ...rest].slice(0, NOT_FOUND_CANDIDATE_LIMIT).map(toCandidate)
 }
 
 /** Zstandard frame magic, little-endian `28 B5 2F FD`. */

@@ -217,6 +217,35 @@ export class TitleCache {
     return this.entries
   }
 
+  /**
+   * Look up an entry by a caller-supplied id that may be spelled differently.
+   *
+   * Item ④ of the name-lookup fix lets callers pass the canonical
+   * `session-<uuid>` or the bare UUID (and, via resolution, the short id). The
+   * cache is keyed by whatever canonical id the host reported, so an exact hit
+   * has to compare **normalized** forms. This is still a pure in-memory exact
+   * match — no enumeration and no prefix guessing: a prefix would need the full
+   * corpus to prove uniqueness, which is `resolve()`'s job, not the cache's.
+   *
+   * @param value - any caller-supplied id string.
+   * @param now - epoch ms for the E4 age check.
+   * @returns the live entry, or undefined when no key normalizes to the same id.
+   */
+  getByNormalizedId(value: string, now: number = Date.now()): { readonly key: string; readonly entry: TitleCacheEntry } | undefined {
+    this.load()
+    const want = value.trim().toLowerCase().replace(/^session-/, '')
+    for (const [key, entry] of this.entries) {
+      if (key.trim().toLowerCase().replace(/^session-/, '') !== want) continue
+      if (now - entry.builtAt > TITLE_TTL_MS) return undefined // E4
+      if (entry.lastAccess !== now) {
+        entry.lastAccess = now
+        this.markDirty()
+      }
+      return { key, entry }
+    }
+    return undefined
+  }
+
   private markDirty(): void {
     this.dirty = true
     if (this.flushTimer !== undefined) return

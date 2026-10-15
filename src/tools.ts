@@ -31,6 +31,27 @@ function labelOf(r: Extract<S2sResolveResult, { kind: 'ok' }>): string {
 }
 
 /**
+ * How a resolution found its target, rendered for the receipt.
+ *
+ * The ruling requires the receipt to distinguish these: two of them are
+ * fallbacks, and a caller that asked for an exact title must be able to tell
+ * whether it got the exact session or an approximation. Returns `''` for an
+ * exact hit so the common case stays uncluttered, and an explicit phrase
+ * otherwise.
+ *
+ * @param r - a successful resolution.
+ */
+function matchNoteOf(r: Extract<S2sResolveResult, { kind: 'ok' }>): string {
+  if (r.matchedBy === 'title-prefix') {
+    return ' [matched by TITLE PREFIX, not exact — actual title: "' + (r.title ?? '(untitled)') + '"]'
+  }
+  if (r.matchedBy === 'id-prefix') {
+    return ' [matched by ID PREFIX — full id: ' + r.sessionId + ']'
+  }
+  return ''
+}
+
+/**
  * Short display form of a session id.
  *
  * A real session id is the full `session-<uuid>` string — that exact form is
@@ -54,7 +75,12 @@ function describeCandidates(cands: { title?: string; sessionId: string; state: s
 function displayResolve(resolved: Extract<S2sResolveResult, { kind: 'not-found' | 'ambiguous' }>): string {
   if (resolved.kind === 'not-found') {
     const lines = resolved.candidates.length === 0 ? ['No sessions match.'] : describeCandidates(resolved.candidates)
-    return 'No session named "' + resolved.name + '" (a rename becomes visible after the next title checkpoint; list actual names with s2s_sessions).\n' + lines.join('\n')
+    // Item ⑤: never print the whole corpus. Say how much was left out so the
+    // reader knows the list is a suggestion, not the complete set — a truncated
+    // list presented as complete is its own kind of overclaim.
+    const hidden = (resolved.totalCandidates ?? resolved.candidates.length) - resolved.candidates.length
+    if (hidden > 0) lines.push('… and ' + hidden + ' more (use s2s_sessions to list all)')
+    return 'No session named "' + resolved.name + '" (a rename becomes visible after the next title checkpoint; list actual names with s2s_sessions). Names must match EXACTLY or be a unique TITLE PREFIX.\n' + lines.join('\n')
   }
   return 'Multiple sessions named "' + resolved.name + '". Disambiguate with session_id:\n' + resolved.candidates.map(function(c) { return '- ' + c.sessionId + ' (' + c.workspaceDir + ')' }).join('\n')
 }
@@ -144,6 +170,10 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
         const from = args.from ?? String(exec.agent?.id ?? 'unknown')
         const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+        // Item ①/④: a fallback match must be visible on the receipt, and this is
+        // the receipt where it matters most — delivering to a session chosen by
+        // prefix is exactly where an unstated approximation would be harmful.
+        const matchNote = matchNoteOf(resolved)
         // Record before delivering: the row must exist for the delivery to
         // advance it, and a message that is lost mid-flight is exactly the one a
         // status query later needs to find.
@@ -174,7 +204,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             return { text: 'NOT delivered: "' + labelOf(resolved) + '" resolved but had no live agent (broker state=absent), so the message reached nobody (left queued).' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
           }
           const how = state === 'idle' ? 'as a follow-up turn' : 'by context injection (the target was mid-turn)'
-          return { text: 'Handed to "' + labelOf(resolved) + '" ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+          return { text: 'Handed to "' + labelOf(resolved) + '"' + matchNote + ' ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
         }
         if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' }
         const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
@@ -183,7 +213,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         // the live path reports — so the same restraint applies. The old wording
         // said a bare "delivered", which a reader takes as "it is in the log".
         const base = outcome === 'resumed'
-          ? 'Woke "' + labelOf(resolved) + '" and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+          ? 'Woke "' + labelOf(resolved) + '"' + matchNote + ' and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
           : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
         return { text: base + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
       },
@@ -232,7 +262,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
           : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
         return { text: outcome === 'resumed'
-          ? 'Session "' + labelOf(resolved) + '" resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm
+          ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm
           : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' }
       },
     }),
