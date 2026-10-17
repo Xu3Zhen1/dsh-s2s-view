@@ -636,18 +636,28 @@ export class S2sDiscoveryService extends Service {
       join(sessionDir, 'session.jsonl.zstd'),
     ]
     for (const p of paths) {
-      const z = await readFile(p).catch(() => undefined)
-      if (z === undefined) continue
-      const header = headerFromZstd(z, expectedBareId)
-      if (header !== undefined) return { origin: header.origin, headerProven: true }
-      // A present-but-unprovable header: do NOT fall through to other formats or
-      // guesses — report unknown.
-      return { origin: undefined, headerProven: false }
+      const read = await readFile(p).then(z => ({ z }), (error: unknown) => ({ error }))
+      if ('error' in read) {
+        // ENOENT = this format simply does not exist; trying the next format is
+        // legitimate. ANY other error (EACCES, EBUSY, …) means a log EXISTS but
+        // cannot be read — its identity is unprovable, and quietly falling
+        // through to an older format (or to "ordinary") would turn an unreadable
+        // session into a legal target.
+        const code = (read.error as { code?: string } | undefined)?.code
+        if (code === 'ENOENT') continue
+        return { origin: undefined, headerProven: false }
+      }
+      const header = headerFromZstd(read.z, expectedBareId)
+      return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
     }
-    const plain = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').catch(() => undefined)
-    if (plain !== undefined) {
-      const header = headerFromJsonl(plain, expectedBareId)
-      if (header !== undefined) return { origin: header.origin, headerProven: true }
+    const plainRead = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').then(t => ({ t }), (error: unknown) => ({ error }))
+    if ('t' in plainRead) {
+      const header = headerFromJsonl(plainRead.t, expectedBareId)
+      return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
+    }
+    const code = (plainRead.error as { code?: string } | undefined)?.code
+    if (code !== 'ENOENT') {
+      // A plain log exists but could not be read — same fail-closed rule.
       return { origin: undefined, headerProven: false }
     }
     // No log at all.
@@ -891,44 +901,52 @@ interface S2sSessionHeaderReading {
 /**
  * Extract and VERIFY the top-level session header from one frame of JSONL.
  *
- * Verification is what makes the reading trustworthy: the first record must be
- * a `session` record, carry an id, and that id must equal the expected bare id
- * (the directory name). A non-session first record, a missing id, or an id
- * mismatch yields `undefined` — the caller then reports the identity as
- * unknown rather than pretending the session is ordinary. `data.origin` is
- * deliberately NOT consulted: identity lives on the record itself.
+ * Verification is decided by the FIRST NON-EMPTY record alone: it must be a
+ * `session` record, carry an id, and that id must equal the expected bare id
+ * (the directory name). A first record that fails to parse, carries the wrong
+ * type, or mismatches the id ends the search — a LATER well-formed `session`
+ * record cannot rescue an identity whose header was unreadable (an impostor
+ * line must not revive it). `data.origin` is deliberately NOT consulted:
+ * identity lives on the record itself. An `origin` that is present but not a
+ * non-empty string is UNRECOGNIZED (unknown), never "field absent".
+ *
+ * @returns the trusted reading, or `'unrecognized'` when the identity could not
+ *   be proven from this frame.
  */
-export function headerFromJsonl(text: string, expectedBareId: string): S2sSessionHeaderReading | undefined {
+export function headerFromJsonl(text: string, expectedBareId: string): { reading: S2sSessionHeaderReading | 'unrecognized' } {
   for (const line of text.split('\n')) {
     if (line.length === 0) continue
     let event: { type?: unknown; id?: unknown; origin?: unknown }
-    try { event = JSON.parse(line) } catch { continue }
-    if (event.type !== 'session') return undefined
-    if (typeof event.id !== 'string') return undefined
-    if (normalizeId(event.id) !== expectedBareId) return undefined
-    return {
-      origin: typeof event.origin === 'string' && event.origin.length > 0 ? event.origin : undefined,
-      id: event.id,
-    }
+    try { event = JSON.parse(line) } catch { return { reading: 'unrecognized' } }
+    if (event.type !== 'session') return { reading: 'unrecognized' }
+    if (typeof event.id !== 'string' || normalizeId(event.id) !== expectedBareId) return { reading: 'unrecognized' }
+    if (event.origin === undefined) return { reading: { origin: undefined, id: event.id } }
+    if (typeof event.origin !== 'string' || event.origin.length === 0) return { reading: 'unrecognized' }
+    return { reading: { origin: event.origin, id: event.id } }
   }
-  return undefined
+  // Empty log: nothing proven.
+  return { reading: 'unrecognized' }
 }
 
-/** `headerFromJsonl` over a concatenated-zstd log (first frame that parses). */
-export function headerFromZstd(buf: Buffer, expectedBareId: string): S2sSessionHeaderReading | undefined {
+/**
+ * `headerFromJsonl` over a concatenated-zstd log, decided by the FIRST
+ * decodable frame — later frames cannot revive a header the first one failed to
+ * prove.
+ */
+export function headerFromZstd(buf: Buffer, expectedBareId: string): { reading: S2sSessionHeaderReading | 'unrecognized' } {
   let frames: ZstdFrame[]
   try {
     frames = scanZstdFrames(buf).frames
   } catch {
     // A structurally invalid log is an UNPROVABLE header (T30 fail-closed), not
     // a crash: the caller reports the identity as unknown.
-    return undefined
+    return { reading: 'unrecognized' }
   }
   for (const frame of frames) {
     let text: string
     try { text = zstdDecompressSync(buf.subarray(frame.start, frame.end)).toString('utf8') } catch { continue }
-    const header = headerFromJsonl(text, expectedBareId)
-    if (header !== undefined) return header
+    return { reading: headerFromJsonl(text, expectedBareId).reading }
   }
-  return undefined
+  return { reading: 'unrecognized' }
 }
+

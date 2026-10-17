@@ -691,27 +691,51 @@ export class S2sLedger extends Service {
    * the row's error field so `s2s_status` / `s2s_reconcile` can show WHY it was
    * cancelled, not just that it was.
    *
+   * The return is STRUCTURED because "the call did not throw" proves nothing:
+   * the row may be missing, already handed off, or terminal — and `putIfUnchanged`
+   * losing its CAS race means the state on disk is NOT what this call intended.
+   * The caller must branch on the outcome; only `cancelled` proves the row is
+   * no longer queued.
+   *
    * Terminal and already-advancing rows are left untouched (same rule as
    * `markInboxed`): cancelling a delivered message would erase evidence.
    *
    * @param msgId - the queued row to cancel.
    * @param reason - the policy refusal text, stored verbatim on the row.
+   * @returns what actually happened on storage.
    */
-  async cancel(msgId: string, reason: string): Promise<void> {
+  async cancel(msgId: string, reason: string): Promise<
+    { outcome: 'cancelled'; revision: number } |
+    { outcome: 'not-found' } |
+    { outcome: 'not-cancellable'; status: string } |
+    { outcome: 'conflict' }
+  > {
     const domain = this.opened()
     const table = domain.table(MESSAGES_TABLE)
+    let result: { outcome: 'cancelled'; revision: number } | { outcome: 'not-found' } | { outcome: 'not-cancellable'; status: string } | { outcome: 'conflict' } = { outcome: 'conflict' }
     await this.serialize(async () => {
       const row = table.get(msgId)
-      if (row === undefined) return
-      if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return
-      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) return
-      await this.putIfUnchanged(row.revision ?? 0, {
+      if (row === undefined) {
+        result = { outcome: 'not-found' }
+        return
+      }
+      if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') {
+        result = { outcome: 'not-cancellable', status: row.status }
+        return
+      }
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) {
+        result = { outcome: 'not-cancellable', status: row.status }
+        return
+      }
+      const changed = await this.putIfUnchanged(row.revision ?? 0, {
         ...row,
         status: 'cancelled',
         lastError: reason,
         updatedAt: Date.now(),
       })
+      result = changed ? { outcome: 'cancelled', revision: (row.revision ?? 0) + 1 } : { outcome: 'conflict' }
     })
+    return result
   }
 
   /**

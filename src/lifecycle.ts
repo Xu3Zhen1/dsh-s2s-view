@@ -14,7 +14,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import { installModelSelection, type Agent, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { S2sError } from './error.ts'
+import { S2sError, type S2sErrorCode } from './error.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2S_MESSAGE_SOURCE } from './source.ts'
 import { S2sMailbox, type MailboxEntry } from './mailbox.ts'
@@ -101,6 +101,15 @@ export class S2sLifecycleService extends Service {
 
   private readonly config: LifecycleConfig
   private readonly mailbox: S2sMailbox
+  /**
+   * T30: the target-policy check injected by the tools layer, consulted at
+   * EVERY actual handover point — before `registry.resume` in
+   * `queueForDormant`, and before `drain` fires from `agent/created` (which
+   * bypasses the tools entirely). The verdict is re-read at the handover
+   * moment; a refusal keeps the message in the mailbox (it is the user's
+   * queue — never silently dropped) and the caller gets `'refused'`.
+   */
+  private targetPolicyCheck: ((sessionId: string) => { code: S2sErrorCode; message: string } | undefined) | undefined
   /** Resumed handles are kept alive for the process lifetime (see OQ-5). */
   private readonly resumed = new Map<string, ResumedHandle>()
   /**
@@ -126,12 +135,28 @@ export class S2sLifecycleService extends Service {
   }
 
   /**
+   * T30: install the target-policy check, consulted at every handover point.
+   *
+   * Injected by the tools layer after its own gates, because the policy needs
+   * the registry-backed classifier that lives there. `drain()` from
+   * `agent/created` bypasses the tools entirely, so without this hook an
+   * auto-drain could hand a queued message to a session archived AFTER enqueue
+   * — the exact race the review required closed.
+   *
+   * @param check - returns the refusal for the session, or undefined when the
+   *   session is an eligible target.
+   */
+  setTargetPolicyCheck(check: ((sessionId: string) => { code: S2sErrorCode; message: string } | undefined) | undefined): void {
+    this.targetPolicyCheck = check
+  }
+
+  /**
    * Queue one message for a (presumed dormant) session and, when allowed,
    * resume it and deliver immediately.
    * @returns `'resumed'` when the session was resumed and drained now,
    *   `'queued'` when the entry waits in the mailbox.
    */
-  async queueForDormant(entry: { sessionId: string; from: string; text: string; replyTo?: string; msgId: string }): Promise<'queued' | 'resumed'> {
+  async queueForDormant(entry: { sessionId: string; from: string; text: string; replyTo?: string; msgId: string }): Promise<'queued' | 'resumed' | 'refused'> {
     const record: MailboxEntry = {
       msgId: entry.msgId,
       from: entry.from,
@@ -162,6 +187,19 @@ export class S2sLifecycleService extends Service {
     if (typeof registry.resume !== 'function') {
       this.ctx.logger.warn('s2s lifecycle: agent registry has no resume capability; message stays queued')
       return 'queued'
+    }
+    // T30: re-run the target policy AFTER the async setup read, immediately
+    // before the actual resume. The tools-layer gate ran earlier; archive state
+    // can flip across the `resumedSetup` await (which reads presets/observations
+    // asynchronously). A refusal KEEPS the message in the mailbox — it is the
+    // user's queue, never silently dropped — and the outcome is `'refused'` so
+    // the caller can cancel its ledger row.
+    if (this.targetPolicyCheck !== undefined) {
+      const refusal = this.targetPolicyCheck(entry.sessionId)
+      if (refusal !== undefined) {
+        this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}); message kept in the mailbox`)
+        return 'refused'
+      }
     }
     // A dormant resume through AgentRegistry.resume does NOT run the host's
     // composeAgent, so the resumed Agent gets a fresh scoped world with no
@@ -395,6 +433,20 @@ export class S2sLifecycleService extends Service {
   async drain(sessionId: string): Promise<number> {
     const agent = this.ctx.agents.get(SessionId(sessionId))
     if (agent === undefined) return 0
+    // T30: the LAST gate before followup/inject. This covers every drain entry
+    // point — the resume path above, the already-live branch, and the
+    // `agent/created` auto-drain (which bypasses the tools entirely, so without
+    // this check a manually reopened session would receive queued messages
+    // without any target-policy evaluation). A refusal KEEPS the entries in the
+    // mailbox (the user's queue — never silently dropped; the read is not
+    // destructive here) and logs the refusal loudly (G9).
+    if (this.targetPolicyCheck !== undefined) {
+      const refusal = this.targetPolicyCheck(sessionId)
+      if (refusal !== undefined) {
+        this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); mailbox kept`)
+        return 0
+      }
+    }
     // T6b: the row for a dormant message was created by the caller
     // (`s2s_message` records before dispatch) and stayed `queued` for the whole
     // wake, so a status query could not tell a delivered wake from a stuck one.

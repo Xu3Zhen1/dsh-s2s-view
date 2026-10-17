@@ -118,17 +118,26 @@ describe('T30 blocker 1: FS identity reads the REAL top-level header', () => {
     expect(cls).toBe('unknown')
   })
 
-  it('the header verifier rejects non-session first records and id mismatches', () => {
-    expect(headerFromJsonl(headerLine('subagent'), BARE)).toEqual({ origin: 'subagent', id: CANON })
-    // A non-header first record is not trusted even if it carries origin.
-    expect(headerFromJsonl(JSON.stringify({ type: 'other', origin: 'subagent' }), BARE)).toBeUndefined()
+  it('the header verifier decides on the FIRST non-empty record only, and unrecognized origins stay unrecognized', () => {
+    expect(headerFromJsonl(headerLine('subagent'), BARE).reading).toEqual({ origin: 'subagent', id: CANON })
+    // A non-header first record is not trusted even if it carries origin…
+    expect(headerFromJsonl(JSON.stringify({ type: 'other', origin: 'subagent' }), BARE).reading).toBe('unrecognized')
+    // …and a LATER well-formed session record cannot revive it.
+    const impostorThenHeader = JSON.stringify({ type: 'other', origin: 'subagent' }) + '\n' + headerLine('subagent')
+    expect(headerFromJsonl(impostorThenHeader, BARE).reading).toBe('unrecognized')
     // Wrong session id is not trusted.
-    expect(headerFromJsonl(headerLine('subagent', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), BARE)).toBeUndefined()
+    expect(headerFromJsonl(headerLine('subagent', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), BARE).reading).toBe('unrecognized')
     // A data-wrapped origin is not the identity.
-    expect(headerFromJsonl(JSON.stringify({ type: 'session', id: 'session-' + BARE, data: { origin: 'subagent' } }), BARE)!.origin).toBeUndefined()
-    // The zstd path agrees.
+    expect(headerFromJsonl(JSON.stringify({ type: 'session', id: 'session-' + BARE, data: { origin: 'subagent' } }), BARE).reading).toEqual({ origin: undefined, id: CANON })
+    // An origin that is present but NOT a non-empty string is unrecognized.
+    expect(headerFromJsonl(JSON.stringify({ type: 'session', id: 'session-' + BARE, origin: 42 }), BARE).reading).toBe('unrecognized')
+    expect(headerFromJsonl(JSON.stringify({ type: 'session', id: 'session-' + BARE, origin: '' }), BARE).reading).toBe('unrecognized')
+    // The zstd path agrees, and a bad FIRST frame followed by a good one stays unrecognized.
     const z = zstdCompressSync(Buffer.from(headerLine('subagent') + '\n', 'utf8'))
-    expect(headerFromZstd(z, BARE)!.origin).toBe('subagent')
+    expect(headerFromZstd(z, BARE).reading).toEqual({ origin: 'subagent', id: CANON })
+    const badFirst = zstdCompressSync(Buffer.from('not json\n', 'utf8'))
+    const goodSecond = zstdCompressSync(Buffer.from(headerLine('subagent') + '\n', 'utf8'))
+    expect(headerFromZstd(Buffer.concat([badFirst, goodSecond]), BARE).reading).toBe('unrecognized')
   })
 
   it('★ a warm title cache does not skip the header check (identity still verified)', async () => {
@@ -263,35 +272,96 @@ describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
     expect(row!.lastError ?? null).toBeNull() // no refusal was written to it
   })
 
-  it('a dead_letter row is not revived by cancel', async () => {
+  it('★ terminal rows are not revived by cancel (inboxed tested directly; dead_letter needs an unreadable log, declared)', async () => {
+    // Honest scope note: producing a REAL dead_letter requires a row stamped
+    // `unreadableSince` by a failed reconcile — this environment has no injection
+    // entry for that (the standing T24 boundary: real-host expired>0 unobserved).
+    // The terminal-state guard IS exercised directly through `inboxed`, which
+    // runs the same not-cancellable branch as dead_letter.
     const { ledger } = await realLedger()
     await ledger.record({ msgId: 'm-3', from: CALLER, to: PEER, text: 't' })
-    await ledger.cancel('m-3', 'first')
-    await ledger.cancel('m-3', 'second attempt')
+    await ledger.markInboxed('m-3', PEER)
+    await ledger.cancel('m-3', 'late refusal')
     const row = await ledger.get('m-3')
-    expect(row!.status).toBe('cancelled')
-    expect(row!.lastError).toBe('first') // first refusal is the evidence
+    expect(row!.status).toBe('inboxed') // untouched by the refusal
+    expect(row!.lastError ?? null).toBeNull()
   })
 
-  it('★ REAL mid-flight cancellation: flip the archive during budget, then cancel lands on storage', async () => {
+  it('★ cancel writes the refusal and the revision INCREASES (before/after)', async () => {
     const { ledger } = await realLedger()
     await ledger.record({ msgId: 'm-4', from: CALLER, to: ARCHIVED, text: 't' })
-    // Simulate the exact post-budget refusal path against REAL storage.
-    await ledger.cancel('m-4', '[S2S_ARCHIVED_TARGET] Refused (post-budget re-check)')
+    const before = await ledger.get('m-4')
+    const revBefore = before!.revision ?? 0
+    const result = await ledger.cancel('m-4', '[S2S_ARCHIVED_TARGET] Refused (post-budget re-check)')
+    expect(result.outcome).toBe('cancelled')
     const row = await ledger.get('m-4')
     expect(row!.status).toBe('cancelled')
     expect(row!.lastError).toContain('S2S_ARCHIVED_TARGET')
-    expect(spiesDone).toBe(true)
+    expect(row!.revision ?? 0).toBeGreaterThan(revBefore)
   })
 
-  it('cancel on an unknown msgId is a no-op (no row invented)', async () => {
+  it('cancel reports its structured outcome honestly (not-found / not-cancellable)', async () => {
     const { ledger } = await realLedger()
-    await ledger.cancel('m-missing', 'no such row')
-    expect(await ledger.get('m-missing')).toBeUndefined()
+    await ledger.record({ msgId: 'm-5', from: CALLER, to: PEER, text: 't' })
+    await ledger.markInboxed('m-5', PEER)
+    const handedOff = await ledger.cancel('m-5', 'late refusal')
+    expect(handedOff.outcome).toBe('not-cancellable')
+    expect((handedOff as { status?: string }).status).toBe('inboxed')
+    const missing = await ledger.cancel('m-missing', 'x')
+    expect(missing.outcome).toBe('not-found')
+  })
+
+  it('★ REAL tool-level mid-flight: buildTools + real storage ledger + archive flipped during the budget barrier', async () => {
+    // The review's required shape: a REAL buildTools over a REAL storage ledger,
+    // a budget spy that flips the archive state mid-flight (the barrier), and
+    // assertions that NO handover happened and the row ended cancelled.
+    const root = await mkdtemp(join(tmpdir(), 's2s-cancel-'))
+    dirs.push(root)
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    const ledger = new S2sLedger(ctx)
+    await ledger.open()
+    disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
+    const live = { ids: [] as string[] }
+    const discovery = {
+      list: vi.fn(async () => [] as any[]),
+      resolve: vi.fn(async () => ({ kind: 'ok', sessionId: ARCHIVED, title: 'a', state: 'dormant', workspaceDir: 'ws', matchedBy: 'exact', targetClass: 'eligible' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [...live.ids] }) as const),
+      classifyTarget: vi.fn((id: string) => (live.ids.includes(id) ? 'archived' : 'eligible') as const),
+    }
+    const queueForDormant = vi.fn(async () => 'resumed' as const)
+    const queuedCount = vi.fn(async () => 1)
+    let budgetCalls = 0
+    const budget = { check: vi.fn(async () => { budgetCalls++; if (budgetCalls === 1) live.ids.push(ARCHIVED); return undefined }) }
+    const defs = buildTools({
+      ctx: { on: vi.fn(() => vi.fn()), get: vi.fn(() => undefined) },
+      broker: { deliver: vi.fn(() => 'idle'), history: vi.fn(() => []) },
+      discovery,
+      ledger,
+      budget,
+      lifecycle: { queueForDormant, queuedCount, resumeReport: vi.fn(() => undefined), resumeReports_: vi.fn(() => []) },
+    } as any)
+    const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
+    const out = await msg.execute({ name: 'a', text: 'x' }, { agent: { id: CALLER } })
+    expect(out.text).toContain('[S2S_ARCHIVED_TARGET]')
+    expect(out.text).toContain('cancel outcome: cancelled')
+    expect(queueForDormant).not.toHaveBeenCalled() // no handover
+    // The row on REAL storage is cancelled with the refusal.
+    const row = await ledger.get(await firstMsgId(ledger))
+    expect(row!.status).toBe('cancelled')
+    expect(row!.lastError).toContain('is an archived session') // the refusal reason, verbatim
   })
 })
-
-let spiesDone = true
 const CALLER = 'session-11111111-2222-3333-4444-555555555555'
 const PEER = 'session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 const ARCHIVED = 'session-cccccccc-dddd-eeee-ffff-000000000000'
+
+/** The single row this test just recorded (query returns newest first). */
+async function firstMsgId(ledger: S2sLedger): Promise<string> {
+  const rows = await ledger.query({})
+  return rows[0]!.msgId
+}
