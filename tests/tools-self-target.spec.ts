@@ -346,6 +346,31 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     }
   })
 
+  it('★ CAP EVICTION PROOF: distinct targets show the retained window is exactly the LAST 10 inputs', async () => {
+    // The review's evidence gap: 12 sends to the SAME target with monotonic
+    // timestamps cannot distinguish "keep the newest 10" from "keep the oldest
+    // 10" — both produce an identical-looking list. Distinct canonical targets
+    // make the window observable: after 12 pushes, the retained targets must be
+    // EXACTLY inputs 3..12 (0-indexed 2..11), in input order. Driven through
+    // `recordSelfCheckSkipped` directly so the eviction itself is what is under
+    // test, not the tool pipeline.
+    const { resetSelfCheckSkipped, readSelfCheckSkipped, recordSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const targets: string[] = []
+    for (let i = 0; i < 12; i++) {
+      const t = 'session-' + String(i).padStart(8, '0') + '-aaaa-bbbb-cccc-dddddddddddd'
+      targets.push(t)
+      recordSelfCheckSkipped('s2s_message', t)
+    }
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(10)
+    // The two OLDEST inputs (00…, 01…) must be gone.
+    expect(skipped.map(s => s.target)).not.toContain(targets[0])
+    expect(skipped.map(s => s.target)).not.toContain(targets[1])
+    // The retained window is EXACTLY inputs 3..12, in input order.
+    expect(skipped.map(s => s.target)).toEqual(targets.slice(2))
+  })
+
   it('★ s2s_status reads the skipped record back, and identity-present sends do not record it', async () => {
     const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
     resetSelfCheckSkipped()
