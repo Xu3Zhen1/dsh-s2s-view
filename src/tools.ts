@@ -17,7 +17,7 @@ import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, readDrainRefusalOutcomes, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -468,30 +468,20 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' + callerNote }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
             if (outcome === 'refused') {
-              // The lifecycle's LAST-moment gate (just before registry.resume)
-              // refused — the target's legality flipped inside the async
-              // setup/resume window. The message stays in the mailbox (the
-              // user's queue); the recorded row must be explicitly cancelled —
-              // using the SAME shared verdict and ONLY its structured cancel
-              // result (review blocker 3: "the call did not throw" proves
-              // nothing).
+              // The lifecycle's handover gate refused — the target's legality
+              // flipped inside the async setup/resume window. The message stays
+              // in the mailbox (the user's queue).
+              //
+              // T30 (review blocker 1): the LIFECYCLE owns the cancel for its
+              // refusals — the refusal items below carry each msgId's STRUCTURED
+              // cancel outcome. The tools must NOT cancel again: a second cancel
+              // of an already-cancelled row reports `not-cancellable`, which read
+              // as "not-cancelled" and misreported a successful refusal.
               const refusal = discovery.targetPolicyVerdict(resolved)
               const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
               const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
-              let cancelOutcome = 'cancel-unavailable'
-              if (ledger !== undefined && ledger.isOpen) {
-                try {
-                  const result = await ledger.cancel(msgId, message)
-                  if (result.outcome === 'cancelled') cancelOutcome = 'cancelled'
-                  else cancelOutcome = 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
-                } catch (error) {
-                  cancelOutcome = 'cancel-failed'
-                  recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
-                }
-              } else {
-                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
-              }
-              throw new S2sError(message + ' [cancel outcome: ' + cancelOutcome + ']', code)
+              const outcomeNote = ' [cancel outcome: per the target-policy refusal above; the message stays in the mailbox]'
+              throw new S2sError(message + outcomeNote, code)
             }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: `drain()` hands the queue to the agent, which is the same handover
@@ -584,25 +574,13 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             if (outcome === 'refused') {
               // T30: the lifecycle's drain-time gate refused (the archive
               // flipped between the pre-resume check and the handover). Nothing
-              // was handed over — the caller must NOT report a wake. The row is
-              // cancelled with the SAME shared verdict, outcome rendered
-              // explicitly.
+              // was handed over — the caller must NOT report a wake. The
+              // lifecycle owns the cancel and its structured outcome (see the
+              // s2s_message refused branch); the tools never cancel again.
               const refusal = discovery.targetPolicyVerdict(resolved)
               const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
               const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
-              let cancelOutcome = 'cancel-unavailable'
-              if (ledger !== undefined && ledger.isOpen) {
-                try {
-                  const result = await ledger.cancel(msgId, message)
-                  cancelOutcome = result.outcome === 'cancelled' ? 'cancelled' : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
-                } catch (error) {
-                  cancelOutcome = 'cancel-failed'
-                  recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
-                }
-              } else {
-                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
-              }
-              throw new S2sError(message + ' The message was kept in the target\'s mailbox (not dropped). [cancel outcome: ' + cancelOutcome + ']', code)
+              throw new S2sError(message + ' The message was kept in the target\'s mailbox (not dropped); the cancel outcome is carried on the lifecycle refusal record.', code)
             }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: same restraint as `s2s_message` — a wake hands the queue over, it
@@ -689,6 +667,17 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + ' (caller identity unavailable; retained <= 10, process-scoped — not a delivery-success record):')
           for (const s of skipped) {
             lines.push('  ' + s.tool + ' -> ' + s.target + '  at=' + new Date(s.at).toISOString())
+          }
+        }
+
+        // T30: the lifecycle's own cancel outcomes for refused messages —
+        // including the agent/created bypass, where no tool call is involved and
+        // a logger line is not a ledger proof. Rendered only when non-empty.
+        const outcomes = readDrainRefusalOutcomes()
+        if (outcomes.length > 0) {
+          lines.push('drain refusals with cancel outcomes (retained <= 20, process-scoped):')
+          for (const o of outcomes) {
+            lines.push('  ' + o.msgId + ' -> ' + o.sessionId + '  code=' + o.code + '  cancel=' + o.cancelOutcome + '  at=' + new Date(o.at).toISOString())
           }
         }
 

@@ -183,6 +183,45 @@ export function recordSelfRefusalCancelFailure(entry: SelfRefusalCancelFailure):
 }
 
 /**
+ * T30: the LATEST drain-refusal cancellation outcomes (bounded, latest last).
+ *
+ * The lifecycle owns the cancel for refused messages — including the
+ * `agent/created` bypass, where no tool call is involved and a logger line is
+ * NOT a ledger proof. Every refusal's structured cancel outcome lands here so
+ * `s2s_status` can render it; the per-row durable state remains the row itself
+ * (cancelled / still-queued with the reason).
+ */
+export interface DrainRefusalOutcome {
+  readonly sessionId: string
+  readonly msgId: string
+  readonly code: string
+  /** Structured cancel outcome: `cancelled`, `not-cancelled (…)`, `cancel-failed: …`, `cancel-unavailable (…)`. */
+  readonly cancelOutcome: string
+  readonly at: number
+}
+
+const drainRefusalOutcomes: DrainRefusalOutcome[] = []
+const MAX_DRAIN_REFUSAL_OUTCOMES = 20
+
+/** Record one refused message's cancel outcome. Never throws. */
+export function recordDrainRefusalOutcome(entry: DrainRefusalOutcome): void {
+  try {
+    drainRefusalOutcomes.push(entry)
+    while (drainRefusalOutcomes.length > MAX_DRAIN_REFUSAL_OUTCOMES) drainRefusalOutcomes.shift()
+  } catch {}
+}
+
+/** Read-only view for `s2s_status` (latest last). */
+export function readDrainRefusalOutcomes(): readonly DrainRefusalOutcome[] {
+  return drainRefusalOutcomes
+}
+
+/** Test isolation. */
+export function resetDrainRefusalOutcomes(): void {
+  drainRefusalOutcomes.length = 0
+}
+
+/**
  * Self-target check skipped because the host gave no caller id (T29).
  *
  * The ruling allows the explicit fail-open only if it is observable on every

@@ -442,6 +442,33 @@ describe('T30 drain-refusal accounting: REAL lifecycle, real msgIds, every entry
     // And the row is cancelled with the refusal.
     expect((await ledger.get('m-keep'))!.status).toBe('cancelled')
   })
+
+  it('★ SNAPSHOT SCOPE: only entries present at peek time are refused/cancelled; entries enqueued DURING the gate stay untouched', async () => {
+    const { lifecycle, ledger, agentStub } = await realLifecycleHarness({ archived: [ARCHIVED] })
+    await ledger.record({ msgId: 'm-first', from: CALLER, to: ARCHIVED, text: 't' })
+    await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-first' })
+    // The gate refuses m-first (archived) and keeps it. An entry that arrives
+    // AFTER the peek is outside that refusal's scope — it must still be in the
+    // mailbox, uncancelled, waiting for the next gate pass.
+    const count = await lifecycle.queuedCount(ARCHIVED)
+    expect(count).toBe(1)
+    const row = await ledger.get('m-first')
+    expect(row!.status).toBe('cancelled')
+    // No handover for the archived target at any point.
+    expect(agentStub.followup).not.toHaveBeenCalled()
+    expect(agentStub.inject).not.toHaveBeenCalled()
+  })
+
+  it('★ re-enqueue idempotence: a refused entry is re-queued ONCE (no duplicate mailbox files)', async () => {
+    const { lifecycle, ledger } = await realLifecycleHarness({ archived: [ARCHIVED] })
+    await ledger.record({ msgId: 'm-idem', from: CALLER, to: ARCHIVED, text: 't' })
+    const r1 = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-idem' })
+    const r2 = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-idem' })
+    expect(r1).toBe('refused')
+    expect(r2).toBe('refused')
+    // Same msgId ⇒ the mailbox keeps ONE file for it (enqueue is idempotent by design).
+    expect(await lifecycle.queuedCount(ARCHIVED)).toBe(1)
+  })
 })
 
 const CALLER = 'session-11111111-2222-3333-4444-555555555555'

@@ -15,6 +15,7 @@ import { installModelSelection, type Agent, type AgentSetup, type ModelSelection
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { S2sError, type S2sErrorCode } from './error.ts'
+import { recordDrainRefusalOutcome } from './ledger-diagnostics.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2S_MESSAGE_SOURCE } from './source.ts'
 import { S2sMailbox, type MailboxEntry } from './mailbox.ts'
@@ -457,22 +458,32 @@ export class S2sLifecycleService extends Service {
       const refusal = await this.targetPolicyCheck(sessionId)
       if (refusal !== undefined) {
         const queued = await this.mailbox.peek(sessionId)
+        // T30: SINGLE cancel ownership — the lifecycle owns the cancel for
+        // refused messages (the agent/created bypass has no tools to do it), and
+        // each msgId's STRUCTURED cancel outcome is carried back on the refusal
+        // item. The tools' refused branch renders these verbatim and never
+        // cancels again — a second cancel of an already-cancelled row reports
+        // `not-cancellable`, which read as "not-cancelled" and misreported a
+        // successful refusal (review blocker: 双重 cancel).
+        const refused: Array<{ msgId: string; code: S2sErrorCode; message: string; cancelOutcome: string }> = []
         for (const entry of queued) {
+          let cancelOutcome = 'cancel-unavailable (no ledger)'
           if (ledger !== undefined && ledger.isOpen) {
             try {
-              await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+              const result = await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+              cancelOutcome = result.outcome === 'cancelled'
+                ? 'cancelled'
+                : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
             } catch (error) {
-              // The row stays queued — visible on its own row and to s2s_status
-              // via the cancel-failure diagnostic; never silently lost.
+              cancelOutcome = 'cancel-failed: ' + String(error)
               this.ctx.logger.warn(`s2s lifecycle: cancel failed for refused message ${entry.msgId}: ${String(error)}`)
             }
           }
+          refused.push({ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome })
+          recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: refusal.code, cancelOutcome, at: Date.now() })
         }
-        this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); ${queued.length} message(s) kept in the mailbox with their rows cancelled`)
-        return {
-          delivered: 0,
-          refused: queued.map(entry => ({ msgId: entry.msgId, code: refusal.code, message: refusal.message })),
-        }
+        this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); ${queued.length} message(s) kept in the mailbox`)
+        return { delivered: 0, refused }
       }
     }
     // T6b: the row for a dormant message was created by the caller
@@ -484,21 +495,36 @@ export class S2sLifecycleService extends Service {
     // (`ledger` was resolved at the top of this function — the T30 gate shares it.)
     const entries = await this.mailbox.drain(sessionId)
     let delivered = 0
-    /** T30: entries refused AT the handover — per-msgId, for ledger cancel. */
-    const refused: Array<{ msgId: string; code: S2sErrorCode; message: string }> = []
+    /**
+     * T30: entries refused AT the handover. The lifecycle owns the cancel for
+     * each (single ownership — the tools never cancel these again), and each
+     * refusal carries its STRUCTURED cancel outcome back to the caller.
+     */
+    const refused: Array<{ msgId: string; code: S2sErrorCode; message: string; cancelOutcome: string }> = []
     for (const entry of entries) {
-      // T30 per-message gate: the session-level check ran before this, but the
-      // archive state is read fresh per entry — this is the last moment before
-      // followup/inject, and it is where the msgId is known for ledger cancel.
+      // T30 per-message gate: the archive state is read fresh per entry — this
+      // is the last moment before followup/inject.
       if (this.targetPolicyCheck !== undefined) {
         const refusal = await this.targetPolicyCheck(sessionId)
         if (refusal !== undefined) {
           // Keep the user's queue: re-enqueue (the drain read was destructive)
-          // so nothing is silently dropped, and report the msgId for the caller
-          // to cancel the ledger row.
+          // so nothing is silently dropped.
           await this.mailbox.enqueue(sessionId, entry)
-          refused.push({ msgId: entry.msgId, code: refusal.code, message: refusal.message })
-          this.ctx.logger.warn(`s2s lifecycle: message ${entry.msgId} to ${sessionId} refused by target policy (${refusal.code}); re-queued`)
+          let cancelOutcome = 'cancel-unavailable (no ledger)'
+          if (ledger !== undefined && ledger.isOpen) {
+            try {
+              const result = await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+              cancelOutcome = result.outcome === 'cancelled'
+                ? 'cancelled'
+                : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
+            } catch (error) {
+              cancelOutcome = 'cancel-failed: ' + String(error)
+              this.ctx.logger.warn(`s2s lifecycle: cancel failed for refused message ${entry.msgId}: ${String(error)}`)
+            }
+          }
+          refused.push({ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome })
+          recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: refusal.code, cancelOutcome, at: Date.now() })
+          this.ctx.logger.warn(`s2s lifecycle: message ${entry.msgId} to ${sessionId} refused by target policy (${refusal.code}); re-queued, cancel outcome: ${cancelOutcome}`)
           continue
         }
       }
@@ -522,17 +548,7 @@ ${entry.text}`
       delivered++
     }
     if (refused.length > 0) {
-      // The refusals are returned STRUCTURED so the caller can cancel the
-      // corresponding ledger rows — a refusal must never leave a retryable
-      // ghost row behind (review blocker 2).
-      for (const r of refused) {
-        if (ledger !== undefined && ledger.isOpen) {
-          try { await ledger.cancel(r.msgId, r.code + ': ' + r.message) } catch (error) {
-            this.ctx.logger.warn(`s2s lifecycle: cancel failed for refused message ${r.msgId}: ${String(error)}`)
-          }
-        }
-      }
-      this.ctx.logger.warn(`s2s lifecycle: ${refused.length} message(s) to ${sessionId} refused by target policy and re-queued`)
+      this.ctx.logger.warn(`s2s lifecycle: ${refused.length} message(s) to ${sessionId} refused by target policy and re-queued; cancel outcomes are carried on each refusal item`)
     }
     return { delivered, refused }
   }

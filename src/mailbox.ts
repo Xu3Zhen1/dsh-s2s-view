@@ -38,10 +38,26 @@ export class S2sMailbox {
     this.rootDir = rootDir ?? join(homedir(), '.dsh', 's2s', 'mailboxes')
   }
 
-  /** Queue one entry; same-session duplicate msgIds overwrite (idempotent). */
+  /**
+   * Queue one entry; same-session duplicate msgIds are IDEMPOTENT (T30).
+   *
+   * The comment always claimed idempotency, but the filename embeds
+   * `createdAt`, so re-enqueueing the same msgId after a refusal (the T30
+   * per-entry path re-enqueues refused entries) created a SECOND file — two
+   * copies of one message, both later delivered. Before writing, any existing
+   * file for the same msgId is removed.
+   */
   async enqueue(sessionId: string, entry: MailboxEntry): Promise<void> {
     const dir = this.dirFor(sessionId)
     await mkdir(dir, { recursive: true })
+    // Idempotence: remove any earlier file carrying this same msgId, whatever
+    // its timestamp prefix was.
+    const names = await readdir(dir).catch(() => [] as string[])
+    for (const name of names) {
+      if (name.endsWith('.json') && name.includes('-' + entry.msgId + '.json')) {
+        await rm(join(dir, name), { force: true }).catch(() => undefined)
+      }
+    }
     // Name files with a zero-padded epoch prefix so a lexicographic
     // readdir is already chronological, independent of msgId contents.
     const file = join(dir, `${String(entry.createdAt).padStart(15, '0')}-${entry.msgId}.json`)
