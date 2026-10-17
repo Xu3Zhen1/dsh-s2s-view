@@ -43,6 +43,10 @@ export interface S2sSessionInfo {
   readonly workspaceDir: string
   readonly state: 'live-idle' | 'live-busy' | 'dormant'
   readonly lastActivity?: number
+  /** The session header's `origin`, when the listing could read it (T30). The
+   *  host types this as `'subagent' | undefined`; FS fallback reads it from the
+   *  real log header, never from the title cache. */
+  readonly origin?: string
 }
 
 export type S2sCandidate = Pick<S2sSessionInfo, 'sessionId' | 'title' | 'workspaceDir' | 'state'>
@@ -63,6 +67,28 @@ export type S2sMatchKind =
   /** Only a unique id *prefix* matched (e.g. the short id shown in listings). */
   | 'id-prefix'
 
+/**
+ * Policy class of a target under T30 (ruling 2026-10-17).
+ *
+ * `eligible` sessions are the default addressing universe. `archived` comes
+ * from `workspaceRegistry.archivedSessionIds` (direct membership, no lineage);
+ * `subagent` from the session header's `origin` field (the host's SessionHeader
+ * types `origin` as `'subagent' | undefined` — there is no third value, so an
+ * unexpected string is classified `unknown` defensively). When both apply,
+ * archived wins.
+ */
+export type S2sTargetClass = 'eligible' | 'archived' | 'subagent' | 'unknown'
+
+/** How the archive filter can fail, rendered verbatim — never collapsed to "absent". */
+export type S2sArchiveFilterState =
+  | { readonly state: 'available'; readonly ids: readonly string[] }
+  | { readonly state: 'unavailable'; readonly reason: 'registry-absent' | 'registry-read-failed' | 'archived-session-ids-not-an-array' }
+
+/** The workspaceRegistry shape s2s consumes, reached structurally. */
+interface WorkspaceRegistryLike {
+  readonly archivedSessionIds?: unknown
+}
+
 export type S2sResolveResult =
   | {
     readonly kind: 'ok'
@@ -71,6 +97,10 @@ export type S2sResolveResult =
     readonly state: S2sSessionInfo['state']
     readonly workspaceDir: string
     readonly matchedBy: S2sMatchKind
+    /** T30: how the target classifies under the archive/subagent policy. */
+    readonly targetClass: S2sTargetClass
+    /** T30: the header origin carried through, so post-budget re-checks classify the same target. */
+    readonly origin?: string
   }
   | {
     readonly kind: 'not-found'
@@ -82,7 +112,7 @@ export type S2sResolveResult =
   }
   | { readonly kind: 'ambiguous'; readonly name: string; readonly candidates: S2sCandidate[] }
 
-interface SessionRecordLike { readonly header: { readonly id: unknown; readonly cwd?: string }; readonly live: boolean }
+interface SessionRecordLike { readonly header: { readonly id: unknown; readonly cwd?: string; readonly origin?: unknown }; readonly live: boolean }
 interface SessionQueryLike {
   listSessions(): Promise<SessionRecordLike[]>
   readTitle(sessionId: unknown): Promise<{ readonly title?: string } | undefined>
@@ -148,6 +178,10 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) 
 export class S2sDiscoveryService extends Service {
   private queryService?: SessionQueryLike
   private projectionCache?: SessionProjectionCacheLike
+  /** T30: the host's workspace registry, when this fiber can see it. */
+  private workspaceRegistry?: WorkspaceRegistryLike
+  /** Last registry read failure, for diagnostics — distinct reasons must survive. */
+  private lastRegistryError: string | undefined
   private readonly sessionsRoot: string | undefined
   private readonly cache: TitleCache
   private readonly now: () => number
@@ -171,6 +205,51 @@ export class S2sDiscoveryService extends Service {
     ctx.inject(['sessionProjectionCache'], (sctx) => {
       this.projectionCache = (sctx as unknown as { sessionProjectionCache: SessionProjectionCacheLike }).sessionProjectionCache
     })
+    ctx.inject(['workspaceRegistry'], (sctx) => {
+      this.workspaceRegistry = (sctx as unknown as { workspaceRegistry: WorkspaceRegistryLike }).workspaceRegistry
+    })
+  }
+
+  /**
+   * Read the archived-session id set **fresh on every call** (T30 ruling: the
+   * archive state must not freeze into the 24h title cache).
+   *
+   * @returns the set when the filter is usable, or the precise reason it is not
+   *   — the caller fail-closes on `unavailable` and must surface the reason
+   *   verbatim rather than collapsing all failures into "absent".
+   */
+  archivedFilterState(): S2sArchiveFilterState {
+    try {
+      const registry = this.workspaceRegistry
+      if (registry === undefined || registry === null) return { state: 'unavailable', reason: 'registry-absent' }
+      const ids = registry.archivedSessionIds
+      if (ids === undefined || ids === null) return { state: 'unavailable', reason: 'archived-session-ids-not-an-array' }
+      if (!Array.isArray(ids)) return { state: 'unavailable', reason: 'archived-session-ids-not-an-array' }
+      return { state: 'available', ids: ids.map(String) }
+    } catch (error) {
+      // A throwing registry read is a distinct failure from an absent one; both
+      // fail closed, but the receipt must say which.
+      this.lastRegistryError = String(error)
+      return { state: 'unavailable', reason: 'registry-read-failed' }
+    }
+  }
+
+  /**
+   * Classify one target session (T30).
+   *
+   * Archived membership is checked first and wins over subagent (ruling §2).
+   * The header `origin` type has exactly one non-undefined value (`subagent`);
+   * anything else unexpected is `unknown`, never silently "eligible".
+   *
+   * @param sessionId - canonical target id.
+   * @param headerOrigin - the session header's `origin`, when the listing could read it.
+   * @param archivedIds - the fresh archived set, when the registry answered.
+   */
+  classifyTarget(sessionId: string, headerOrigin: string | undefined, archivedIds: readonly string[] | undefined): S2sTargetClass {
+    if (archivedIds !== undefined && archivedIds.includes(sessionId)) return 'archived'
+    if (headerOrigin === undefined) return 'eligible'
+    if (headerOrigin === 'subagent') return 'subagent'
+    return 'unknown'
   }
 
   /** The durable title cache; exposed for tooling and tests. */
@@ -281,6 +360,14 @@ export class S2sDiscoveryService extends Service {
   }
 
   async resolve(name: string | undefined, sessionId: string | undefined): Promise<S2sResolveResult> {
+    // T30: read the archived set fresh on EVERY resolution — archive state must
+    // not ride the 24h title cache. The classifier closes over this reading; the
+    // `unknown` reason (registry absent etc.) is NOT classified here: targets
+    // under an unavailable policy stay in the corpus and the tools fail closed
+    // with S2S_TARGET_POLICY_UNAVAILABLE instead of pretending eligibility.
+    const filter = this.archivedFilterState()
+    const archivedIds = filter.state === 'available' ? filter.ids : undefined
+    const classify = (info: S2sSessionInfo): S2sTargetClass => this.classifyTarget(info.sessionId, info.origin, archivedIds)
     if (sessionId !== undefined && sessionId.length > 0) {
       // L0 fast path: a cached entry that knows its workspace answers with no
       // enumeration and no read at all. Keyed by *normalized* id so the canonical
@@ -291,17 +378,17 @@ export class S2sDiscoveryService extends Service {
       {
         const hit = this.cache.getByNormalizedId(sessionId, this.now())
         if (hit !== undefined && hit.entry.workspaceDir !== undefined) {
-          return toOk({
-            sessionId: hit.key,
-            ...(hit.entry.title === undefined ? {} : { title: hit.entry.title }),
-            state: this.stateOf(hit.key),
-            workspaceDir: hit.entry.workspaceDir,
-          })
+          // T30: the cache stores no identity fields, so this fast path cannot
+          // classify. Fall through to the authoritative read — the ruling
+          // forbids a cache hit from bypassing the target policy.
+          const exactAuth = await this.collectById(sessionId)
+          if (exactAuth !== undefined) return toOk(exactAuth, 'exact', classify)
+          return { kind: 'not-found', name: sessionId, candidates: [], totalCandidates: 0 }
         }
       }
       // Fast path: an exact canonical id needs only that session's title.
       const exact = await this.collectById(sessionId)
-      if (exact !== undefined) return toOk(exact, 'exact')
+      if (exact !== undefined) return toOk(exact, 'exact', classify)
 
       // Item ④: accept the bare UUID and the short id shown by `s2s_sessions`,
       // but ONLY on a unique match, and ONLY when the input is actually
@@ -314,10 +401,10 @@ export class S2sDiscoveryService extends Service {
         // path can never be mistaken for one. Exact normalized match wins; only
         // then is a prefix considered.
         const exactNorm = infos.filter(info => normalizeId(info.sessionId) === wantId)
-        if (exactNorm.length === 1) return toOk(exactNorm[0]!, 'exact')
+        if (exactNorm.length === 1) return toOk(exactNorm[0]!, 'exact', classify)
         if (exactNorm.length > 1) return { kind: 'ambiguous', name: sessionId, candidates: exactNorm.map(toCandidate) }
         const prefixedById = infos.filter(info => normalizeId(info.sessionId).startsWith(wantId))
-        if (prefixedById.length === 1) return toOk(prefixedById[0]!, 'id-prefix')
+        if (prefixedById.length === 1) return toOk(prefixedById[0]!, 'id-prefix', classify)
         if (prefixedById.length > 1) return { kind: 'ambiguous', name: sessionId, candidates: prefixedById.map(toCandidate) }
         return { kind: 'not-found', name: sessionId, candidates: approxCandidates(infos, wantId), totalCandidates: infos.length }
       }
@@ -332,12 +419,10 @@ export class S2sDiscoveryService extends Service {
       if (owners.length === 1) {
         const cached = this.cache.get(owners[0]!, this.now())
         if (cached?.workspaceDir !== undefined) {
-          return toOk({
-            sessionId: owners[0]!,
-            ...(cached.title === undefined ? {} : { title: cached.title }),
-            state: this.stateOf(owners[0]!),
-            workspaceDir: cached.workspaceDir,
-          })
+          // T30: same rule as the id fast path — the cache cannot classify, so
+          // the authoritative read decides eligibility and the class.
+          const authoritative = await this.collectById(owners[0]!)
+          if (authoritative !== undefined) return toOk(authoritative, 'exact', classify)
         }
       } else if (owners.length > 1) {
         // E2: record the collision so it is not answered from cache again.
@@ -347,22 +432,37 @@ export class S2sDiscoveryService extends Service {
 
     const infos = await this.collect()
     if (needle === undefined || needle.length === 0) return { kind: 'not-found', name: name ?? '', candidates: approxCandidates(infos, ''), totalCandidates: infos.length }
-    const matches = infos.filter(info => info.title?.trim().toLowerCase() === needle)
+    // T30: titles match against the ELIGIBLE universe first, so an archived
+    // session sharing a title cannot shadow a live target.
+    const matches = infos.filter(info => info.title?.trim().toLowerCase() === needle && classify(info) === 'eligible')
+    const excludedMatches = infos.filter(info => info.title?.trim().toLowerCase() === needle && classify(info) !== 'eligible')
     if (matches.length > 1) {
       // E2: remember the ambiguity so the cache never resolves this name alone.
       for (const match of matches) this.cache.markAmbiguous(match.sessionId, this.now())
       return { kind: 'ambiguous', name: name ?? '', candidates: matches.map(toCandidate) }
     }
-    if (matches.length === 1) return toOk(matches[0]!)
+    if (matches.length === 1) return toOk(matches[0]!, 'exact', classify)
+    if (excludedMatches.length > 0) {
+      // The needle hit only excluded targets: resolve the identity anyway (for a
+      // stable refusal code) when exactly one, else ambiguous — but NEVER return
+      // an ok for them.
+      if (excludedMatches.length === 1) return toOk(excludedMatches[0]!, 'exact', classify)
+      return { kind: 'ambiguous', name: name ?? '', candidates: excludedMatches.map(toCandidate) }
+    }
 
     // Item ①: exact failed. Accept ONLY a title that *starts with* the needle,
     // and only when exactly one candidate does. No arbitrary `contains` match —
     // its false-hit risk is not supported as safe by current evidence. The
     // receipt reports `matchedBy: 'title-prefix'` so the caller can tell an
-    // approximation from an exact hit.
-    const prefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true)
-    if (prefixed.length === 1) return toOk(prefixed[0]!, 'title-prefix')
-    if (prefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: prefixed.map(toCandidate) }
+    // approximation from an exact hit. Prefix candidates also come from the
+    // eligible universe first; an excluded prefix hit resolves its identity for
+    // refusal but is never ok.
+    const eligiblePrefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true && classify(info) === 'eligible')
+    if (eligiblePrefixed.length === 1) return toOk(eligiblePrefixed[0]!, 'title-prefix', classify)
+    if (eligiblePrefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: eligiblePrefixed.map(toCandidate) }
+    const excludedPrefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true)
+    if (excludedPrefixed.length === 1) return toOk(excludedPrefixed[0]!, 'title-prefix', classify)
+    if (excludedPrefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: excludedPrefixed.map(toCandidate) }
     return { kind: 'not-found', name: name ?? '', candidates: approxCandidates(infos, needle), totalCandidates: infos.length }
   }
 
@@ -484,8 +584,33 @@ export class S2sDiscoveryService extends Service {
         title = await this.readTitleLayered(sessionId, undefined, join(root, workspaceDir, entry), workspaceDir)
         this.cache.set(sessionId, title, this.now(), workspaceDir)
       }
-      return { sessionId, ...(title === undefined ? {} : { title }), workspaceDir, state: this.stateOf(sessionId) }
+      // T30: identity must come from the session's REAL header on disk — the
+      // title cache stores no identity fields, and guessing from a title or the
+      // directory name is exactly what the ruling forbids.
+      const origin = await this.readOriginFromFs(join(root, workspaceDir, entry))
+      return { sessionId, ...(title === undefined ? {} : { title }), workspaceDir, state: this.stateOf(sessionId), ...(origin === undefined ? {} : { origin }) }
     })
+  }
+
+  /**
+   * Read `header.origin` from the session log on disk (T30 FS fallback).
+   *
+   * `session.jsonl.zstd` (or the plain `.jsonl`) opens with the session header,
+   * whose `origin` field the host writes for subagent-origin sessions. Returns
+   * `undefined` when the file is absent or the header has no origin — an
+   * ordinary session.
+   */
+  private async readOriginFromFs(sessionDir: string): Promise<string | undefined> {
+    try {
+      const z = await readFile(join(sessionDir, 'session.v4.jsonl.zstd')).catch(() => readFile(join(sessionDir, 'session.jsonl.zstd')).catch(() => undefined))
+      if (z !== undefined) {
+        const origin = originFromZstd(z)
+        if (origin !== undefined) return origin
+      }
+      const plain = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').catch(() => undefined)
+      if (plain !== undefined) return originFromJsonl(plain)
+    } catch {}
+    return undefined
   }
 
   private stateOf(sessionId: string): S2sSessionInfo['state'] {
@@ -509,15 +634,25 @@ export class S2sDiscoveryService extends Service {
 
 /** Build one row from a query record + its resolved title and live state. */
 function toInfo(record: SessionRecordLike, sessionId: string, title: string | undefined, state: S2sSessionInfo['state']): S2sSessionInfo {
-  return { sessionId, ...(title === undefined ? {} : { title }), workspaceDir: record.header.cwd ?? '?', state }
+  const rawOrigin = record.header.origin
+  return {
+    sessionId,
+    ...(title === undefined ? {} : { title }),
+    workspaceDir: record.header.cwd ?? '?',
+    state,
+    ...(typeof rawOrigin === 'string' ? { origin: rawOrigin } : {}),
+  }
 }
 
 function toCandidate(info: S2sSessionInfo): S2sCandidate {
   return { sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), workspaceDir: info.workspaceDir, state: info.state }
 }
 
-function toOk(info: S2sSessionInfo, matchedBy: S2sMatchKind = 'exact'): S2sResolveResult {
-  return { kind: 'ok', sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), state: info.state, workspaceDir: info.workspaceDir, matchedBy }
+function toOk(info: S2sSessionInfo, matchedBy: S2sMatchKind = 'exact', classify: (info: S2sSessionInfo) => S2sTargetClass): S2sResolveResult {
+  // `origin` must survive into the receipt: the delivery tools re-classify the
+  // target after the async budget, and they classify from THIS record — dropping
+  // the field would make every post-resolve check see an ordinary session.
+  return { kind: 'ok', sessionId: info.sessionId, ...(info.title === undefined ? {} : { title: info.title }), state: info.state, workspaceDir: info.workspaceDir, matchedBy, targetClass: classify(info), ...(info.origin === undefined ? {} : { origin: info.origin } as { origin: string }) }
 }
 
 /** How many approximate candidates a `not-found` receipt may carry (item ⑤). */
@@ -695,4 +830,33 @@ function titleFromJsonl(text: string): string | undefined {
     try { const event = JSON.parse(line) as { type?: string; data?: { title?: unknown } }; if (event.type === 'session/title' && typeof event.data?.title === 'string' && event.data.title.length > 0) title = event.data.title } catch {}
   }
   return title
+}
+
+/**
+ * The `origin` field of a session's header record, read from the log on disk
+ * (T30 FS fallback). Unlike titles, the header is written once at session
+ * creation, so the FIRST occurrence is authoritative and later ones are not
+ * expected; scanning all lines is harmless and keeps the helper shape-compatible
+ * with `titleFromJsonl`.
+ */
+function originFromJsonl(text: string): string | undefined {
+  for (const line of text.split('\n')) {
+    if (line.length === 0) continue
+    try {
+      const event = JSON.parse(line) as { type?: string; data?: { origin?: unknown } }
+      if (typeof event.data?.origin === 'string' && event.data.origin.length > 0) return event.data.origin
+    } catch {}
+  }
+  return undefined
+}
+
+/** `originFromJsonl` over a concatenated-zstd log; undefined if no header says. */
+function originFromZstd(buf: Buffer): string | undefined {
+  const { frames } = scanZstdFrames(buf)
+  for (const frame of frames) {
+    const text = zstdDecompressSync(buf.subarray(frame.start, frame.end)).toString('utf8')
+    const found = originFromJsonl(text)
+    if (found !== undefined) return found
+  }
+  return undefined
 }

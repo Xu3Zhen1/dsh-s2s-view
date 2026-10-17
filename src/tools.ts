@@ -15,6 +15,7 @@ import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2sError } from './error.ts'
+import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import { readHistory } from './history.ts'
 import { ledgerDiagnostics, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped } from './ledger-diagnostics.ts'
 
@@ -168,6 +169,73 @@ function selfCheckNote(exec: unknown): string {
     : ''
 }
 
+/**
+ * The T30 target-policy gate (ruling 2026-10-17 §3).
+ *
+ * Runs on a resolved `ok` target BEFORE any record/queue/deliver/resume, and —
+ * per the ruling — AGAIN after the async budget, immediately before the actual
+ * handover, to narrow the archive-state race. The class is RECOMPUTED on every
+ * invocation from the fresh registry reading (`resolved.targetClass` is only a
+ * snapshot taken at resolve time).
+ *
+ * Fail-closed on an unavailable policy: unlike the T29 caller-identity
+ * fail-open (explicitly approved for that single case), the ruling does NOT
+ * extend compatibility to archive policy — when the registry cannot answer,
+ * the delivery is refused with `S2S_TARGET_POLICY_UNAVAILABLE` and the precise
+ * reason, because refusing is the only state that cannot be a silent
+ * mis-delivery to an archived session.
+ *
+ * @returns `undefined` when the target is eligible; otherwise the refusal text
+ *   prefixed with the stable code.
+ */
+/**
+ * Read the filter state defensively: a discovery without the T30 methods (test
+ * stubs, older builds) reports unavailable — the fail-closed answer — rather
+ * than throwing. Real services always carry the methods (class members).
+ */
+function safeFilterState(discovery: S2sDiscoveryService): S2sArchiveFilterState {
+  try {
+    if (typeof discovery.archivedFilterState !== 'function') return { state: 'unavailable', reason: 'registry-absent' }
+    return discovery.archivedFilterState()
+  } catch {
+    return { state: 'unavailable', reason: 'registry-read-failed' }
+  }
+}
+
+/**
+ * Classify defensively: a discovery without the T30 method (test stubs, older
+ * builds) yields `unknown` — the fail-closed answer — rather than throwing.
+ * Real services always carry the method (a class member).
+ */
+function safeClassify(discovery: S2sDiscoveryService, filter: S2sArchiveFilterState): (info: { sessionId: string; origin?: string }) => S2sTargetClass {
+  return (info) => {
+    try {
+      if (typeof discovery.classifyTarget !== 'function') return 'unknown'
+      return discovery.classifyTarget(info.sessionId, info.origin, filter.state === 'available' ? filter.ids : undefined)
+    } catch {
+      return 'unknown'
+    }
+  }
+}
+
+function targetPolicyRefusal(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, filter: S2sArchiveFilterState, classify: (info: { sessionId: string; origin?: string }) => S2sTargetClass): string | undefined {
+  if (filter.state === 'unavailable') {
+    return '[S2S_TARGET_POLICY_UNAVAILABLE] Refused: the target-legality filter could not answer (' + filter.reason
+      + '), so this delivery cannot be proven legitimate. No message was recorded, queued, delivered, or woken.'
+  }
+  const cls = classify({ sessionId: resolved.sessionId, ...(resolved.origin === undefined ? {} : { origin: resolved.origin }) })
+  if (cls === 'archived') {
+    return '[S2S_ARCHIVED_TARGET] Refused: "' + labelOf(resolved) + '" is an archived session. Archived sessions are not delivery targets; unarchive it first if it must receive messages.'
+  }
+  if (cls === 'subagent') {
+    return '[S2S_SUBAGENT_TARGET] Refused: "' + labelOf(resolved) + '" is a subagent session (origin=subagent). Subagents are not independent conversation targets.'
+  }
+  if (cls === 'unknown') {
+    return '[S2S_SUBAGENT_TARGET] Refused: "' + labelOf(resolved) + '" has an unrecognized session origin; the target policy cannot classify it as an ordinary peer.'
+  }
+  return undefined
+}
+
 export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
   const ctx = deps.ctx
   const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule, ledger = deps.ledger
@@ -177,18 +245,50 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
     }
     return discovery.resolve(name, sessionId)
   }
+  /**
+   * T30 discovery filtering (shared by s2s_peers / s2s_sessions / s2s_digest).
+   *
+   * Default: excluded targets are dropped. With `include_*` the excluded rows
+   * stay but are explicitly tagged, so a look-back can never read as a list of
+   * ordinary peers. The filter capability state is always rendered when it is
+   * not `available` — the ruling forbids packaging an unfiltered list as a
+   * legal delivery roster.
+   */
+  const applyTargetPolicyToList = function(infos: readonly S2sSessionInfo[], args: { include_archived?: boolean; include_subagents?: boolean }): { rows: Array<{ line: string; info: S2sSessionInfo }>; note: string } {
+    const filter = safeFilterState(discovery)
+    const note = filter.state === 'unavailable'
+      ? ' [archiveFilter: unavailable (' + filter.reason + ') — archived status unknown; this list is NOT a legal delivery roster]'
+      : ''
+    const eligible: Array<{ line: string; info: S2sSessionInfo }> = []
+    const tagged: Array<{ line: string; info: S2sSessionInfo }> = []
+    for (const s of infos) {
+      const cls = discovery.classifyTarget(s.sessionId, s.origin, filter.state === 'available' ? filter.ids : undefined)
+      const line = (s.title ?? '(untitled)') + '  [' + shortId(s.sessionId) + ']  ' + s.state + (cls === 'archived' ? '  [archived]' : cls === 'subagent' ? '  [subagent]' : cls === 'unknown' ? '  [origin-unknown]' : '')
+      const row = { line, info: s }
+      if (cls === 'eligible') eligible.push(row)
+      else if (cls === 'archived' && args.include_archived === true) tagged.push(row)
+      else if (cls === 'subagent' && args.include_subagents === true) tagged.push(row)
+      else if (cls === 'unknown') tagged.push(row)
+    }
+    return { rows: [...eligible, ...tagged], note }
+  }
   return [
     defineTool({
       name: 's2s_peers',
       description: 'List live sessions in the current project (all=true lists every project) with title (name) and state. Use the title in s2s_message / s2s_resume.',
-      parameters: { all: { type: 'boolean', description: 'List sessions across all projects (default: current project only).' } },
+      parameters: {
+        all: { type: 'boolean', description: 'List sessions across all projects (default: current project only).' },
+        include_archived: { type: 'boolean', description: 'Also list archived sessions, explicitly tagged [archived]. Audit only — not delivery permission.' },
+        include_subagents: { type: 'boolean', description: 'Also list subagent sessions, explicitly tagged [subagent]. Audit only — not delivery permission.' },
+      },
       output: OUTPUT,
       execute: async function(args, exec) {
         const infos = await discovery.list()
         const scoped = args.all === true ? infos : sameProjectAsCaller(infos, exec)
-        const sessions = scoped.filter(function(s) { return s.state !== 'dormant' })
-        if (sessions.length === 0) return { text: 'No live sessions.' }
-        return { text: sessions.map(function(s) { return (s.title ?? '(untitled)') + '  [' + shortId(s.sessionId) + ']  ' + s.state }).join('\n') }
+        const live = scoped.filter(function(s) { return s.state !== 'dormant' })
+        const { rows, note } = applyTargetPolicyToList(live, args)
+        if (rows.length === 0) return { text: 'No live sessions.' + note }
+        return { text: rows.map(function(r) { return r.line }).join('\n') + note }
       },
     }),
     defineTool({
@@ -197,6 +297,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
       parameters: {
         all: { type: 'boolean', description: 'List sessions across all projects (default: current project only).' },
         query: { type: 'string', description: 'Optional substring filter over session title, session id, or workspace directory name.' },
+        include_archived: { type: 'boolean', description: 'Also list archived sessions, explicitly tagged [archived]. Audit only — not delivery permission.' },
+        include_subagents: { type: 'boolean', description: 'Also list subagent sessions, explicitly tagged [subagent]. Audit only — not delivery permission.' },
       },
       output: OUTPUT,
       execute: async function(args, exec) {
@@ -205,8 +307,9 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         const sessions = (args.query === undefined || args.query.length === 0)
           ? scoped
           : scoped.filter(function(s) { const needle = (args.query as string).toLowerCase(); return (s.title ?? '').toLowerCase().includes(needle) || s.sessionId.toLowerCase().includes(needle) || s.workspaceDir.toLowerCase().includes(needle) })
-        if (sessions.length === 0) return { text: 'No sessions found.' }
-        return { text: sessions.map(function(s) { return (s.title ?? '(untitled)') + '  [' + shortId(s.sessionId) + ']  ' + s.state + '  ws=' + s.workspaceDir + (s.lastActivity === undefined ? '' : '  last=' + new Date(s.lastActivity).toISOString()) }).join('\n') }
+        const { rows, note } = applyTargetPolicyToList(sessions, args)
+        if (rows.length === 0) return { text: 'No sessions found.' + note }
+        return { text: rows.map(function(r) { const s = r.info; return r.line + '  ws=' + s.workspaceDir + (s.lastActivity === undefined ? '' : '  last=' + new Date(s.lastActivity).toISOString()) }).join('\n') + note }
       },
     }),
     defineTool({
@@ -242,6 +345,13 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 'S2S_SELF_TARGET',
               )
             }
+            // T30 pre-check: archive/subagent policy, before any side effect. Read
+            // fresh (registry state is never cached with the title).
+            const filter = safeFilterState(discovery)
+            // The classifier closes over the FRESH registry reading — a flip during the async budget is seen here.
+            const classifyNow = safeClassify(discovery, filter)
+            const refusal = targetPolicyRefusal(resolved, filter, classifyNow)
+            if (refusal !== undefined) throw new S2sError(refusal, refusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : refusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
             const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
             // Item ①/④: a fallback match must be visible on the receipt, and this is
@@ -272,6 +382,21 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               // behavior, not just docs (T29 scope).
               const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
               if (result?.verdict === 'warn') warn = result.reason
+            }
+            // T30 post-budget re-check: the archive state may have flipped while
+            // the budget ran. If it now refuses, an already-recorded queued row
+            // must be explicitly cancelled — never left as retryable ghost work
+            // (ruling: 后置拒绝时 queued 行须显式 cancelled 或记录拒绝原因).
+            // Fresh reading + fresh classifier: a flip during the async budget is
+            // seen here, and the original exception escapes unchanged.
+            const refilter = discovery.archivedFilterState()
+            const reclassify = safeClassify(discovery, refilter)
+            const rerefusal = targetPolicyRefusal(resolved, refilter, reclassify)
+            if (rerefusal !== undefined) {
+              if (ledger !== undefined && ledger.isOpen) {
+                await noteLedger(ledger, 'cancel', function() { return ledger.cancel(msgId, rerefusal) })
+              }
+              throw new S2sError(rerefusal, rerefusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : rerefusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
             }
             if (resolved.state !== 'dormant') {
               const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
@@ -307,7 +432,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           })()
         } catch (error: unknown) {
           // Only the T29 self refusal is rendered. Other S2sError codes keep their existing contract (e.g. the unsafe-id guard in s2s_resume is asserted to REJECT upstream), so this wrapper must not swallow them.
-          if (error instanceof S2sError && error.code === 'S2S_SELF_TARGET') return { text: '[' + error.code + '] ' + error.message }
+          // T30: the three target-policy codes join the approved render set (the ruling permits exactly these; other S2sError contracts, e.g. the unsafe-id guard, still reject upstream).
+          if (error instanceof S2sError && ['S2S_SELF_TARGET', 'S2S_ARCHIVED_TARGET', 'S2S_SUBAGENT_TARGET', 'S2S_TARGET_POLICY_UNAVAILABLE'].includes(error.code)) return { text: '[' + error.code + '] ' + error.message }
           throw error
         }
       },
@@ -340,6 +466,11 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 'S2S_SELF_TARGET',
               )
             }
+            // T30 pre-check, same as s2s_message (fresh registry read).
+            const filter = safeFilterState(discovery)
+            const classifyNow = safeClassify(discovery, filter)
+            const refusal = targetPolicyRefusal(resolved, filter, classifyNow)
+            if (refusal !== undefined) throw new S2sError(refusal, refusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : refusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
             S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
             // T29: same skipped-check record as s2s_message — a wake that proceeds
@@ -356,6 +487,17 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             const recorded = await noteLedger(ledger, 'record', function() {
               return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text })
             })
+            // T30 post-record re-check: refuse with the queued row explicitly
+            // cancelled (never retryable ghost work). Fresh reading + classifier.
+            const refilter = discovery.archivedFilterState()
+            const reclassify = safeClassify(discovery, refilter)
+            const rerefusal = targetPolicyRefusal(resolved, refilter, reclassify)
+            if (rerefusal !== undefined) {
+              if (ledger !== undefined && ledger.isOpen) {
+                await noteLedger(ledger, 'cancel', function() { return ledger.cancel(msgId, rerefusal) })
+              }
+              throw new S2sError(rerefusal, rerefusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : rerefusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
+            }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: same restraint as `s2s_message` — a wake hands the queue over, it
@@ -377,7 +519,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           })()
         } catch (error: unknown) {
           // Only the T29 self refusal is rendered. Other S2sError codes keep their existing contract (e.g. the unsafe-id guard in s2s_resume is asserted to REJECT upstream), so this wrapper must not swallow them.
-          if (error instanceof S2sError && error.code === 'S2S_SELF_TARGET') return { text: '[' + error.code + '] ' + error.message }
+          // T30: the three target-policy codes join the approved render set (the ruling permits exactly these; other S2sError contracts, e.g. the unsafe-id guard, still reject upstream).
+          if (error instanceof S2sError && ['S2S_SELF_TARGET', 'S2S_ARCHIVED_TARGET', 'S2S_SUBAGENT_TARGET', 'S2S_TARGET_POLICY_UNAVAILABLE'].includes(error.code)) return { text: '[' + error.code + '] ' + error.message }
           throw error
         }
       },

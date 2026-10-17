@@ -53,7 +53,9 @@ async function harness(opts: { deliver?: 'idle' | 'busy' | 'absent'; state?: str
   const discovery = {
     list: vi.fn(async () => [] as any[]),
     resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: opts.state ?? 'live-idle', workspaceDir: 'ws' }) as any),
-  }
+  
+    archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+    classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
   const defs = buildTools({
     broker,
     discovery,
@@ -74,7 +76,9 @@ describe('s2s_status (T10)', () => {
     const ctx = new Context()
     const ledger = new S2sLedger(ctx) // constructed, deliberately NOT opened
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
-    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
 
@@ -115,7 +119,9 @@ describe('s2s_status (T10)', () => {
     const ctx = new Context()
     const ledger = new S2sLedger(ctx) // constructed, deliberately NOT opened
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
-    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
 
@@ -183,7 +189,9 @@ describe('s2s_message ledger wiring (T6)', () => {
 
   it('still delivers when no ledger is mounted', async () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
-    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
     // The ledger is optional; its absence must not break sending.
@@ -204,7 +212,9 @@ describe('s2s_message ledger wiring (T6)', () => {
     const warn = vi.fn()
     ctx.logger.warn = warn as never
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
-    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery, ledger } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
 
@@ -257,7 +267,9 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
     const stub = lifecycleStub(ledger)
     const defs = buildTools({
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
-      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) },
+      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
     } as any)
@@ -290,7 +302,9 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
     }
     const defs = buildTools({
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
-      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) },
+      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
     } as any)
@@ -316,7 +330,9 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
     const defs = buildTools({
       ctx,
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
-      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) },
+      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
     } as any)
     const resume = defs.find((d) => d.name === 's2s_resume') as unknown as Tool
@@ -346,7 +362,9 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
     const defs = buildTools({
       ctx,
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
-      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) },
+      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger: failing,
     } as any)
@@ -374,7 +392,9 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
     const defs = buildTools({
       ctx,
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
-      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any) },
+      discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
     } as any)

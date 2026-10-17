@@ -278,16 +278,24 @@ describe('s2s discovery capability layers', () => {
     expect(list[0]!.title).toBe('仍然可用')
   })
 
-  it('exact-id resolve is cache-served with no enumeration on a repeat', async () => {
+  it('exact-id resolve re-reads authoritatively for classification (T30), still served warm', async () => {
     const { d, counts } = await harness([rec('a', '/w')], { a: '按号' })
     const first = await d.resolve(undefined, 'a')
     expect(first.kind).toBe('ok')
+    if (first.kind === 'ok') expect(first.targetClass).toBe('eligible')
     const enumerations = counts.list
     const second = await d.resolve(undefined, 'a')
     expect(second.kind).toBe('ok')
-    if (second.kind === 'ok') expect(second.workspaceDir).toBe('/w')
-    // A cached id with a known workspace answers without listing the corpus.
-    expect(counts.list).toBe(enumerations)
+    if (second.kind === 'ok') {
+      expect(second.workspaceDir).toBe('/w')
+      // T30: the L0 cache stores no identity fields, so the class must come from
+      // the authoritative read — the fast path no longer answers by itself.
+      expect(second.targetClass).toBe('eligible')
+    }
+    // The old guarantee ("no enumeration at all") is superseded by the target
+    // policy: one authoritative enumeration per resolve is the cost of knowing
+    // the target is legal. Assert it stays BOUNDED, not zero.
+    expect(counts.list).toBeLessThanOrEqual(enumerations + 1)
   })
 })
 

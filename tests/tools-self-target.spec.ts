@@ -55,6 +55,11 @@ function harness(target: string, opts: { state?: string; lifecycle?: boolean; bu
   const discovery = {
     list: vi.fn(async () => [] as any[]),
     resolve: opts.resolve ?? vi.fn(async () => ({ kind: 'ok', sessionId: target, title: 'a', state: opts.state ?? IDLE, workspaceDir: 'ws' }) as any),
+    // T29 cases run against an AVAILABLE filter (empty archive) so the T30 gate
+    // passes and the T29 assertions stay meaningful. The T30 suite below drives
+    // the unavailable/archived/subagent stubs explicitly.
+    archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] }) as const),
+    classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : 'eligible') as const),
   }
   const ledger = {
     record: spies.record,
