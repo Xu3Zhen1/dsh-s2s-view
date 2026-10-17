@@ -112,6 +112,50 @@ function sameProjectAsCaller(infos: readonly S2sSessionInfo[], exec: unknown): r
   return infos.filter((info) => info.workspaceDir === caller.workspaceDir)
 }
 
+/**
+ * Normalized session id for self-target comparison (T29).
+ *
+ * The canonical id is `session-<uuid>`; callers may pass the bare uuid or the
+ * short form shown by listings. Self-ness must be judged on the normalized
+ * pair so none of those spellings sneaks past the guard.
+ */
+function normalizedSessionId(value: string): string {
+  return value.trim().toLowerCase().replace(/^session-/, '')
+}
+
+/**
+ * Is the resolved target the calling session itself? (T29)
+ *
+ * Judged against the **real** caller id from the execution context — never the
+ * model-writable `args.from`. The comparison is exact on normalized ids, which
+ * covers canonical, bare-uuid and case variants; a *unique* short-prefix self
+ * reference is covered too, because by then `resolve()` has already expanded the
+ * prefix to the one full id it can only be.
+ *
+ * @returns true when the target is provably the caller's own session.
+ */
+function isSelfTarget(exec: unknown, resolvedSessionId: string): boolean {
+  const callerId = (exec as { agent?: { id?: string } } | undefined)?.agent?.id
+  if (callerId === undefined || callerId.length === 0) return false
+  return normalizedSessionId(callerId) === normalizedSessionId(resolvedSessionId)
+}
+
+/**
+ * Whether the self-target check actually ran (T29).
+ *
+ * The ruling forbids two silent failure modes when the host gives no caller id:
+ * reading `args.from` as "not self" (it is model-writable), and claiming
+ * protection that never executed. The chosen fail-open is therefore explicit:
+ * the send proceeds — it cannot be PROVEN to be self — and the receipt carries a
+ * fixed marker so the skipped check is greppable in every transcript.
+ */
+function selfCheckNote(exec: unknown): string {
+  const callerId = (exec as { agent?: { id?: string } } | undefined)?.agent?.id
+  return callerId === undefined || callerId.length === 0
+    ? ' [s2s] caller identity unavailable — self-target check skipped (args.from is not trusted as identity).'
+    : ''
+}
+
 export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
   const ctx = deps.ctx
   const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule, ledger = deps.ledger
@@ -168,12 +212,24 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         const resolved = await resolve(args.name, args.session_id)
         if (resolved.kind === 'err') return { text: resolved.reason }
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
+        // T29: a session must not message itself. Judged against the REAL caller
+        // id (`exec.agent.id`), never `args.from`, which the model can fill with
+        // anything. This runs after resolution but BEFORE any record, budget
+        // count, queue entry, delivery or wake — a refused self-send must leave
+        // no trace at all. The receipt suggests `s2s_schedule`, the supported way
+        // to give one's own session a later step.
+        if (isSelfTarget(exec, resolved.sessionId)) {
+          return { text: '[S2S_SELF_TARGET] Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot send an s2s message to itself. To schedule a later step for your own session, use s2s_schedule.' }
+        }
         const from = args.from ?? String(exec.agent?.id ?? 'unknown')
         const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
         // Item ①/④: a fallback match must be visible on the receipt, and this is
         // the receipt where it matters most — delivering to a session chosen by
         // prefix is exactly where an unstated approximation would be harmful.
         const matchNote = matchNoteOf(resolved)
+        // T29 observability: if the host gave no caller id, the self check could
+        // not run — say so on the receipt instead of implying it did.
+        const callerNote = selfCheckNote(exec)
         // Record before delivering: the row must exist for the delivery to
         // advance it, and a message that is lost mid-flight is exactly the one a
         // status query later needs to find.
@@ -182,6 +238,13 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         })
         let warn: string | undefined
         if (budget !== undefined) {
+          // hop is 0 by design here: `maxHops` currently bounds only *forwarded*
+          // chains (messages carrying a hop count), not direct sends — the
+          // judgment is `hop >= maxHops`, so a direct send at hop 0 never trips
+          // it. For direct sends the active budget protections are the per-pair
+          // rate limit and (when configured) the semantic judge. Do not change
+          // this to hop=1 without a separate ruling: it would alter budget
+          // behavior, not just docs (T29 scope).
           const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
           if (result?.verdict === 'warn') warn = result.reason
         }
@@ -204,7 +267,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             return { text: 'NOT delivered: "' + labelOf(resolved) + '" resolved but had no live agent (broker state=absent), so the message reached nobody (left queued).' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
           }
           const how = state === 'idle' ? 'as a follow-up turn' : 'by context injection (the target was mid-turn)'
-          return { text: 'Handed to "' + labelOf(resolved) + '"' + matchNote + ' ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+          return { text: 'Handed to "' + labelOf(resolved) + '"' + matchNote + ' ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
         }
         if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' }
         const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
@@ -233,6 +296,13 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         const resolved = await resolve(args.name, args.session_id)
         if (resolved.kind === 'err') return { text: resolved.reason }
         if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
+        // T29, same gate as s2s_message: waking one's own session is a self-send
+        // through the mailbox, so it is refused before any record, queue entry or
+        // resume — a dormant wake would otherwise fabricate lifecycle activity on
+        // the caller itself.
+        if (isSelfTarget(exec, resolved.sessionId)) {
+          return { text: '[S2S_SELF_TARGET] Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot wake itself. To schedule a later step for your own session, use s2s_schedule.' }
+        }
         S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
         const from = args.from ?? String(exec.agent?.id ?? 'unknown')
         const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
@@ -262,8 +332,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
           : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
         return { text: outcome === 'resumed'
-          ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm
-          : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' }
+          ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm + selfCheckNote(exec)
+          : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' + selfCheckNote(exec) }
       },
     }),
     defineTool({

@@ -16,6 +16,7 @@ export type S2sErrorCode =
   | 'S2S_INVALID_MESSAGE'
   | 'S2S_LEDGER'
   | 'S2S_SCHEDULE'
+  | 'S2S_SELF_TARGET'
 
 export class S2sError extends HarnessError {
   override readonly code: S2sErrorCode
