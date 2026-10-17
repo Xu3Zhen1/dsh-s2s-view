@@ -211,16 +211,39 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     expect(spies.queueForDormant).toHaveBeenCalledTimes(1)
   })
 
-  it('marker on the queued wake path (autoResume off, via s2s_message dormant)', async () => {
-    // s2s_resume has no "queued" return (autoResume is a profile setting, not an
-    // argument); the queued wake outcome is reached through s2s_message with a
-    // lifecycle whose queueForDormant reports queued.
+  it('marker on the queued wake path (via s2s_message dormant, an independent path)', async () => {
+    // Kept as its own path: s2s_message's dormant branch queues without waking.
     const ctxHarness = harness(SIBLING, { state: 'dormant' })
     ctxHarness.spies.queueForDormant.mockResolvedValue('queued')
     const out = await ctxHarness.by('s2s_message').execute({ name: 'a', text: 'x' }, {})
     expect(out.text).toContain('Queued for')
     expect(out.text).toContain('caller identity unavailable')
     expect(ctxHarness.spies.record).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ marker on the s2s_resume QUEUED branch (a real return, not a profile absence)', async () => {
+    // Review must-fix 2: the queued return exists at
+    // `outcome === 'resumed' ? … : 'Session … is dormant; queued …'`. The earlier
+    // note claiming "s2s_resume has no queued return" was wrong — autoResume is
+    // profile configuration, not an argument, and the branch is reachable by
+    // mocking queueForDormant to report 'queued'.
+    const { by, spies } = await harness(SIBLING, { state: 'dormant' })
+    spies.queueForDormant.mockResolvedValue('queued')
+    const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, {})
+    expect(out.text).toContain('is dormant; queued (')
+    expect(out.text).toContain('caller identity unavailable')
+    expect(spies.queueForDormant).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ s2s_message no-lifecycle branch carries the marker (records first, then reports)', async () => {
+    // Review must-fix 2: the message no-lifecycle test was missing entirely.
+    // This branch records the row BEFORE reporting "not handed", so it must not
+    // be silent about the skipped check.
+    const { by, spies } = await harness(SIBLING, { state: 'dormant', lifecycle: false })
+    const out = await by('s2s_message').execute({ name: 'a', text: 'x' }, {})
+    expect(out.text).toContain('no lifecycle is configured')
+    expect(out.text).toContain('caller identity unavailable')
+    expect(spies.record).toHaveBeenCalledTimes(1)
   })
 
   it('★ resume RESUMED path carries the marker (the real resume receipt)', async () => {
@@ -241,23 +264,86 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     // it IS covered (see the message suite).
     const { by, spies } = await harness(SIBLING, { state: 'dormant', lifecycle: false })
     const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, {})
+    // The resume wording differs from the message one: "s2s lifecycle is not
+    // configured" (this branch returns before any resolution).
     expect(out.text).toContain('lifecycle is not configured')
     expect(out.text).not.toContain('caller identity unavailable')
     expect(spies.record).not.toHaveBeenCalled()
   })
 
-  it('★ a THROWN queue error still leaves the skipped-check evidence readable', async () => {
-    // The whole point of the bounded diagnostic: budget/queue/delivery can throw
-    // after resolution, erasing the receipt. The record must survive.
+  it('★ THROWN budget error: same object re-thrown, evidence retained', async () => {
     const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
     resetSelfCheckSkipped()
-    const harness1 = harness(SIBLING, { state: 'dormant' })
-    harness1.spies.queueForDormant.mockRejectedValue(new Error('queue exploded'))
-    await expect(harness1.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toThrow('queue exploded')
+    const h = harness(SIBLING, { state: 'idle' })
+    const boom = new Error('budget exploded')
+    h.spies.budgetCheck.mockRejectedValue(boom)
+    // The ORIGINAL exception object escapes unchanged (not a rewritten one).
+    await expect(h.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toBe(boom)
     const skipped = readSelfCheckSkipped()
     expect(skipped.length).toBe(1)
     expect(skipped[0]!.tool).toBe('s2s_message')
     expect(skipped[0]!.target).toBe(SIBLING)
+    // And the status reads it back.
+    const out = await h.by('s2s_status').execute({}, { agent: { id: SELF } })
+    expect(out.text).toContain('self-target check skipped for 1 recent resolved attempt(s)')
+    expect(out.text).toContain('s2s_message -> ' + SIBLING)
+  })
+
+  it('★ THROWN delivery error: same object re-thrown, evidence retained', async () => {
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const h = harness(SIBLING, { state: 'idle' })
+    const boom = new Error('deliver exploded')
+    h.spies.deliver.mockImplementation(() => { throw boom })
+    await expect(h.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toBe(boom)
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(1)
+    expect(skipped[0]!.tool).toBe('s2s_message')
+    const out = await h.by('s2s_status').execute({}, { agent: { id: SELF } })
+    expect(out.text).toContain('self-target check skipped for 1 recent resolved attempt(s)')
+  })
+
+  it('★ THROWN queue error (message): same object re-thrown, evidence retained', async () => {
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const h = harness(SIBLING, { state: 'dormant' })
+    const boom = new Error('queue exploded')
+    h.spies.queueForDormant.mockRejectedValue(boom)
+    await expect(h.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toBe(boom)
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(1)
+    expect(skipped[0]!.tool).toBe('s2s_message')
+  })
+
+  it('★ THROWN queue error (resume): same object re-thrown — the resume write point bears load', async () => {
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const h = harness(SIBLING, { state: 'dormant' })
+    const boom = new Error('resume queue exploded')
+    h.spies.queueForDormant.mockRejectedValue(boom)
+    await expect(h.by('s2s_resume').execute({ name: 'a', text: 'x' }, {})).rejects.toBe(boom)
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(1)
+    expect(skipped[0]!.tool).toBe('s2s_resume')
+    expect(skipped[0]!.target).toBe(SIBLING)
+  })
+
+  it('★ the retained list caps at 10 and keeps the MOST RECENT entries in order', async () => {
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    // 12 attempts: the first 2 must be evicted, the last 10 retained, order kept.
+    for (let i = 0; i < 12; i++) {
+      const h = harness(SIBLING, { state: 'dormant' })
+      h.spies.queueForDormant.mockRejectedValue(new Error('boom ' + i))
+      await expect(h.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toThrow('boom ' + i)
+    }
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(10)
+    expect(skipped[0]!.target).toBe(SIBLING)
+    // Monotonic timestamps prove the retained window is the most recent 10.
+    for (let i = 1; i < skipped.length; i++) {
+      expect(skipped[i]!.at).toBeGreaterThanOrEqual(skipped[i - 1]!.at)
+    }
   })
 
   it('★ s2s_status reads the skipped record back, and identity-present sends do not record it', async () => {
@@ -273,7 +359,7 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     expect(skipped.length).toBe(1)
     const status = by('s2s_status')
     const out = await status.execute({}, { agent: { id: SELF } })
-    expect(out.text).toContain('self-target checks SKIPPED')
+    expect(out.text).toContain('self-target check skipped for 1 recent resolved attempt(s)')
     expect(out.text).toContain('s2s_message -> ' + SIBLING)
     expect(spies.record).toHaveBeenCalledTimes(2) // both sends recorded rows
     resetSelfCheckSkipped()

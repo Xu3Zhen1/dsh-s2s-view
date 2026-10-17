@@ -158,14 +158,15 @@ export const ledgerDiagnostics: LedgerDiagnostics = {}
  * otherwise erase the receipt. This bounded process-level record survives that:
  * written before the first side effect, read back by `s2s_status`.
  *
- * Bounded like `untrackedDeliveries`: this exists so a reader can see that the
- * check was skipped, when, and for which target — not as an audit log. No
- * message text is ever recorded here.
+ * Bounded like `untrackedDeliveries`. The recorded fact is a **resolved
+ * attempt**, not a delivery: the event lands before any budget/queue/deliver
+ * side effect, so the reader must not treat it as proof that anything was sent.
+ * No message text is ever recorded here.
  */
 export interface SelfCheckSkippedEvent {
-  /** Tool whose send proceeded without a self check. */
+  /** Tool whose resolution proceeded without a self check. */
   tool: string
-  /** Canonical target id the (unchecked) message was addressed to. */
+  /** Canonical target id the attempt was addressed to. */
   target: string
   /** Epoch ms. */
   at: number
@@ -173,12 +174,18 @@ export interface SelfCheckSkippedEvent {
 
 const MAX_SELF_CHECK_SKIPPED = 10
 
-/** Bounded record of skipped self-target checks. Read by `s2s_status`. */
+/**
+ * Bounded record of skipped self-target checks, latest last. Read by
+ * `s2s_status`; retains at most {@link MAX_SELF_CHECK_SKIPPED} entries and is
+ * process-scoped (a restart clears it). N here is the *retained* count, not a
+ * process-lifetime total.
+ */
 const selfCheckSkipped: SelfCheckSkippedEvent[] = []
 
 /**
- * Record that a send/queue proceeded without a self-target check because the
- * caller id was unavailable. Never throws — called on the delivery path.
+ * Record that a resolution proceeded without a self-target check because the
+ * caller id was unavailable. Never throws — called on the delivery path, before
+ * the first side effect.
  *
  * @param tool - the tool name.
  * @param target - the resolved target id.

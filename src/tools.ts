@@ -429,14 +429,16 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           lines.push('  These appear in the target\'s session log but are absent from the ledger, so s2s_reconcile cannot see them. Read them with s2s_history.')
         }
 
-        // T29: sends that proceeded WITHOUT a self-target check (caller id
-        // unavailable at the time). Printed only when non-empty, for the same
-        // reason as the block above. This is the surviving evidence when a
-        // budget/queue/delivery throw erased the receipt.
+        // T29: recent resolutions that proceeded WITHOUT a self-target check
+        // (caller id unavailable at the time). Printed only when non-empty, for
+        // the same reason as the block above. Wording is deliberately NOT
+        // "sent"/"queued": the event is recorded BEFORE the first side effect, so
+        // a budget/queue/delivery throw may mean nothing was handed at all. This
+        // block is the surviving evidence in exactly that case.
         const skipped = readSelfCheckSkipped()
         if (skipped.length > 0) {
-          lines.push('self-target checks SKIPPED (caller identity unavailable): ' + skipped.length
-            + ' send(s)/queue(s) proceeded without a self check — latest ' + (skipped.length > 0 ? new Date(skipped[skipped.length - 1]!.at).toISOString() : '') + ':')
+          lines.push('self-target check skipped for ' + skipped.length + ' recent resolved attempt(s)'
+            + ' (caller identity unavailable; retained <= 10, process-scoped — not a delivery-success record):')
           for (const s of skipped) {
             lines.push('  ' + s.tool + ' -> ' + s.target + '  at=' + new Date(s.at).toISOString())
           }
