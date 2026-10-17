@@ -390,7 +390,13 @@ describe('T30 drain-refusal accounting: REAL lifecycle, real msgIds, every entry
     // already-live branch drains immediately).
     await ledger.record({ msgId: 'm-live', from: CALLER, to: ARCHIVED, text: 't' })
     const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-live' })
-    expect(outcome).toBe('refused')
+    // T30: the refusal is STRUCTURED — it carries the real msgId and its cancel outcome.
+    expect(typeof outcome).toBe('object')
+    if (typeof outcome === 'object' && outcome.kind === 'refused') {
+      expect(outcome.code).toBe('S2S_ARCHIVED_TARGET')
+      expect(outcome.items.map(i => i.msgId)).toEqual(['m-live'])
+      expect(outcome.items[0]!.cancelOutcome).toBe('cancelled')
+    }
     expect(agentStub.followup).not.toHaveBeenCalled()
     expect(agentStub.inject).not.toHaveBeenCalled()
     // REAL storage: the row is cancelled with the refusal.
@@ -464,8 +470,10 @@ describe('T30 drain-refusal accounting: REAL lifecycle, real msgIds, every entry
     await ledger.record({ msgId: 'm-idem', from: CALLER, to: ARCHIVED, text: 't' })
     const r1 = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-idem' })
     const r2 = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-idem' })
-    expect(r1).toBe('refused')
-    expect(r2).toBe('refused')
+    expect(typeof r1).toBe('object')
+    expect(typeof r2).toBe('object')
+    if (typeof r1 === 'object' && r1.kind === 'refused') expect(r1.items.map(i => i.msgId)).toEqual(['m-idem'])
+    if (typeof r2 === 'object' && r2.kind === 'refused') expect(r2.items.map(i => i.msgId)).toEqual(['m-idem'])
     // Same msgId ⇒ the mailbox keeps ONE file for it (enqueue is idempotent by design).
     expect(await lifecycle.queuedCount(ARCHIVED)).toBe(1)
   })

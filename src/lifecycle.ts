@@ -91,6 +91,40 @@ export interface ResumeReport {
 type ScopedAgentSetup = (agentCtx: Context, agent?: Agent) => void | Promise<void>
 
 /**
+ * T30: one refused message, with its per-msgId structured cancel outcome.
+ *
+ * The lifecycle owns the cancel for refused messages (the `agent/created`
+ * bypass has no tools to do it), so `cancelOutcome` is the PROOF of what
+ * happened on the ledger — the tools render it verbatim and never cancel
+ * again.
+ */
+export interface S2sRefusedItem {
+  readonly msgId: string
+  readonly code: S2sErrorCode
+  readonly message: string
+  /** `cancelled` / `not-cancelled (outcome)` / `cancel-failed: …` / `cancel-unavailable (no ledger)`. */
+  readonly cancelOutcome: string
+}
+
+/**
+ * T30: the result of a delivery whose handover was refused by the target
+ * policy. `items` carries EVERY refused msgId with its cancel outcome, so the
+ * tools can aggregate honestly instead of printing one fixed line.
+ */
+export interface S2sRefusedOutcome {
+  readonly kind: 'refused'
+  /** The policy code (all items share it — one verdict per drain). */
+  readonly code: S2sErrorCode
+  /** The policy refusal text. */
+  readonly message: string
+  /** Every refused message, oldest first, each with its cancel outcome. */
+  readonly items: readonly S2sRefusedItem[]
+}
+
+/** The outcome of `queueForDormant`. */
+export type S2sQueueOutcome = 'queued' | 'resumed' | S2sRefusedOutcome
+
+/**
  * The lifecycle service. Mounted only when a `lifecycle` config block is
  * present, so deployments that never target dormant sessions pay nothing.
  */
@@ -157,7 +191,7 @@ export class S2sLifecycleService extends Service {
    * @returns `'resumed'` when the session was resumed and drained now,
    *   `'queued'` when the entry waits in the mailbox.
    */
-  async queueForDormant(entry: { sessionId: string; from: string; text: string; replyTo?: string; msgId: string }): Promise<'queued' | 'resumed' | 'refused'> {
+  async queueForDormant(entry: { sessionId: string; from: string; text: string; replyTo?: string; msgId: string }): Promise<S2sQueueOutcome> {
     const record: MailboxEntry = {
       msgId: entry.msgId,
       from: entry.from,
@@ -183,7 +217,7 @@ export class S2sLifecycleService extends Service {
       // T30: a refused drain means NOTHING was handed over — the tools must not
       // report "Woke/handed". The mailbox and its (now cancelled) rows carry the
       // refusal.
-      if (drained.refused.length > 0) return 'refused'
+      if (drained.refused.length > 0) return { kind: 'refused', code: drained.refused[0]!.code, message: drained.refused[0]!.message, items: drained.refused }
       return 'resumed'
     }
     const registry = this.ctx.agents as typeof this.ctx.agents & {
@@ -203,7 +237,7 @@ export class S2sLifecycleService extends Service {
       const refusal = await this.targetPolicyCheck(entry.sessionId)
       if (refusal !== undefined) {
         this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}); message kept in the mailbox`)
-        return 'refused'
+        return { kind: 'refused' as const, code: refusal.code, message: refusal.message, items: [{ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome: 'not-cancelled (refused before any record/queue on this path)' }] }
       }
     }
     // A dormant resume through AgentRegistry.resume does NOT run the host's
@@ -220,7 +254,7 @@ export class S2sLifecycleService extends Service {
     // T30: the resume-path drain can also be refused (the archive flipped
     // between the pre-resume gate and this drain). Nothing was handed over, so
     // the caller must not report a wake — same rule as the already-live branch.
-    if (drained.refused.length > 0) return 'refused'
+    if (drained.refused.length > 0) return { kind: 'refused' as const, code: drained.refused[0]!.code, message: drained.refused[0]!.message, items: drained.refused }
     return 'resumed'
   }
 
@@ -439,7 +473,7 @@ export class S2sLifecycleService extends Service {
    * idle-aware shape as mesh inbound). Public: tests and the resume tool
    * path call it directly after a wake.
    */
-  async drain(sessionId: string): Promise<{ delivered: number; refused: Array<{ msgId: string; code: S2sErrorCode; message: string }> }> {
+  async drain(sessionId: string): Promise<{ delivered: number; refused: Array<{ msgId: string; code: S2sErrorCode; message: string; cancelOutcome: string }> }> {
     const agent = this.ctx.agents.get(SessionId(sessionId))
     if (agent === undefined) return { delivered: 0, refused: [] }
     const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined

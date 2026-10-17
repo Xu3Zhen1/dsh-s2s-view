@@ -10,7 +10,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { S2sBroker } from './broker.ts'
 import type { S2sDiscoveryService, S2sResolveResult, S2sSessionInfo } from './discovery.ts'
-import { S2sLifecycleService } from './lifecycle.ts'
+import { S2sLifecycleService, type S2sRefusedOutcome } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
@@ -234,40 +234,32 @@ function safeClassify(discovery: S2sDiscoveryService, filter: S2sArchiveFilterSt
  * structured `ledger.cancel` result, and rendered as an explicit
  * `[cancel outcome: …]` suffix.
  */
-function targetPolicyVerdict(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, filter: S2sArchiveFilterState, classify: (info: { sessionId: string; origin?: string; headerUnproven?: boolean }) => S2sTargetClass, recorded: boolean): { code: S2sErrorCode; message: string } | undefined {
-  const queueNote = recorded
-    ? ' A queued row exists for this message; its cancellation outcome is reported separately.'
-    : ' No message was recorded, queued, delivered, or woken.'
-  if (filter.state === 'unavailable') {
-    return {
-      code: 'S2S_TARGET_POLICY_UNAVAILABLE',
-      message: 'Refused: the target-legality filter could not answer (' + filter.reason + '), so this delivery cannot be proven legitimate.' + queueNote,
-    }
+/**
+ * T30: render a refused delivery HONESTLY, item by item (review: "至少列出每种
+ * 结果与数量/目标 msgId，不把所有项写成已取消").
+ *
+ * The lifecycle returns every refused msgId with its structured cancel outcome;
+ * this groups them by outcome so a mixed batch (one cancelled, one failed)
+ * cannot read as uniformly cancelled — which is exactly what the fixed-text
+ * version did.
+ *
+ * @param resolved - the resolved target (for the label).
+ * @param outcome - the lifecycle's structured refusal.
+ */
+function renderRefusedOutcome(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, outcome: S2sRefusedOutcome): string {
+  const byOutcome = new Map<string, string[]>()
+  for (const item of outcome.items) {
+    const list = byOutcome.get(item.cancelOutcome) ?? []
+    list.push(item.msgId)
+    byOutcome.set(item.cancelOutcome, list)
   }
-  const cls = classify({ sessionId: resolved.sessionId, ...(resolved.origin === undefined ? {} : { origin: resolved.origin }), ...(resolved as { headerUnproven?: true }).headerUnproven === true ? { headerUnproven: true } : {} })
-  if (cls === 'archived') {
-    return {
-      code: 'S2S_ARCHIVED_TARGET',
-      message: 'Refused: "' + labelOf(resolved) + '" is an archived session. Archived sessions are not delivery targets; unarchive it first if it must receive messages.' + queueNote,
-    }
+  const parts: string[] = []
+  for (const [outcomeText, ids] of byOutcome) {
+    parts.push(ids.length + ' message(s) ' + outcomeText + ' [' + ids.join(', ') + ']')
   }
-  if (cls === 'subagent') {
-    return {
-      code: 'S2S_SUBAGENT_TARGET',
-      message: 'Refused: "' + labelOf(resolved) + '" is a subagent session (origin=subagent). Subagents are not independent conversation targets.' + queueNote,
-    }
-  }
-  if (cls === 'unknown') {
-    // NOT a subagent code: an unproven/unrecognized identity is a policy-
-    // availability fact, and the ruling requires the specific reason.
-    return {
-      code: 'S2S_TARGET_POLICY_UNAVAILABLE',
-      message: 'Refused: "' + labelOf(resolved) + '" has no provable session identity (header unreadable or unrecognized origin'
-        + ((resolved as { headerUnproven?: true }).headerUnproven === true ? ' — no trusted session header could be read' : '')
-        + '), so the target policy cannot classify it as an ordinary peer.' + queueNote,
-    }
-  }
-  return undefined
+  return 'Refused: "' + labelOf(resolved) + '" — the target policy refused this delivery at the handover point ('
+    + outcome.code + '). Per-message cancel outcomes: ' + parts.join('; ')
+    + '. The message(s) stay in the target\'s mailbox (never dropped).'
 }
 
 export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
@@ -467,21 +459,15 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             }
             if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' + callerNote }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
-            if (outcome === 'refused') {
-              // The lifecycle's handover gate refused — the target's legality
-              // flipped inside the async setup/resume window. The message stays
-              // in the mailbox (the user's queue).
-              //
-              // T30 (review blocker 1): the LIFECYCLE owns the cancel for its
-              // refusals — the refusal items below carry each msgId's STRUCTURED
-              // cancel outcome. The tools must NOT cancel again: a second cancel
-              // of an already-cancelled row reports `not-cancellable`, which read
-              // as "not-cancelled" and misreported a successful refusal.
-              const refusal = discovery.targetPolicyVerdict(resolved)
-              const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
-              const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
-              const outcomeNote = ' [cancel outcome: per the target-policy refusal above; the message stays in the mailbox]'
-              throw new S2sError(message + outcomeNote, code)
+            if (typeof outcome === 'object' && outcome.kind === 'refused') {
+              // T30 (review: refusal results must survive the queueForDormant
+              // boundary): the lifecycle returns EVERY refused msgId with its
+              // structured cancel outcome. The tools consume it verbatim — they
+              // never cancel again (a second cancel of an already-cancelled row
+              // reported `not-cancelled` and misread a successful refusal). The
+              // aggregation names each outcome and its count, so a mixed batch
+              // cannot read as "all cancelled".
+              throw new S2sError(renderRefusedOutcome(resolved, outcome), outcome.code)
             }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: `drain()` hands the queue to the agent, which is the same handover
@@ -571,16 +557,10 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               throw new S2sError(rerefusal.message + ' [cancel outcome: ' + cancelOutcome + ']', rerefusal.code)
             }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
-            if (outcome === 'refused') {
-              // T30: the lifecycle's drain-time gate refused (the archive
-              // flipped between the pre-resume check and the handover). Nothing
-              // was handed over — the caller must NOT report a wake. The
-              // lifecycle owns the cancel and its structured outcome (see the
-              // s2s_message refused branch); the tools never cancel again.
-              const refusal = discovery.targetPolicyVerdict(resolved)
-              const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
-              const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
-              throw new S2sError(message + ' The message was kept in the target\'s mailbox (not dropped); the cancel outcome is carried on the lifecycle refusal record.', code)
+            if (typeof outcome === 'object' && outcome.kind === 'refused') {
+              // T30: same consumption rule as s2s_message — the lifecycle's
+              // structured items are rendered verbatim, never cancelled again.
+              throw new S2sError(renderRefusedOutcome(resolved, outcome), outcome.code)
             }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: same restraint as `s2s_message` — a wake hands the queue over, it
