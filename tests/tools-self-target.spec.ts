@@ -59,6 +59,7 @@ function harness(target: string, opts: { state?: string; lifecycle?: boolean; bu
     // passes and the T29 assertions stay meaningful. The T30 suite below drives
     // the unavailable/archived/subagent stubs explicitly.
     archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] }) as const),
+    targetPolicyVerdict: vi.fn(() => undefined),
     classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : 'eligible') as const),
   }
   const ledger = {

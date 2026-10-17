@@ -332,6 +332,7 @@ describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
       resolve: vi.fn(async () => ({ kind: 'ok', sessionId: ARCHIVED, title: 'a', state: 'dormant', workspaceDir: 'ws', matchedBy: 'exact', targetClass: 'eligible' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [...live.ids] }) as const),
       classifyTarget: vi.fn((id: string) => (live.ids.includes(id) ? 'archived' : 'eligible') as const),
+      targetPolicyVerdict: vi.fn((info: { sessionId: string }) => (live.ids.includes(info.sessionId) ? { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' } : undefined)),
     }
     const queueForDormant = vi.fn(async () => 'resumed' as const)
     const queuedCount = vi.fn(async () => 1)
@@ -353,7 +354,7 @@ describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
     // The row on REAL storage is cancelled with the refusal.
     const row = await ledger.get(await firstMsgId(ledger))
     expect(row!.status).toBe('cancelled')
-    expect(row!.lastError).toContain('is an archived session') // the refusal reason, verbatim
+    expect(row!.lastError).toContain('archived') // the refusal reason, verbatim
   })
 })
 const CALLER = 'session-11111111-2222-3333-4444-555555555555'

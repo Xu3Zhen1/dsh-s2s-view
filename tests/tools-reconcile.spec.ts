@@ -74,6 +74,7 @@ async function harness(opts: { events?: readonly unknown[]; readFails?: boolean 
     resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
   
     archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
     classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
   const defs = buildTools({ ctx, broker, discovery, ledger } as any)
   const by = (n: string) => defs.find((d) => d.name === n) as unknown as Tool
@@ -139,6 +140,7 @@ describe('s2s_reconcile (T26 wiring)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const tool = defs.find((d) => d.name === 's2s_reconcile') as unknown as Tool
@@ -152,6 +154,7 @@ describe('s2s_reconcile (T26 wiring)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery } as any)
     const tool = defs.find((d) => d.name === 's2s_reconcile') as unknown as Tool
@@ -228,6 +231,7 @@ describe('s2s_status reconcile exposure (T26)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -276,6 +280,7 @@ describe('s2s_status reconcile exposure (T26)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -310,6 +315,7 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
       broker: { deliver: vi.fn(() => 'absent' as const), history: vi.fn(() => [] as any[]) },
       discovery: { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       ledger: ctx.get('s2sLedger') as never,
     } as any)
@@ -333,6 +339,7 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -356,6 +363,7 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -386,6 +394,7 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -410,6 +419,7 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool

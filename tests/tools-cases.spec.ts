@@ -12,6 +12,7 @@ function makeTools(overrides: Record<string, any> = {}) {
     ...(overrides.discovery ?? {}),
   
     archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
     classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
   const lifecycle = { queueForDormant: vi.fn(async () => 'resumed' as const), queuedCount: vi.fn(async () => 0), ...(overrides.lifecycle ?? {}) }
   const budget = { check: vi.fn(), ...(overrides.budget ?? {}) }
@@ -37,6 +38,7 @@ describe('s2s tools execution', () => {
       { sessionId: 's2', title: 'b', state: 'dormant', workspaceDir: 'ws' },
     ]), 
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_peers').execute({}, { agent: { id: 'x' } })
     expect(out.text).toContain('a')
@@ -52,6 +54,7 @@ describe('s2s tools execution', () => {
       { sessionId: 's1', title: '', state: 'live-busy', workspaceDir: 'ws', lastActivity: 1700000000000 },
     ]), 
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_sessions').execute({ query: 'ws' }, {})
     expect(out.text).toContain('live-busy')
@@ -69,6 +72,7 @@ describe('s2s tools execution', () => {
       { sessionId: 's2', title: 'b', state: 'live-idle', workspaceDir: 'proj-b' },
     ]), 
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_peers').execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('a')
@@ -80,6 +84,7 @@ describe('s2s tools execution', () => {
       { sessionId: 's2', title: 'b', state: 'live-idle', workspaceDir: 'proj-b' },
     ]), 
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_peers').execute({ all: true }, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('b')
@@ -91,6 +96,7 @@ describe('s2s tools execution', () => {
       { sessionId: 's2', title: 'beta', state: 'dormant', workspaceDir: 'proj-b' },
     ]), 
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const scoped = await by('s2s_sessions').execute({ query: 'beta' }, { agent: { id: 'sess-a' } })
     expect(scoped.text).toBe('No sessions found.')
@@ -105,6 +111,7 @@ describe('s2s tools execution', () => {
   it('s2s_message not-found', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_message').execute({ name: 'x', text: 'hi' }, { agent: { id: 'y' } })
     expect(out.text).toContain('No session named')
@@ -112,6 +119,7 @@ describe('s2s tools execution', () => {
   it('s2s_message ambiguous', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ambiguous', name: 'x', candidates: [{ sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }] }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_message').execute({ name: 'x', text: 'hi' }, { agent: { id: 'y' } })
     expect(out.text).toContain('Multiple sessions')
@@ -132,9 +140,11 @@ describe('s2s tools execution', () => {
   it('s2s_message dormant resumes', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const { by: by2, lifecycle } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by2('s2s_message').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
     expect(lifecycle.queueForDormant).toHaveBeenCalledTimes(1)
@@ -143,6 +153,7 @@ describe('s2s tools execution', () => {
   it('s2s_message dormant queued', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}, lifecycle: { queueForDormant: vi.fn(async () => 'queued' as const), queuedCount: vi.fn(async () => 2) } })
     const out = await by('s2s_message').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
     expect(out.text).toContain('Queued')
@@ -150,6 +161,7 @@ describe('s2s tools execution', () => {
   it('s2s_resume unconfigured', async () => {
     const defs = buildTools({ broker: { deliver: vi.fn(), history: vi.fn() }, discovery: { list: vi.fn(), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} } as any)
     const tool = defs.find((d) => d.name === 's2s_resume') as unknown as Tool
     const out = await tool.execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
@@ -158,6 +170,7 @@ describe('s2s tools execution', () => {
   it('s2s_resume dormant resumed', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_resume').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
     // T9: the wake hands the queue over; it must not claim the message is in the
@@ -168,6 +181,7 @@ describe('s2s tools execution', () => {
   it('s2s_resume not-found', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     const out = await by('s2s_resume').execute({ name: 'x', text: 'hi' }, { agent: { id: 'y' } })
     expect(out.text).toContain('No session named')
@@ -175,6 +189,7 @@ describe('s2s tools execution', () => {
   it('s2s_resume unsafe id throws', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: '../evil', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} })
     await expect(by('s2s_resume').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })).rejects.toThrow(/unsafe/)
   })
@@ -206,6 +221,7 @@ describe('s2s tools execution', () => {
   it('s2s_schedule unconfigured', async () => {
     const defs = buildTools({ broker: { deliver: vi.fn(), history: vi.fn() }, discovery: { list: vi.fn(), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),} } as any)
     const tool = defs.find((d) => d.name === 's2s_schedule') as unknown as Tool
     const out = await tool.execute({ action: 'list' }, { agent: { id: 'y' } })
@@ -276,6 +292,7 @@ describe('s2s short-id display', () => {
     const { by } = makeTools({
       discovery: { list: vi.fn(async () => [{ sessionId: FULL, title: 's2s test', state: 'live-busy', workspaceDir: '/w' }]), 
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
     })
     const out = await by('s2s_sessions').execute({}, {})
@@ -287,6 +304,7 @@ describe('s2s short-id display', () => {
     const { by } = makeTools({
       discovery: { list: vi.fn(async () => [{ sessionId: FULL, title: 's2s test', state: 'live-idle', workspaceDir: '/w' }]), 
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
     })
     const out = await by('s2s_peers').execute({}, {})
@@ -300,6 +318,7 @@ describe('s2s short-id display', () => {
         candidates: [{ sessionId: FULL, title: 'x', state: 'dormant', workspaceDir: '/w' }],
       })),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')) },
     })
     const out = await by('s2s_message').execute({ name: 'nope', text: 't' }, { agent: { id: 'me' } })
@@ -313,6 +332,7 @@ describe('s2s short-id display', () => {
       broker: { deliver, history: vi.fn(() => []) },
       discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: FULL, title: 's2s test', state: 'live-idle', workspaceDir: '/w' })),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')) },
     })
     await by('s2s_message').execute({ name: 's2s test', text: 'hi' }, { agent: { id: 'me' } })

@@ -36,6 +36,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { TitleCache } from './title-cache.ts'
+import type { S2sErrorCode } from './error.ts'
 
 export interface S2sSessionInfo {
   readonly sessionId: string
@@ -258,6 +259,69 @@ export class S2sDiscoveryService extends Service {
     if (headerOrigin === undefined) return 'eligible'
     if (headerOrigin === 'subagent') return 'subagent'
     return 'unknown'
+  }
+
+  /**
+   * T30: the SINGLE source of target-policy verdicts, shared by the tools'
+   * pre/post gates and the lifecycle handover hook.
+   *
+   * Everything the verdict needs is read ONCE here: the registry snapshot and
+   * the target's identity fields. Sharing this function is what makes the gate
+   * positions agree — before it existed, the tools classified from a full
+   * `S2sSessionInfo` while the lifecycle hook re-classified from a bare id with
+   * `origin=undefined`, so `unknown`/`subagent` targets silently became
+   * `eligible` at the lifecycle layer (review blocker 1), and two registry reads
+   * could disagree mid-verdict (blocker 4).
+   *
+   * @param info - the target's identity as the calling layer knows it: canonical
+   *   id, the header `origin` when the listing could read it, and whether a
+   *   trusted header could be read at all.
+   * @returns `undefined` when the target is eligible; otherwise the structured
+   *   refusal (stable code + human text).
+   */
+  targetPolicyVerdict(info: { sessionId: string; origin?: string; headerUnproven?: boolean }): { code: S2sErrorCode; message: string } | undefined {
+    const filter = this.archivedFilterState()
+    if (filter.state === 'unavailable') {
+      return {
+        code: 'S2S_TARGET_POLICY_UNAVAILABLE',
+        message: 'Refused: the target-legality filter could not answer (' + filter.reason + '), so this delivery cannot be proven legitimate.',
+      }
+    }
+    const cls = this.classifyTarget(info.sessionId, info.origin, filter.ids, info.headerUnproven)
+    if (cls === 'archived') {
+      return {
+        code: 'S2S_ARCHIVED_TARGET',
+        message: 'Refused: "' + info.sessionId + '" is an archived session. Archived sessions are not delivery targets; unarchive it first if it must receive messages.',
+      }
+    }
+    if (cls === 'subagent') {
+      return {
+        code: 'S2S_SUBAGENT_TARGET',
+        message: 'Refused: "' + info.sessionId + '" is a subagent session (origin=subagent). Subagents are not independent conversation targets.',
+      }
+    }
+    if (cls === 'unknown') {
+      return {
+        code: 'S2S_TARGET_POLICY_UNAVAILABLE',
+        message: 'Refused: "' + info.sessionId + '" has no provable session identity (header unreadable or unrecognized origin), so the target policy cannot classify it as an ordinary peer.',
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * T30: the authoritative identity for ONE canonical id, for callers that hold
+   * only the id (the lifecycle hook) — same authoritative sources as
+   * `resolve()`, so the lifecycle verdict classifies the target exactly as the
+   * tools did. This is what keeps the lifecycle gate from re-classifying a bare
+   * id with `origin=undefined` (review blocker 1).
+   *
+   * @returns the identity, or `undefined` when the id is not in the corpus —
+   *   which the caller must treat as unknown rather than eligible.
+   */
+  async authoritativeIdentity(sessionId: string): Promise<{ sessionId: string; origin?: string; headerUnproven?: boolean } | undefined> {
+    const info = await this.collectById(sessionId)
+    return info === undefined ? undefined : { sessionId: info.sessionId, ...(info.origin === undefined ? {} : { origin: info.origin }), ...(info.headerUnproven === true ? { headerUnproven: true } : {}) }
   }
 
   /** The durable title cache; exposed for tooling and tests. */

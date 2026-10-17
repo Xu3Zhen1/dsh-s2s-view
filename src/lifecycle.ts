@@ -109,7 +109,7 @@ export class S2sLifecycleService extends Service {
    * moment; a refusal keeps the message in the mailbox (it is the user's
    * queue — never silently dropped) and the caller gets `'refused'`.
    */
-  private targetPolicyCheck: ((sessionId: string) => { code: S2sErrorCode; message: string } | undefined) | undefined
+  private targetPolicyCheck: ((sessionId: string) => Promise<{ code: S2sErrorCode; message: string } | undefined>) | undefined
   /** Resumed handles are kept alive for the process lifetime (see OQ-5). */
   private readonly resumed = new Map<string, ResumedHandle>()
   /**
@@ -146,7 +146,7 @@ export class S2sLifecycleService extends Service {
    * @param check - returns the refusal for the session, or undefined when the
    *   session is an eligible target.
    */
-  setTargetPolicyCheck(check: ((sessionId: string) => { code: S2sErrorCode; message: string } | undefined) | undefined): void {
+  setTargetPolicyCheck(check: ((sessionId: string) => Promise<{ code: S2sErrorCode; message: string } | undefined>) | undefined): void {
     this.targetPolicyCheck = check
   }
 
@@ -195,7 +195,7 @@ export class S2sLifecycleService extends Service {
     // user's queue, never silently dropped — and the outcome is `'refused'` so
     // the caller can cancel its ledger row.
     if (this.targetPolicyCheck !== undefined) {
-      const refusal = this.targetPolicyCheck(entry.sessionId)
+      const refusal = await this.targetPolicyCheck(entry.sessionId)
       if (refusal !== undefined) {
         this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}); message kept in the mailbox`)
         return 'refused'
@@ -430,9 +430,9 @@ export class S2sLifecycleService extends Service {
    * idle-aware shape as mesh inbound). Public: tests and the resume tool
    * path call it directly after a wake.
    */
-  async drain(sessionId: string): Promise<number> {
+  async drain(sessionId: string): Promise<{ delivered: number; refused: Array<{ msgId: string; code: S2sErrorCode; message: string }> }> {
     const agent = this.ctx.agents.get(SessionId(sessionId))
-    if (agent === undefined) return 0
+    if (agent === undefined) return { delivered: 0, refused: [] }
     // T30: the LAST gate before followup/inject. This covers every drain entry
     // point — the resume path above, the already-live branch, and the
     // `agent/created` auto-drain (which bypasses the tools entirely, so without
@@ -441,10 +441,12 @@ export class S2sLifecycleService extends Service {
     // mailbox (the user's queue — never silently dropped; the read is not
     // destructive here) and logs the refusal loudly (G9).
     if (this.targetPolicyCheck !== undefined) {
-      const refusal = this.targetPolicyCheck(sessionId)
+      const refusal = await this.targetPolicyCheck(sessionId)
       if (refusal !== undefined) {
+        // Session-level gate: the enqueue-time tool owns the ledger cancel for
+        // these rows (it holds their msgIds); the mailbox is kept intact.
         this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); mailbox kept`)
-        return 0
+        return { delivered: 0, refused: [{ msgId: '(session-level gate)', code: refusal.code, message: refusal.message }] }
       }
     }
     // T6b: the row for a dormant message was created by the caller
@@ -455,7 +457,25 @@ export class S2sLifecycleService extends Service {
     // (`tools.ts`). Resolved once per drain; the ledger is optional.
     const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
     const entries = await this.mailbox.drain(sessionId)
+    let delivered = 0
+    /** T30: entries refused AT the handover — per-msgId, for ledger cancel. */
+    const refused: Array<{ msgId: string; code: S2sErrorCode; message: string }> = []
     for (const entry of entries) {
+      // T30 per-message gate: the session-level check ran before this, but the
+      // archive state is read fresh per entry — this is the last moment before
+      // followup/inject, and it is where the msgId is known for ledger cancel.
+      if (this.targetPolicyCheck !== undefined) {
+        const refusal = await this.targetPolicyCheck(sessionId)
+        if (refusal !== undefined) {
+          // Keep the user's queue: re-enqueue (the drain read was destructive)
+          // so nothing is silently dropped, and report the msgId for the caller
+          // to cancel the ledger row.
+          await this.mailbox.enqueue(sessionId, entry)
+          refused.push({ msgId: entry.msgId, code: refusal.code, message: refusal.message })
+          this.ctx.logger.warn(`s2s lifecycle: message ${entry.msgId} to ${sessionId} refused by target policy (${refusal.code}); re-queued`)
+          continue
+        }
+      }
       // Same `msgId=` header as the broker's live path: the ledger derives
       // `landed` by finding this token in the target's session log, so both
       // delivery paths must emit it or dormant deliveries can never land.
@@ -473,8 +493,22 @@ ${entry.text}`
       // Guarded, like the live path: bookkeeping never outranks delivery (an
       // unopened ledger must not abort the drain), and the loss stays loud (G9).
       await noteLedger(ledger, 'markInboxed', () => ledger!.markInboxed(entry.msgId, sessionId))
+      delivered++
     }
-    return entries.length
+    if (refused.length > 0) {
+      // The refusals are returned STRUCTURED so the caller can cancel the
+      // corresponding ledger rows — a refusal must never leave a retryable
+      // ghost row behind (review blocker 2).
+      for (const r of refused) {
+        if (ledger !== undefined && ledger.isOpen) {
+          try { await ledger.cancel(r.msgId, r.code + ': ' + r.message) } catch (error) {
+            this.ctx.logger.warn(`s2s lifecycle: cancel failed for refused message ${r.msgId}: ${String(error)}`)
+          }
+        }
+      }
+      this.ctx.logger.warn(`s2s lifecycle: ${refused.length} message(s) to ${sessionId} refused by target policy and re-queued`)
+    }
+    return { delivered, refused }
   }
 
   /** Queued message count for one session (tool-facing). */

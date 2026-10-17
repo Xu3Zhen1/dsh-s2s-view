@@ -379,13 +379,10 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 'S2S_SELF_TARGET',
               )
             }
-            // T30 pre-check: archive/subagent policy, before any side effect. Read
-            // fresh (registry state is never cached with the title). `recorded=false`:
-            // nothing is on the ledger yet, so the verdict text says so.
-            const filter = safeFilterState(discovery)
-            // The classifier closes over the FRESH registry reading — a flip during the async budget is seen here.
-            const classifyNow = safeClassify(discovery, filter)
-            const verdict = targetPolicyVerdict(resolved, filter, classifyNow, false)
+            // T30 pre-check: ONE shared verdict — the identity comes from the
+            // resolved record (origin + provenance) and the registry snapshot is
+            // taken once inside it. `recorded=false`: nothing is on the ledger.
+            const verdict = discovery.targetPolicyVerdict(resolved)
             if (verdict !== undefined) throw new S2sError(verdict.message, verdict.code)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
             const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
@@ -420,16 +417,11 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               if (result?.verdict === 'warn') warn = result.reason
             }
             // T30 post-budget re-check: the archive state may have flipped while
-            // the budget ran. If it now refuses, an already-recorded queued row
-            // must be explicitly cancelled — never left as retryable ghost work
-            // (ruling: 后置拒绝时 queued 行须显式 cancelled 或记录拒绝原因).
-            // Fresh reading + fresh classifier: a flip during the async budget is
-            // seen here, and the original exception escapes unchanged.
-            // `recorded=true`: a row IS on the ledger, so the verdict must not
-            // claim "no message was recorded".
-            const refilter = safeFilterState(discovery)
-            const reclassify = safeClassify(discovery, refilter)
-            const rerefusal = targetPolicyVerdict(resolved, refilter, reclassify, recorded)
+            // the budget ran. The shared verdict re-reads the registry ONCE
+            // inside itself, and the resolved record carries the identity
+            // (origin + provenance) — so this classifies exactly as the
+            // pre-check did. `recorded` is the real noteLedger return.
+            const rerefusal = discovery.targetPolicyVerdict(resolved)
             if (rerefusal !== undefined) {
               // The cancel result is OBSERVABLE either way (ruling: cancel 失败
               // 不得被吞). `ledger.cancel` returns a STRUCTURED outcome — "did
@@ -477,21 +469,29 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
             if (outcome === 'refused') {
               // The lifecycle's LAST-moment gate (just before registry.resume)
-              // refused — archive state flipped inside the async setup/resume
-              // window. The message stays in the mailbox (the user's queue);
-              // the recorded row is explicitly cancelled, never left as
-              // retryable ghost work.
-              const refusal = targetPolicyVerdict(resolved, discovery.archivedFilterState(), safeClassify(discovery, discovery.archivedFilterState()), true)
+              // refused — the target's legality flipped inside the async
+              // setup/resume window. The message stays in the mailbox (the
+              // user's queue); the recorded row must be explicitly cancelled —
+              // using the SAME shared verdict and ONLY its structured cancel
+              // result (review blocker 3: "the call did not throw" proves
+              // nothing).
+              const refusal = discovery.targetPolicyVerdict(resolved)
               const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
               const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
+              let cancelOutcome = 'cancel-unavailable'
               if (ledger !== undefined && ledger.isOpen) {
                 try {
-                  await ledger.cancel(msgId, message)
+                  const result = await ledger.cancel(msgId, message)
+                  if (result.outcome === 'cancelled') cancelOutcome = 'cancelled'
+                  else cancelOutcome = 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
                 } catch (error) {
+                  cancelOutcome = 'cancel-failed'
                   recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
                 }
+              } else {
+                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
               }
-              throw new S2sError(message + ' The message was kept in the target\'s mailbox (not dropped); the recorded row was cancelled.', code)
+              throw new S2sError(message + ' [cancel outcome: ' + cancelOutcome + ']', code)
             }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: `drain()` hands the queue to the agent, which is the same handover
@@ -538,10 +538,9 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 'S2S_SELF_TARGET',
               )
             }
-            // T30 pre-check, same as s2s_message (fresh registry read).
-            const filter = safeFilterState(discovery)
-            const classifyNow = safeClassify(discovery, filter)
-            const verdict = targetPolicyVerdict(resolved, filter, classifyNow, false)
+            // T30 pre-check, same as s2s_message: ONE shared verdict over the
+            // resolved record's authoritative identity.
+            const verdict = discovery.targetPolicyVerdict(resolved)
             if (verdict !== undefined) throw new S2sError(verdict.message, verdict.code)
             S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
@@ -560,12 +559,11 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text })
             })
             // T30 post-record re-check: refuse with the queued row explicitly
-            // cancelled (never retryable ghost work). Fresh reading + classifier.
+            // cancelled (never retryable ghost work). ONE shared verdict — the
+            // registry snapshot and the classification are taken inside it.
             // `recorded` is the REAL noteLedger return — "record did not throw"
             // is not evidence a row exists.
-            const refilter = safeFilterState(discovery)
-            const reclassify = safeClassify(discovery, refilter)
-            const rerefusal = targetPolicyVerdict(resolved, refilter, reclassify, recorded)
+            const rerefusal = discovery.targetPolicyVerdict(resolved)
             if (rerefusal !== undefined) {
               let cancelOutcome = 'cancel-unavailable'
               if (ledger !== undefined && ledger.isOpen) {
@@ -1047,17 +1045,16 @@ export function apply(ctx: Context): void {
   // T30: the lifecycle's own gates (before `registry.resume` and inside
   // `drain`, which `agent/created` can trigger without any tool call) run the
   // SAME policy the tools run — injected here so every handover point shares
-  // one verdict source. A session whose policy is unavailable fails closed.
-  lifecycle?.setTargetPolicyCheck(function(sessionId) {
-    const filter = safeFilterState(discovery)
-    if (filter.state === 'unavailable') {
-      return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: 'the target-legality filter could not answer (' + filter.reason + ')' }
+  // one verdict source. The check resolves the target's AUTHORITATIVE identity
+  // through discovery (origin + header provenance), then hands it to the shared
+  // verdict — it never re-classifies a bare id with `origin=undefined` (that was
+  // review blocker 1). A corpus miss is `unknown` (fail-closed), not eligible.
+  lifecycle?.setTargetPolicyCheck(async function(sessionId) {
+    const identity = await discovery.authoritativeIdentity(sessionId)
+    if (identity === undefined) {
+      return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: 'the session id is not in the authoritative corpus; its target policy cannot be evaluated' }
     }
-    const cls = discovery.classifyTarget(sessionId, undefined, filter.ids)
-    if (cls === 'archived') return { code: 'S2S_ARCHIVED_TARGET' as const, message: 'the session is archived' }
-    if (cls === 'subagent') return { code: 'S2S_SUBAGENT_TARGET' as const, message: 'the session is a subagent (origin=subagent)' }
-    if (cls === 'unknown') return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: 'the session identity is unprovable (no trusted session header or unrecognized origin)' }
-    return undefined
+    return discovery.targetPolicyVerdict(identity)
   })
 }
 

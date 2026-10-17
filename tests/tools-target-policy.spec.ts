@@ -76,6 +76,15 @@ function harness(target: string, opts: HarnessOptions = {}) {
       return { kind: 'ok', sessionId: target, title: 'a', state: opts.state ?? 'idle', workspaceDir: 'ws', matchedBy: 'exact', targetClass: classifyTarget(target, origin), ...(origin === undefined ? {} : { origin }) } as any
     }),
     archivedFilterState: vi.fn(archivedFilterState),
+    targetPolicyVerdict: vi.fn((info: { sessionId: string; origin?: string; headerUnproven?: boolean }) => {
+        const f = archivedFilterState()
+        if (f.state === 'unavailable') return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: f.reason }
+        const cls = classifyTarget(info.sessionId, info.origin, f.ids, info.headerUnproven)
+        if (cls === 'archived') return { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' }
+        if (cls === 'subagent') return { code: 'S2S_SUBAGENT_TARGET' as const, message: 'subagent' }
+        if (cls === 'unknown') return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: 'unknown' }
+        return undefined
+      }),
     classifyTarget: vi.fn(classifyTarget),
   }
   const ledger = {
@@ -227,7 +236,16 @@ describe('T30 discovery surface: default exclusion and explicit look-back', () =
       list: vi.fn(async () => infos),
       resolve: vi.fn(async () => ({ kind: 'ok', sessionId: rows[0]!.id, title: rows[0]!.title, state: 'dormant', workspaceDir: '/w', matchedBy: 'exact', targetClass: classifyTarget(rows[0]!.id, rows[0]!.origin) }) as any),
       archivedFilterState: vi.fn(archivedFilterState),
-      classifyTarget: vi.fn(classifyTarget),
+      targetPolicyVerdict: vi.fn((info: { sessionId: string; origin?: string; headerUnproven?: boolean }) => {
+        const f = archivedFilterState()
+        if (f.state === 'unavailable') return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: f.reason }
+        const cls = classifyTarget(info.sessionId, info.origin, f.ids, info.headerUnproven)
+        if (cls === 'archived') return { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' }
+        if (cls === 'subagent') return { code: 'S2S_SUBAGENT_TARGET' as const, message: 'subagent' }
+        if (cls === 'unknown') return { code: 'S2S_TARGET_POLICY_UNAVAILABLE' as const, message: 'unknown' }
+        return undefined
+      }),
+    classifyTarget: vi.fn(classifyTarget),
     }
     const ledger = { record: vi.fn(async () => true), markInboxed: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), sweepStatus: { armed: false, intervalMs: 3600000, landedDeadlineMs: 86400000 } }
     const defs = buildTools({ ctx: { on: vi.fn(() => vi.fn()) }, broker: { deliver: vi.fn(() => 'idle'), history: vi.fn(() => []) }, discovery, ledger } as any)

@@ -55,6 +55,7 @@ async function harness(opts: { deliver?: 'idle' | 'busy' | 'absent'; state?: str
     resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: opts.state ?? 'live-idle', workspaceDir: 'ws' }) as any),
   
     archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
     classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
   const defs = buildTools({
     broker,
@@ -78,6 +79,7 @@ describe('s2s_status (T10)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -121,6 +123,7 @@ describe('s2s_status (T10)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ ctx, broker, discovery, ledger } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
@@ -191,6 +194,7 @@ describe('s2s_message ledger wiring (T6)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
@@ -214,6 +218,7 @@ describe('s2s_message ledger wiring (T6)', () => {
     const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
     const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
       classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
     const defs = buildTools({ broker, discovery, ledger } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
@@ -269,6 +274,7 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
       discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
@@ -304,6 +310,7 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
       discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
@@ -332,6 +339,7 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
       discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
     } as any)
@@ -364,6 +372,7 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
       discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger: failing,
@@ -394,6 +403,7 @@ describe('s2s_resume ledger wiring (T6b dormant path)', () => {
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
       discovery: { list: vi.fn(async () => []), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
         archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
         classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
       lifecycle: stub,
       ledger,
