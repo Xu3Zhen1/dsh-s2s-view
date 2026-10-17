@@ -14,6 +14,7 @@ import { S2sLifecycleService } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
+import { S2sError } from './error.ts'
 import { readHistory } from './history.ts'
 import { ledgerDiagnostics, recordFirstS2sToolCall, recordProbe } from './ledger-diagnostics.ts'
 
@@ -124,6 +125,18 @@ function normalizedSessionId(value: string): string {
 }
 
 /**
+ * The caller id the self-target check must judge on, or `undefined` when the
+ * host provided none. `undefined`, empty and whitespace-only are all "identity
+ * unavailable" — a blank string is not an identity (T29 review).
+ */
+function realCallerId(exec: unknown): string | undefined {
+  const raw = (exec as { agent?: { id?: string } } | undefined)?.agent?.id
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  return trimmed.length === 0 ? undefined : trimmed
+}
+
+/**
  * Is the resolved target the calling session itself? (T29)
  *
  * Judged against the **real** caller id from the execution context — never the
@@ -135,8 +148,8 @@ function normalizedSessionId(value: string): string {
  * @returns true when the target is provably the caller's own session.
  */
 function isSelfTarget(exec: unknown, resolvedSessionId: string): boolean {
-  const callerId = (exec as { agent?: { id?: string } } | undefined)?.agent?.id
-  if (callerId === undefined || callerId.length === 0) return false
+  const callerId = realCallerId(exec)
+  if (callerId === undefined) return false
   return normalizedSessionId(callerId) === normalizedSessionId(resolvedSessionId)
 }
 
@@ -150,8 +163,7 @@ function isSelfTarget(exec: unknown, resolvedSessionId: string): boolean {
  * fixed marker so the skipped check is greppable in every transcript.
  */
 function selfCheckNote(exec: unknown): string {
-  const callerId = (exec as { agent?: { id?: string } } | undefined)?.agent?.id
-  return callerId === undefined || callerId.length === 0
+  return realCallerId(exec) === undefined
     ? ' [s2s] caller identity unavailable — self-target check skipped (args.from is not trusted as identity).'
     : ''
 }
@@ -208,77 +220,92 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         from: { type: 'string', description: 'Optional sender label (defaults to your agent id).' },
       },
       output: OUTPUT,
+      // T29 (review must-fix 2): the self refusal is a real `S2sError` thrown by
+      // the body; this wrapper renders domain errors into the receipt so the
+      // machine-routable `code` exists on the thrown object AND the caller sees a
+      // stable text form. Route on `code`, never on the message.
       execute: async function(args, exec) {
-        const resolved = await resolve(args.name, args.session_id)
-        if (resolved.kind === 'err') return { text: resolved.reason }
-        if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
-        // T29: a session must not message itself. Judged against the REAL caller
-        // id (`exec.agent.id`), never `args.from`, which the model can fill with
-        // anything. This runs after resolution but BEFORE any record, budget
-        // count, queue entry, delivery or wake — a refused self-send must leave
-        // no trace at all. The receipt suggests `s2s_schedule`, the supported way
-        // to give one's own session a later step.
-        if (isSelfTarget(exec, resolved.sessionId)) {
-          return { text: '[S2S_SELF_TARGET] Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot send an s2s message to itself. To schedule a later step for your own session, use s2s_schedule.' }
+        try {
+          return await (async function(): Promise<{ text: string }> {
+            const resolved = await resolve(args.name, args.session_id)
+            if (resolved.kind === 'err') return { text: resolved.reason }
+            if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
+            // T29: a session must not message itself. Judged against the REAL caller
+            // id (`exec.agent.id`), never `args.from`, which the model can fill with
+            // anything. This runs after resolution but BEFORE any record, budget
+            // count, queue entry, delivery or wake — a refused self-send must leave
+            // no trace at all. The receipt suggests `s2s_schedule`, the supported way
+            // to give one's own session a later step.
+            if (isSelfTarget(exec, resolved.sessionId)) {
+              throw new S2sError(
+                'Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot send an s2s message to itself. To schedule a later step for your own session, use s2s_schedule.',
+                'S2S_SELF_TARGET',
+              )
+            }
+            const from = args.from ?? String(exec.agent?.id ?? 'unknown')
+            const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+            // Item ①/④: a fallback match must be visible on the receipt, and this is
+            // the receipt where it matters most — delivering to a session chosen by
+            // prefix is exactly where an unstated approximation would be harmful.
+            const matchNote = matchNoteOf(resolved)
+            // T29 observability: if the host gave no caller id, the self check could
+            // not run — say so on the receipt instead of implying it did.
+            const callerNote = selfCheckNote(exec)
+            // Record before delivering: the row must exist for the delivery to
+            // advance it, and a message that is lost mid-flight is exactly the one a
+            // status query later needs to find.
+            await noteLedger(ledger, 'record', function() {
+              return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+            })
+            let warn: string | undefined
+            if (budget !== undefined) {
+              // hop is 0 by design here: `maxHops` currently bounds only *forwarded*
+              // chains (messages carrying a hop count), not direct sends — the
+              // judgment is `hop >= maxHops`, so a direct send at hop 0 never trips
+              // it. For direct sends the active budget protections are the per-pair
+              // rate limit and (when configured) the semantic judge. Do not change
+              // this to hop=1 without a separate ruling: it would alter budget
+              // behavior, not just docs (T29 scope).
+              const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
+              if (result?.verdict === 'warn') warn = result.reason
+            }
+            if (resolved.state !== 'dormant') {
+              const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+              // `absent` means no live agent was there after all — the message was
+              // handed to nobody, so the ledger must keep it `queued`. Marking it
+              // `inboxed` on `absent` would report an acceptance that never happened,
+              // which is exactly the overclaiming invariant I1 forbids.
+              if (state !== 'absent') {
+                await noteLedger(ledger, 'markInboxed', function() { return ledger!.markInboxed(msgId, resolved.sessionId) })
+              }
+              // T9: the wording must not outrun the fact. `broker.deliver` returning
+              // a state means the message was handed to the live agent — it is NOT
+              // evidence the target's log now contains it, which is the only sense of
+              // "delivered" this project accepts (I1). The old line printed an
+              // unqualified `Delivered to …` even on the `absent` branch, i.e. for a
+              // message that reached nobody. Three outcomes now read differently.
+              if (state === 'absent') {
+                return { text: 'NOT delivered: "' + labelOf(resolved) + '" resolved but had no live agent (broker state=absent), so the message reached nobody (left queued).' + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+              }
+              const how = state === 'idle' ? 'as a follow-up turn' : 'by context injection (the target was mid-turn)'
+              return { text: 'Handed to "' + labelOf(resolved) + '"' + matchNote + ' ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+            }
+            if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' + callerNote }
+            const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
+            const queued = await lifecycle.queuedCount(resolved.sessionId)
+            // T9: `drain()` hands the queue to the agent, which is the same handover
+            // the live path reports — so the same restraint applies. The old wording
+            // said a bare "delivered", which a reader takes as "it is in the log".
+            const base = outcome === 'resumed'
+              ? 'Woke "' + labelOf(resolved) + '"' + matchNote + ' and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+              : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
+            return { text: base + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+          })()
+        } catch (error: unknown) {
+          // Only the T29 self refusal is rendered. Other S2sError codes keep their existing contract (e.g. the unsafe-id guard in s2s_resume is asserted to REJECT upstream), so this wrapper must not swallow them.
+          if (error instanceof S2sError && error.code === 'S2S_SELF_TARGET') return { text: '[' + error.code + '] ' + error.message }
+          throw error
         }
-        const from = args.from ?? String(exec.agent?.id ?? 'unknown')
-        const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
-        // Item ①/④: a fallback match must be visible on the receipt, and this is
-        // the receipt where it matters most — delivering to a session chosen by
-        // prefix is exactly where an unstated approximation would be harmful.
-        const matchNote = matchNoteOf(resolved)
-        // T29 observability: if the host gave no caller id, the self check could
-        // not run — say so on the receipt instead of implying it did.
-        const callerNote = selfCheckNote(exec)
-        // Record before delivering: the row must exist for the delivery to
-        // advance it, and a message that is lost mid-flight is exactly the one a
-        // status query later needs to find.
-        await noteLedger(ledger, 'record', function() {
-          return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
-        })
-        let warn: string | undefined
-        if (budget !== undefined) {
-          // hop is 0 by design here: `maxHops` currently bounds only *forwarded*
-          // chains (messages carrying a hop count), not direct sends — the
-          // judgment is `hop >= maxHops`, so a direct send at hop 0 never trips
-          // it. For direct sends the active budget protections are the per-pair
-          // rate limit and (when configured) the semantic judge. Do not change
-          // this to hop=1 without a separate ruling: it would alter budget
-          // behavior, not just docs (T29 scope).
-          const result = await budget.check(from, resolved.sessionId, 0, buildThread(broker, from, resolved.sessionId), modelOf(exec))
-          if (result?.verdict === 'warn') warn = result.reason
-        }
-        if (resolved.state !== 'dormant') {
-          const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
-          // `absent` means no live agent was there after all — the message was
-          // handed to nobody, so the ledger must keep it `queued`. Marking it
-          // `inboxed` on `absent` would report an acceptance that never happened,
-          // which is exactly the overclaiming invariant I1 forbids.
-          if (state !== 'absent') {
-            await noteLedger(ledger, 'markInboxed', function() { return ledger!.markInboxed(msgId, resolved.sessionId) })
-          }
-          // T9: the wording must not outrun the fact. `broker.deliver` returning
-          // a state means the message was handed to the live agent — it is NOT
-          // evidence the target's log now contains it, which is the only sense of
-          // "delivered" this project accepts (I1). The old line printed an
-          // unqualified `Delivered to …` even on the `absent` branch, i.e. for a
-          // message that reached nobody. Three outcomes now read differently.
-          if (state === 'absent') {
-            return { text: 'NOT delivered: "' + labelOf(resolved) + '" resolved but had no live agent (broker state=absent), so the message reached nobody (left queued).' + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
-          }
-          const how = state === 'idle' ? 'as a follow-up turn' : 'by context injection (the target was mid-turn)'
-          return { text: 'Handed to "' + labelOf(resolved) + '"' + matchNote + ' ' + how + ' — state=' + state + '. This means the agent accepted it, NOT that it is in the target\'s log yet; that is what s2s_reconcile (or s2s_history) confirms.' + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
-        }
-        if (lifecycle === undefined) return { text: '"' + labelOf(resolved) + '" is dormant and no lifecycle is configured; use s2s_resume with autoResume=allow to wake it.' }
-        const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
-        const queued = await lifecycle.queuedCount(resolved.sessionId)
-        // T9: `drain()` hands the queue to the agent, which is the same handover
-        // the live path reports — so the same restraint applies. The old wording
-        // said a bare "delivered", which a reader takes as "it is in the log".
-        const base = outcome === 'resumed'
-          ? 'Woke "' + labelOf(resolved) + '"' + matchNote + ' and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
-          : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
-        return { text: base + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
       },
     }),
     defineTool({
@@ -291,49 +318,61 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         from: { type: 'string', description: 'Sender label.' },
       },
       output: OUTPUT,
+      // T29 (review must-fix 2): same domain-error wrapper as s2s_message.
       execute: async function(args, exec) {
-        if (lifecycle === undefined) return { text: 's2s lifecycle is not configured: add a lifecycle config block to enable waking dormant sessions.' }
-        const resolved = await resolve(args.name, args.session_id)
-        if (resolved.kind === 'err') return { text: resolved.reason }
-        if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
-        // T29, same gate as s2s_message: waking one's own session is a self-send
-        // through the mailbox, so it is refused before any record, queue entry or
-        // resume — a dormant wake would otherwise fabricate lifecycle activity on
-        // the caller itself.
-        if (isSelfTarget(exec, resolved.sessionId)) {
-          return { text: '[S2S_SELF_TARGET] Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot wake itself. To schedule a later step for your own session, use s2s_schedule.' }
+        try {
+          return await (async function(): Promise<{ text: string }> {
+            if (lifecycle === undefined) return { text: 's2s lifecycle is not configured: add a lifecycle config block to enable waking dormant sessions.' }
+            const resolved = await resolve(args.name, args.session_id)
+            if (resolved.kind === 'err') return { text: resolved.reason }
+            if (resolved.kind !== 'ok') return { text: displayResolve(resolved) }
+            // T29, same gate as s2s_message: waking one's own session is a self-send
+            // through the mailbox, so it is refused before any record, queue entry or
+            // resume — a dormant wake would otherwise fabricate lifecycle activity on
+            // the caller itself.
+            if (isSelfTarget(exec, resolved.sessionId)) {
+              throw new S2sError(
+                'Refused: "' + labelOf(resolved) + '" is the calling session itself (caller id ' + String(exec.agent?.id) + '). A session cannot wake itself. To schedule a later step for your own session, use s2s_schedule.',
+                'S2S_SELF_TARGET',
+              )
+            }
+            S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
+            const from = args.from ?? String(exec.agent?.id ?? 'unknown')
+            const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+            // Record before queueing, exactly as `s2s_message` does. Without this the
+            // dormant `drain()` reaches `markInboxed()` with no row to advance: the
+            // wake was delivered, the ledger kept nothing, and `s2s_reconcile`
+            // reported `examined=0` forever. Measured on the real host — the target's
+            // log held `[s2s-lifecycle message] msgId=wake-…` while the ledger had
+            // zero rows for it. `markInboxed` must not be the one to create the row:
+            // that would fabricate a `record` and hide a missing one.
+            const recorded = await noteLedger(ledger, 'record', function() {
+              return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text })
+            })
+            const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
+            const queued = await lifecycle.queuedCount(resolved.sessionId)
+            // T9: same restraint as `s2s_message` — a wake hands the queue over, it
+            // does not put anything in the target's log on its own.
+            //
+            // The confirmation pointer is only offered when this process actually
+            // recorded the row. An unopened or absent ledger makes `record()` a
+            // no-op, and naming `s2s_reconcile` in that state would point the reader
+            // at a source that structurally cannot answer — the overclaim I1 forbids,
+            // one level removed (the claim is about the evidence, not the delivery).
+            // That is why the gate is `noteLedger`'s own return, not `ledger.isOpen`:
+            // an open ledger whose write threw is just as untracked.
+            const confirm = recorded
+              ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
+              : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
+            return { text: outcome === 'resumed'
+              ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm + selfCheckNote(exec)
+              : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' + selfCheckNote(exec) }
+          })()
+        } catch (error: unknown) {
+          // Only the T29 self refusal is rendered. Other S2sError codes keep their existing contract (e.g. the unsafe-id guard in s2s_resume is asserted to REJECT upstream), so this wrapper must not swallow them.
+          if (error instanceof S2sError && error.code === 'S2S_SELF_TARGET') return { text: '[' + error.code + '] ' + error.message }
+          throw error
         }
-        S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
-        const from = args.from ?? String(exec.agent?.id ?? 'unknown')
-        const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
-        // Record before queueing, exactly as `s2s_message` does. Without this the
-        // dormant `drain()` reaches `markInboxed()` with no row to advance: the
-        // wake was delivered, the ledger kept nothing, and `s2s_reconcile`
-        // reported `examined=0` forever. Measured on the real host — the target's
-        // log held `[s2s-lifecycle message] msgId=wake-…` while the ledger had
-        // zero rows for it. `markInboxed` must not be the one to create the row:
-        // that would fabricate a `record` and hide a missing one.
-        const recorded = await noteLedger(ledger, 'record', function() {
-          return ledger!.record({ msgId: msgId, from: from, to: args.name ?? args.session_id ?? resolved.sessionId, text: args.text })
-        })
-        const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
-        const queued = await lifecycle.queuedCount(resolved.sessionId)
-        // T9: same restraint as `s2s_message` — a wake hands the queue over, it
-        // does not put anything in the target's log on its own.
-        //
-        // The confirmation pointer is only offered when this process actually
-        // recorded the row. An unopened or absent ledger makes `record()` a
-        // no-op, and naming `s2s_reconcile` in that state would point the reader
-        // at a source that structurally cannot answer — the overclaim I1 forbids,
-        // one level removed (the claim is about the evidence, not the delivery).
-        // That is why the gate is `noteLedger`'s own return, not `ledger.isOpen`:
-        // an open ledger whose write threw is just as untracked.
-        const confirm = recorded
-          ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
-          : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
-        return { text: outcome === 'resumed'
-          ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm + selfCheckNote(exec)
-          : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' + selfCheckNote(exec) }
       },
     }),
     defineTool({
