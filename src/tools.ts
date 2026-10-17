@@ -14,10 +14,10 @@ import { S2sLifecycleService } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
-import { S2sError } from './error.ts'
+import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -218,20 +218,55 @@ function safeClassify(discovery: S2sDiscoveryService, filter: S2sArchiveFilterSt
   }
 }
 
-function targetPolicyRefusal(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, filter: S2sArchiveFilterState, classify: (info: { sessionId: string; origin?: string }) => S2sTargetClass): string | undefined {
+/**
+ * The T30 target-policy verdict (ruling 2026-10-17 §3), returned STRUCTURED.
+ *
+ * The refusal is `{code, message}` — the caller throws the `S2sError` itself.
+ * Deriving the code from `message.startsWith` is forbidden by `error.ts`
+ * ("route on code, never parsing message") and produced a second copy of every
+ * code at the throw sites in the first version; that is exactly the defect this
+ * shape removes.
+ *
+ * `recorded` distinguishes the two gate positions: the pre-check has recorded
+ * nothing, while the post-budget/post-record gate has a queued row that the
+ * caller must cancel — the refusal text must not claim "No message was
+ * recorded" for a message that WAS recorded.
+ */
+function targetPolicyVerdict(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, filter: S2sArchiveFilterState, classify: (info: { sessionId: string; origin?: string; headerUnproven?: boolean }) => S2sTargetClass, recorded: boolean): { code: S2sErrorCode; message: string } | undefined {
   if (filter.state === 'unavailable') {
-    return '[S2S_TARGET_POLICY_UNAVAILABLE] Refused: the target-legality filter could not answer (' + filter.reason
-      + '), so this delivery cannot be proven legitimate. No message was recorded, queued, delivered, or woken.'
+    return {
+      code: 'S2S_TARGET_POLICY_UNAVAILABLE',
+      message: 'Refused: the target-legality filter could not answer (' + filter.reason + '), so this delivery cannot be proven legitimate.'
+        + (recorded
+          ? ' The already-recorded queued row was cancelled with this reason on the row; if cancellation itself failed, the row remains queued and says so.'
+          : ' No message was recorded, queued, delivered, or woken.'),
+    }
   }
-  const cls = classify({ sessionId: resolved.sessionId, ...(resolved.origin === undefined ? {} : { origin: resolved.origin }) })
+  const cls = classify({ sessionId: resolved.sessionId, ...(resolved.origin === undefined ? {} : { origin: resolved.origin }), ...(resolved as { headerUnproven?: true }).headerUnproven === true ? { headerUnproven: true } : {} })
   if (cls === 'archived') {
-    return '[S2S_ARCHIVED_TARGET] Refused: "' + labelOf(resolved) + '" is an archived session. Archived sessions are not delivery targets; unarchive it first if it must receive messages.'
+    return {
+      code: 'S2S_ARCHIVED_TARGET',
+      message: 'Refused: "' + labelOf(resolved) + '" is an archived session. Archived sessions are not delivery targets; unarchive it first if it must receive messages.'
+        + (recorded ? ' The already-recorded queued row was cancelled with this reason on the row.' : ''),
+    }
   }
   if (cls === 'subagent') {
-    return '[S2S_SUBAGENT_TARGET] Refused: "' + labelOf(resolved) + '" is a subagent session (origin=subagent). Subagents are not independent conversation targets.'
+    return {
+      code: 'S2S_SUBAGENT_TARGET',
+      message: 'Refused: "' + labelOf(resolved) + '" is a subagent session (origin=subagent). Subagents are not independent conversation targets.'
+        + (recorded ? ' The already-recorded queued row was cancelled with this reason on the row.' : ''),
+    }
   }
   if (cls === 'unknown') {
-    return '[S2S_SUBAGENT_TARGET] Refused: "' + labelOf(resolved) + '" has an unrecognized session origin; the target policy cannot classify it as an ordinary peer.'
+    // NOT a subagent code: an unproven/unrecognized identity is a policy-
+    // availability fact, and the ruling requires the specific reason.
+    return {
+      code: 'S2S_TARGET_POLICY_UNAVAILABLE',
+      message: 'Refused: "' + labelOf(resolved) + '" has no provable session identity (header unreadable or unrecognized origin'
+        + ((resolved as { headerUnproven?: true }).headerUnproven === true ? ' — no trusted session header could be read' : '')
+        + '), so the target policy cannot classify it as an ordinary peer.'
+        + (recorded ? ' The already-recorded queued row was cancelled with this reason on the row.' : ''),
+    }
   }
   return undefined
 }
@@ -346,12 +381,13 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               )
             }
             // T30 pre-check: archive/subagent policy, before any side effect. Read
-            // fresh (registry state is never cached with the title).
+            // fresh (registry state is never cached with the title). `recorded=false`:
+            // nothing is on the ledger yet, so the verdict text says so.
             const filter = safeFilterState(discovery)
             // The classifier closes over the FRESH registry reading — a flip during the async budget is seen here.
             const classifyNow = safeClassify(discovery, filter)
-            const refusal = targetPolicyRefusal(resolved, filter, classifyNow)
-            if (refusal !== undefined) throw new S2sError(refusal, refusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : refusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
+            const verdict = targetPolicyVerdict(resolved, filter, classifyNow, false)
+            if (verdict !== undefined) throw new S2sError(verdict.message, verdict.code)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
             const msgId = 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
             // Item ①/④: a fallback match must be visible on the receipt, and this is
@@ -389,14 +425,28 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             // (ruling: 后置拒绝时 queued 行须显式 cancelled 或记录拒绝原因).
             // Fresh reading + fresh classifier: a flip during the async budget is
             // seen here, and the original exception escapes unchanged.
-            const refilter = discovery.archivedFilterState()
+            // `recorded=true`: a row IS on the ledger, so the verdict must not
+            // claim "no message was recorded".
+            const refilter = safeFilterState(discovery)
             const reclassify = safeClassify(discovery, refilter)
-            const rerefusal = targetPolicyRefusal(resolved, refilter, reclassify)
+            const rerefusal = targetPolicyVerdict(resolved, refilter, reclassify, true)
             if (rerefusal !== undefined) {
+              // The cancel result is OBSERVABLE either way (ruling: cancel 失败
+              // 不得被吞). Success is provable by the row's status; failure is
+              // written to the bounded diagnostics AND appended to the refusal.
+              let cancelOutcome: 'cancelled' | 'cancel-failed' | 'cancel-unavailable' = 'cancel-unavailable'
               if (ledger !== undefined && ledger.isOpen) {
-                await noteLedger(ledger, 'cancel', function() { return ledger.cancel(msgId, rerefusal) })
+                try {
+                  await ledger.cancel(msgId, rerefusal.message)
+                  cancelOutcome = 'cancelled'
+                } catch (error) {
+                  cancelOutcome = 'cancel-failed'
+                  recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
+                }
+              } else {
+                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
               }
-              throw new S2sError(rerefusal, rerefusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : rerefusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
+              throw new S2sError(rerefusal.message + ' [cancel outcome: ' + cancelOutcome + ']', rerefusal.code)
             }
             if (resolved.state !== 'dormant') {
               const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
@@ -469,8 +519,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             // T30 pre-check, same as s2s_message (fresh registry read).
             const filter = safeFilterState(discovery)
             const classifyNow = safeClassify(discovery, filter)
-            const refusal = targetPolicyRefusal(resolved, filter, classifyNow)
-            if (refusal !== undefined) throw new S2sError(refusal, refusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : refusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
+            const verdict = targetPolicyVerdict(resolved, filter, classifyNow, false)
+            if (verdict !== undefined) throw new S2sError(verdict.message, verdict.code)
             S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
             // T29: same skipped-check record as s2s_message — a wake that proceeds
@@ -489,14 +539,24 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             })
             // T30 post-record re-check: refuse with the queued row explicitly
             // cancelled (never retryable ghost work). Fresh reading + classifier.
-            const refilter = discovery.archivedFilterState()
+            // `recorded=true`: a row IS on the ledger; cancel outcome is observable.
+            const refilter = safeFilterState(discovery)
             const reclassify = safeClassify(discovery, refilter)
-            const rerefusal = targetPolicyRefusal(resolved, refilter, reclassify)
+            const rerefusal = targetPolicyVerdict(resolved, refilter, reclassify, true)
             if (rerefusal !== undefined) {
+              let cancelOutcome: 'cancelled' | 'cancel-failed' | 'cancel-unavailable' = 'cancel-unavailable'
               if (ledger !== undefined && ledger.isOpen) {
-                await noteLedger(ledger, 'cancel', function() { return ledger.cancel(msgId, rerefusal) })
+                try {
+                  await ledger.cancel(msgId, rerefusal.message)
+                  cancelOutcome = 'cancelled'
+                } catch (error) {
+                  cancelOutcome = 'cancel-failed'
+                  recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
+                }
+              } else {
+                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
               }
-              throw new S2sError(rerefusal, rerefusal.startsWith('[S2S_TARGET_POLICY_UNAVAILABLE]') ? 'S2S_TARGET_POLICY_UNAVAILABLE' : rerefusal.startsWith('[S2S_ARCHIVED_TARGET]') ? 'S2S_ARCHIVED_TARGET' : 'S2S_SUBAGENT_TARGET')
+              throw new S2sError(rerefusal.message + ' [cancel outcome: ' + cancelOutcome + ']', rerefusal.code)
             }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
             const queued = await lifecycle.queuedCount(resolved.sessionId)

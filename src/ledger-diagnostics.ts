@@ -134,6 +134,13 @@ export interface LedgerDiagnostics {
    * remains the only durable record of a delivery.
    */
   untrackedDeliveries?: UntrackedDelivery[]
+  /**
+   * T30: the last post-gate refusal whose queued-row cancellation did not
+   * provably succeed (cancel threw, or the ledger was not open). The row then
+   * REMAINS `queued` — this field is the only process-level trace that a refusal
+   * left work behind. Read back by `s2s_status`.
+   */
+  lastSelfRefusalCancelFailure?: SelfRefusalCancelFailure
 }
 
 /** One `markInboxed()` that had nothing to advance. */
@@ -148,6 +155,32 @@ export interface UntrackedDelivery {
 
 /** Shared, mutable handshake record. */
 export const ledgerDiagnostics: LedgerDiagnostics = {}
+
+/**
+ * T30: the LAST post-gate refusal whose queued-row cancellation did NOT provably
+ * succeed. Written by the delivery tools when `ledger.cancel` throws or the
+ * ledger is not open — the row then REMAINS queued, and this is the only trace
+ * that a refusal left work behind (G9: no silent degradation).
+ */
+export interface SelfRefusalCancelFailure {
+  readonly msgId: string
+  readonly at: number
+  readonly error: string
+}
+
+// Bounded by design: only the most recent failure matters for the status line;
+// older ones are visible on their rows (status stays `queued` with the refusal
+// in `lastError`).
+
+/**
+ * Record a failed/unavailable queued-row cancellation after a target-policy
+ * refusal. Never throws.
+ */
+export function recordSelfRefusalCancelFailure(entry: SelfRefusalCancelFailure): void {
+  try {
+    ledgerDiagnostics.lastSelfRefusalCancelFailure = entry
+  } catch {}
+}
 
 /**
  * Self-target check skipped because the host gave no caller id (T29).

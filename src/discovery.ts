@@ -47,6 +47,10 @@ export interface S2sSessionInfo {
    *  host types this as `'subagent' | undefined`; FS fallback reads it from the
    *  real log header, never from the title cache. */
   readonly origin?: string
+  /** T30: no TRUSTED session header could be read on the FS path (missing/
+   *  corrupt/mismatched log). The target's identity is unprovable and the
+   *  classifier must fail closed (`unknown`), never assume an ordinary session. */
+  readonly headerUnproven?: true
 }
 
 export type S2sCandidate = Pick<S2sSessionInfo, 'sessionId' | 'title' | 'workspaceDir' | 'state'>
@@ -239,14 +243,18 @@ export class S2sDiscoveryService extends Service {
    *
    * Archived membership is checked first and wins over subagent (ruling §2).
    * The header `origin` type has exactly one non-undefined value (`subagent`);
-   * anything else unexpected is `unknown`, never silently "eligible".
+   * anything else unexpected is `unknown`, never silently "eligible". A target
+   * whose header could not be proven (FS path: missing/corrupt/mismatched log)
+   * is ALSO `unknown` — an unreadable identity must not become a legal target.
    *
    * @param sessionId - canonical target id.
    * @param headerOrigin - the session header's `origin`, when the listing could read it.
    * @param archivedIds - the fresh archived set, when the registry answered.
+   * @param headerUnproven - true when no trusted session header could be read.
    */
-  classifyTarget(sessionId: string, headerOrigin: string | undefined, archivedIds: readonly string[] | undefined): S2sTargetClass {
+  classifyTarget(sessionId: string, headerOrigin: string | undefined, archivedIds: readonly string[] | undefined, headerUnproven?: boolean): S2sTargetClass {
     if (archivedIds !== undefined && archivedIds.includes(sessionId)) return 'archived'
+    if (headerUnproven === true) return 'unknown'
     if (headerOrigin === undefined) return 'eligible'
     if (headerOrigin === 'subagent') return 'subagent'
     return 'unknown'
@@ -367,7 +375,7 @@ export class S2sDiscoveryService extends Service {
     // with S2S_TARGET_POLICY_UNAVAILABLE instead of pretending eligibility.
     const filter = this.archivedFilterState()
     const archivedIds = filter.state === 'available' ? filter.ids : undefined
-    const classify = (info: S2sSessionInfo): S2sTargetClass => this.classifyTarget(info.sessionId, info.origin, archivedIds)
+    const classify = (info: S2sSessionInfo): S2sTargetClass => this.classifyTarget(info.sessionId, info.origin, archivedIds, info.headerUnproven)
     if (sessionId !== undefined && sessionId.length > 0) {
       // L0 fast path: a cached entry that knows its workspace answers with no
       // enumeration and no read at all. Keyed by *normalized* id so the canonical
@@ -410,21 +418,19 @@ export class S2sDiscoveryService extends Service {
       }
     }
 
-    // L0 fast path for name addressing: exactly one cached session owns this
-    // name, so answer without enumerating. Two or more cached owners means the
-    // name may be ambiguous — fall through to the corpus for a real verdict.
+    // L0 cache for name addressing: the cache warms the corpus (titles come back
+    // without log reads), but it can NO LONGER answer by itself — T30 requires
+    // warm and cold name resolution to run the SAME priority order
+    // (eligible exact → eligible prefix → excluded diagnostic), and the cache
+    // holds no identity fields to classify its single owner with. The measured
+    // defect shape: an archived owner cached under a title that a NEW eligible
+    // session now also carries — warm resolved the archived one while cold
+    // preferred the live target. The single-owner short-circuit is therefore
+    // gone; the corpus pass below consumes the warm titles.
     const needle = name?.trim().toLowerCase()
     if (needle !== undefined && needle.length > 0) {
       const owners = this.cache.findByName(needle)
-      if (owners.length === 1) {
-        const cached = this.cache.get(owners[0]!, this.now())
-        if (cached?.workspaceDir !== undefined) {
-          // T30: same rule as the id fast path — the cache cannot classify, so
-          // the authoritative read decides eligibility and the class.
-          const authoritative = await this.collectById(owners[0]!)
-          if (authoritative !== undefined) return toOk(authoritative, 'exact', classify)
-        }
-      } else if (owners.length > 1) {
+      if (owners.length > 1) {
         // E2: record the collision so it is not answered from cache again.
         for (const owner of owners) this.cache.markAmbiguous(owner, this.now())
       }
@@ -435,34 +441,35 @@ export class S2sDiscoveryService extends Service {
     // T30: titles match against the ELIGIBLE universe first, so an archived
     // session sharing a title cannot shadow a live target.
     const matches = infos.filter(info => info.title?.trim().toLowerCase() === needle && classify(info) === 'eligible')
-    const excludedMatches = infos.filter(info => info.title?.trim().toLowerCase() === needle && classify(info) !== 'eligible')
+    const excludedExact = infos.filter(info => info.title?.trim().toLowerCase() === needle && classify(info) !== 'eligible')
     if (matches.length > 1) {
       // E2: remember the ambiguity so the cache never resolves this name alone.
       for (const match of matches) this.cache.markAmbiguous(match.sessionId, this.now())
       return { kind: 'ambiguous', name: name ?? '', candidates: matches.map(toCandidate) }
     }
     if (matches.length === 1) return toOk(matches[0]!, 'exact', classify)
-    if (excludedMatches.length > 0) {
-      // The needle hit only excluded targets: resolve the identity anyway (for a
-      // stable refusal code) when exactly one, else ambiguous — but NEVER return
-      // an ok for them.
-      if (excludedMatches.length === 1) return toOk(excludedMatches[0]!, 'exact', classify)
-      return { kind: 'ambiguous', name: name ?? '', candidates: excludedMatches.map(toCandidate) }
-    }
 
     // Item ①: exact failed. Accept ONLY a title that *starts with* the needle,
     // and only when exactly one candidate does. No arbitrary `contains` match —
     // its false-hit risk is not supported as safe by current evidence. The
     // receipt reports `matchedBy: 'title-prefix'` so the caller can tell an
-    // approximation from an exact hit. Prefix candidates also come from the
-    // eligible universe first; an excluded prefix hit resolves its identity for
-    // refusal but is never ok.
+    // approximation from an exact hit.
+    //
+    // T30 priority order is the SAME warm and cold (review blocker 2):
+    //   1. eligible exact        (above)
+    //   2. eligible title-prefix (here)
+    //   3. excluded targets      (diagnostic identity for a stable refusal code
+    //     — an excluded exact/prefix hit resolves to a refusal, never an ok), so
+    //     a live session titled as a prefix of an archived one is preferred over
+    //     that archived one on BOTH cache states.
     const eligiblePrefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true && classify(info) === 'eligible')
     if (eligiblePrefixed.length === 1) return toOk(eligiblePrefixed[0]!, 'title-prefix', classify)
     if (eligiblePrefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: eligiblePrefixed.map(toCandidate) }
+
     const excludedPrefixed = infos.filter(info => info.title?.trim().toLowerCase().startsWith(needle) === true)
-    if (excludedPrefixed.length === 1) return toOk(excludedPrefixed[0]!, 'title-prefix', classify)
-    if (excludedPrefixed.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: excludedPrefixed.map(toCandidate) }
+    const excludedUniverse = excludedExact.length > 0 ? excludedExact : excludedPrefixed
+    if (excludedUniverse.length === 1) return toOk(excludedUniverse[0]!, excludedExact.length > 0 ? 'exact' : 'title-prefix', classify)
+    if (excludedUniverse.length > 1) return { kind: 'ambiguous', name: name ?? '', candidates: excludedUniverse.map(toCandidate) }
     return { kind: 'not-found', name: name ?? '', candidates: approxCandidates(infos, needle), totalCandidates: infos.length }
   }
 
@@ -586,31 +593,65 @@ export class S2sDiscoveryService extends Service {
       }
       // T30: identity must come from the session's REAL header on disk — the
       // title cache stores no identity fields, and guessing from a title or the
-      // directory name is exactly what the ruling forbids.
-      const origin = await this.readOriginFromFs(join(root, workspaceDir, entry))
-      return { sessionId, ...(title === undefined ? {} : { title }), workspaceDir, state: this.stateOf(sessionId), ...(origin === undefined ? {} : { origin }) }
+      // directory name is exactly what the ruling forbids. The reading is
+      // three-valued: an origin string, "no origin field on a PROVEN session
+      // header" (an ordinary session), or `undefined` = no trusted header could
+      // be read (missing/corrupt — the caller must classify `unknown`).
+      const identity = await this.readOriginFromFs(join(root, workspaceDir, entry), sessionId)
+      return {
+        sessionId,
+        ...(title === undefined ? {} : { title }),
+        workspaceDir,
+        state: this.stateOf(sessionId),
+        ...(identity.origin === undefined ? {} : { origin: identity.origin }),
+        ...(identity.headerProven ? {} : { headerUnproven: true } as { headerUnproven: true }),
+      }
     })
   }
 
   /**
-   * Read `header.origin` from the session log on disk (T30 FS fallback).
+   * Read the session identity from the log on disk (T30 FS fallback).
    *
-   * `session.jsonl.zstd` (or the plain `.jsonl`) opens with the session header,
-   * whose `origin` field the host writes for subagent-origin sessions. Returns
-   * `undefined` when the file is absent or the header has no origin — an
-   * ordinary session.
+   * The real session log opens with a **top-level** header record — measured on
+   * this host: `{type:"session", version, id, createdAt, cwd, parentSession,
+   * isSeeded, origin, delegationDepth, agentPreset}` (the fields live on the
+   * record itself, NOT under `data`). The first record must be a `session`
+   * record whose id matches the directory name; anything else — missing file,
+   * undecodable frame, wrong type, missing/mismatched id — is NOT a trusted
+   * header, and the caller treats it as `unknown` (fail-closed) instead of
+   * assuming an ordinary session.
+   *
+   * Search order: v4 zstd, legacy zstd, plain jsonl — a valid top-level header
+   * in the newest format wins; a format whose header cannot be proven is NOT
+   * silently retried against older guesses, because "no trusted header" is the
+   * finding.
+   *
+   * @returns `{ origin, headerProven }` — `origin` is the header's origin field
+   *   (undefined = ordinary session); `headerProven` false means no trusted
+   *   session header was read and the identity is unknown.
    */
-  private async readOriginFromFs(sessionDir: string): Promise<string | undefined> {
-    try {
-      const z = await readFile(join(sessionDir, 'session.v4.jsonl.zstd')).catch(() => readFile(join(sessionDir, 'session.jsonl.zstd')).catch(() => undefined))
-      if (z !== undefined) {
-        const origin = originFromZstd(z)
-        if (origin !== undefined) return origin
-      }
-      const plain = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').catch(() => undefined)
-      if (plain !== undefined) return originFromJsonl(plain)
-    } catch {}
-    return undefined
+  private async readOriginFromFs(sessionDir: string, expectedBareId: string): Promise<{ origin: string | undefined; headerProven: boolean }> {
+    const paths = [
+      join(sessionDir, 'session.v4.jsonl.zstd'),
+      join(sessionDir, 'session.jsonl.zstd'),
+    ]
+    for (const p of paths) {
+      const z = await readFile(p).catch(() => undefined)
+      if (z === undefined) continue
+      const header = headerFromZstd(z, expectedBareId)
+      if (header !== undefined) return { origin: header.origin, headerProven: true }
+      // A present-but-unprovable header: do NOT fall through to other formats or
+      // guesses — report unknown.
+      return { origin: undefined, headerProven: false }
+    }
+    const plain = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').catch(() => undefined)
+    if (plain !== undefined) {
+      const header = headerFromJsonl(plain, expectedBareId)
+      if (header !== undefined) return { origin: header.origin, headerProven: true }
+      return { origin: undefined, headerProven: false }
+    }
+    // No log at all.
+    return { origin: undefined, headerProven: false }
   }
 
   private stateOf(sessionId: string): S2sSessionInfo['state'] {
@@ -833,30 +874,61 @@ function titleFromJsonl(text: string): string | undefined {
 }
 
 /**
- * The `origin` field of a session's header record, read from the log on disk
- * (T30 FS fallback). Unlike titles, the header is written once at session
- * creation, so the FIRST occurrence is authoritative and later ones are not
- * expected; scanning all lines is harmless and keeps the helper shape-compatible
- * with `titleFromJsonl`.
+ * The trusted session header, read from the first record of a log (T30).
+ *
+ * Measured real shape (top-level fields, no `data` wrapper):
+ * `{type:"session", version, id, createdAt, cwd, parentSession, isSeeded,
+ *   origin, delegationDepth, agentPreset}`. `origin` is present only for
+ * subagent-origin sessions.
  */
-function originFromJsonl(text: string): string | undefined {
+interface S2sSessionHeaderReading {
+  /** The header's origin field; undefined on an ordinary (non-subagent) session. */
+  readonly origin: string | undefined
+  /** The header's own id — must match the directory the log was found in. */
+  readonly id: string
+}
+
+/**
+ * Extract and VERIFY the top-level session header from one frame of JSONL.
+ *
+ * Verification is what makes the reading trustworthy: the first record must be
+ * a `session` record, carry an id, and that id must equal the expected bare id
+ * (the directory name). A non-session first record, a missing id, or an id
+ * mismatch yields `undefined` — the caller then reports the identity as
+ * unknown rather than pretending the session is ordinary. `data.origin` is
+ * deliberately NOT consulted: identity lives on the record itself.
+ */
+export function headerFromJsonl(text: string, expectedBareId: string): S2sSessionHeaderReading | undefined {
   for (const line of text.split('\n')) {
     if (line.length === 0) continue
-    try {
-      const event = JSON.parse(line) as { type?: string; data?: { origin?: unknown } }
-      if (typeof event.data?.origin === 'string' && event.data.origin.length > 0) return event.data.origin
-    } catch {}
+    let event: { type?: unknown; id?: unknown; origin?: unknown }
+    try { event = JSON.parse(line) } catch { continue }
+    if (event.type !== 'session') return undefined
+    if (typeof event.id !== 'string') return undefined
+    if (normalizeId(event.id) !== expectedBareId) return undefined
+    return {
+      origin: typeof event.origin === 'string' && event.origin.length > 0 ? event.origin : undefined,
+      id: event.id,
+    }
   }
   return undefined
 }
 
-/** `originFromJsonl` over a concatenated-zstd log; undefined if no header says. */
-function originFromZstd(buf: Buffer): string | undefined {
-  const { frames } = scanZstdFrames(buf)
+/** `headerFromJsonl` over a concatenated-zstd log (first frame that parses). */
+export function headerFromZstd(buf: Buffer, expectedBareId: string): S2sSessionHeaderReading | undefined {
+  let frames: ZstdFrame[]
+  try {
+    frames = scanZstdFrames(buf).frames
+  } catch {
+    // A structurally invalid log is an UNPROVABLE header (T30 fail-closed), not
+    // a crash: the caller reports the identity as unknown.
+    return undefined
+  }
   for (const frame of frames) {
-    const text = zstdDecompressSync(buf.subarray(frame.start, frame.end)).toString('utf8')
-    const found = originFromJsonl(text)
-    if (found !== undefined) return found
+    let text: string
+    try { text = zstdDecompressSync(buf.subarray(frame.start, frame.end)).toString('utf8') } catch { continue }
+    const header = headerFromJsonl(text, expectedBareId)
+    if (header !== undefined) return header
   }
   return undefined
 }
