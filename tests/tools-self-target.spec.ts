@@ -14,10 +14,17 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { S2sError } from '../src/error.ts'
 import { buildTools } from '../src/tools.ts'
+import { resetSelfCheckSkipped } from '../src/ledger-diagnostics.ts'
+
+// The skipped-check record is a module-level singleton: reset around every case
+// so one case's entry cannot turn another case's "nothing recorded" assertion
+// into a false pass (same discipline as ledgerDiagnostics.untrackedDeliveries).
+beforeEach(() => { resetSelfCheckSkipped() })
+afterEach(() => { resetSelfCheckSkipped() })
 
 type Tool = { name: string; execute: (args: any, exec: any) => Promise<{ text: string }> }
 
@@ -49,13 +56,23 @@ function harness(target: string, opts: { state?: string; lifecycle?: boolean; bu
     list: vi.fn(async () => [] as any[]),
     resolve: opts.resolve ?? vi.fn(async () => ({ kind: 'ok', sessionId: target, title: 'a', state: opts.state ?? IDLE, workspaceDir: 'ws' }) as any),
   }
-  const ledger = { record: spies.record, markInboxed: spies.markInboxed }
+  const ledger = {
+    record: spies.record,
+    markInboxed: spies.markInboxed,
+    // s2s_status renders the sweep block from this; the stub just needs the
+    // shape (the status suite asserts its own values elsewhere).
+    sweepStatus: { armed: false, intervalMs: 3600000, landedDeadlineMs: 86400000 },
+  }
   const defs = buildTools({
+    // `s2s_status` attaches its sampler through ctx.on; without a context it
+    // throws before rendering anything (observed when the status read-back case
+    // was first added).
+    ctx: { on: vi.fn(() => vi.fn()) },
     broker,
     discovery,
     ledger,
     ...(opts.budget === false ? {} : { budget: { check: spies.budgetCheck } }),
-    ...(opts.lifecycle === false ? {} : { lifecycle: { queueForDormant: spies.queueForDormant, queuedCount: spies.queuedCount } }),
+    ...(opts.lifecycle === false ? {} : { lifecycle: { queueForDormant: spies.queueForDormant, queuedCount: spies.queuedCount, resumeReport: vi.fn(() => undefined), resumeReports_: vi.fn(() => []) } }),
   } as any)
   const by = (n: string) => defs.find((d) => d.name === n) as unknown as Tool
   return { by, spies }
@@ -206,6 +223,62 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     expect(ctxHarness.spies.record).toHaveBeenCalledTimes(1)
   })
 
+  it('★ resume RESUMED path carries the marker (the real resume receipt)', async () => {
+    // Correction of the previous round: the marker cases above exercised
+    // s2s_message's dormant branch, NOT s2s_resume's own receipt.
+    const { by, spies } = await harness(SIBLING, { state: 'dormant' })
+    const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, {})
+    expect(out.text).toContain('resumed and the queued message(s)')
+    expect(out.text).toContain('caller identity unavailable')
+    expect(spies.queueForDormant).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ resume lifecycle-missing branch returns BEFORE resolution (no marker applies)', async () => {
+    // Correction of my own over-claim: s2s_resume checks lifecycle BEFORE
+    // resolving, so this branch has no resolution, no side effects and — by the
+    // ruling's own wording ("all post-resolution returns") — no marker
+    // requirement. The post-resolution no-lifecycle twin is s2s_message's, and
+    // it IS covered (see the message suite).
+    const { by, spies } = await harness(SIBLING, { state: 'dormant', lifecycle: false })
+    const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, {})
+    expect(out.text).toContain('lifecycle is not configured')
+    expect(out.text).not.toContain('caller identity unavailable')
+    expect(spies.record).not.toHaveBeenCalled()
+  })
+
+  it('★ a THROWN queue error still leaves the skipped-check evidence readable', async () => {
+    // The whole point of the bounded diagnostic: budget/queue/delivery can throw
+    // after resolution, erasing the receipt. The record must survive.
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const harness1 = harness(SIBLING, { state: 'dormant' })
+    harness1.spies.queueForDormant.mockRejectedValue(new Error('queue exploded'))
+    await expect(harness1.by('s2s_message').execute({ name: 'a', text: 'x' }, {})).rejects.toThrow('queue exploded')
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(1)
+    expect(skipped[0]!.tool).toBe('s2s_message')
+    expect(skipped[0]!.target).toBe(SIBLING)
+  })
+
+  it('★ s2s_status reads the skipped record back, and identity-present sends do not record it', async () => {
+    const { resetSelfCheckSkipped, readSelfCheckSkipped } = await import('../src/ledger-diagnostics.ts')
+    resetSelfCheckSkipped()
+    const { by, spies } = await harness(SIBLING, { state: 'dormant' })
+    // A send WITH identity: no skipped record.
+    await by('s2s_message').execute({ name: 'a', text: 'x' }, { agent: { id: SELF } })
+    expect(readSelfCheckSkipped().length).toBe(0)
+    // A send WITHOUT identity: one record, readable via s2s_status.
+    await by('s2s_message').execute({ name: 'a', text: 'x' }, {})
+    const skipped = readSelfCheckSkipped()
+    expect(skipped.length).toBe(1)
+    const status = by('s2s_status')
+    const out = await status.execute({}, { agent: { id: SELF } })
+    expect(out.text).toContain('self-target checks SKIPPED')
+    expect(out.text).toContain('s2s_message -> ' + SIBLING)
+    expect(spies.record).toHaveBeenCalledTimes(2) // both sends recorded rows
+    resetSelfCheckSkipped()
+  })
+
   it('wakes a sibling dormant session as before (no regression)', async () => {
     const { by, spies } = await harness(SIBLING, { state: 'dormant' })
     const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, { agent: { id: SELF } })
@@ -232,7 +305,7 @@ describe('T29 integration: real discovery in the loop (review must-fix 3)', () =
     await ctx.plugin(S2sDiscoveryService, { cachePath: join(dir, 'c.json') })
     const discovery = ctx.get('s2sDiscovery')
     const deliver = vi.fn(() => IDLE)
-    const ledger = { record: vi.fn(async () => true), markInboxed: vi.fn(async () => undefined) }
+    const ledger = { record: vi.fn(async () => true), markInboxed: vi.fn(async () => undefined), sweepStatus: { armed: false, intervalMs: 3600000, landedDeadlineMs: 86400000 } }
     const defs = buildTools({ broker: { deliver, history: vi.fn(() => []) }, discovery, ledger } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
     const out = await msg.execute({ session_id: '9f4b6738', text: 'x' }, { agent: { id: SELF } })
@@ -262,7 +335,7 @@ describe('T29 integration: real discovery in the loop (review must-fix 3)', () =
     await ctx.plugin(S2sDiscoveryService, { cachePath: join(dir, 'c.json') })
     const discovery = ctx.get('s2sDiscovery')
     const deliver = vi.fn(() => IDLE)
-    const ledger = { record: vi.fn(async () => true), markInboxed: vi.fn(async () => undefined) }
+    const ledger = { record: vi.fn(async () => true), markInboxed: vi.fn(async () => undefined), sweepStatus: { armed: false, intervalMs: 3600000, landedDeadlineMs: 86400000 } }
     const defs = buildTools({ broker: { deliver, history: vi.fn(() => []) }, discovery, ledger } as any)
     const msg = defs.find((d) => d.name === 's2s_message') as unknown as Tool
     const out = await msg.execute({ name: '甲', session_id: '9f4b6738', text: 'x' }, { agent: { id: SELF } })

@@ -149,6 +149,59 @@ export interface UntrackedDelivery {
 /** Shared, mutable handshake record. */
 export const ledgerDiagnostics: LedgerDiagnostics = {}
 
+/**
+ * Self-target check skipped because the host gave no caller id (T29).
+ *
+ * The ruling allows the explicit fail-open only if it is observable on every
+ * path that actually sends or queues. The receipt covers the happy return, but
+ * budget/queue/delivery can THROW after resolution — and a thrown error would
+ * otherwise erase the receipt. This bounded process-level record survives that:
+ * written before the first side effect, read back by `s2s_status`.
+ *
+ * Bounded like `untrackedDeliveries`: this exists so a reader can see that the
+ * check was skipped, when, and for which target — not as an audit log. No
+ * message text is ever recorded here.
+ */
+export interface SelfCheckSkippedEvent {
+  /** Tool whose send proceeded without a self check. */
+  tool: string
+  /** Canonical target id the (unchecked) message was addressed to. */
+  target: string
+  /** Epoch ms. */
+  at: number
+}
+
+const MAX_SELF_CHECK_SKIPPED = 10
+
+/** Bounded record of skipped self-target checks. Read by `s2s_status`. */
+const selfCheckSkipped: SelfCheckSkippedEvent[] = []
+
+/**
+ * Record that a send/queue proceeded without a self-target check because the
+ * caller id was unavailable. Never throws — called on the delivery path.
+ *
+ * @param tool - the tool name.
+ * @param target - the resolved target id.
+ */
+export function recordSelfCheckSkipped(tool: string, target: string): void {
+  try {
+    selfCheckSkipped.push({ tool, target, at: Date.now() })
+    while (selfCheckSkipped.length > MAX_SELF_CHECK_SKIPPED) selfCheckSkipped.shift()
+  } catch {
+    // Diagnostics never break the caller.
+  }
+}
+
+/** Read-only view for `s2s_status`: the bounded list itself (latest last). */
+export function readSelfCheckSkipped(): readonly SelfCheckSkippedEvent[] {
+  return selfCheckSkipped
+}
+
+/** Test isolation: clear the bounded record (module-level singleton, like untrackedDeliveries). */
+export function resetSelfCheckSkipped(): void {
+  selfCheckSkipped.length = 0
+}
+
 // Sampled once, at module load: `process.uptime()` counts from process start, so
 // this is the process's own beginning and no earlier reading can precede it.
 // Wrapped because a hostile/odd embedding may not expose `process`.

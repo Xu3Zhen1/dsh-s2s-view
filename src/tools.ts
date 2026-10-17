@@ -16,7 +16,7 @@ import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, type S2sLedger } from './ledger.ts'
 import { S2sError } from './error.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics, recordFirstS2sToolCall, recordProbe } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -249,8 +249,12 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             // prefix is exactly where an unstated approximation would be harmful.
             const matchNote = matchNoteOf(resolved)
             // T29 observability: if the host gave no caller id, the self check could
-            // not run — say so on the receipt instead of implying it did.
+            // not run — say so on the receipt AND in the bounded process-level
+            // diagnostics, so a budget/queue/delivery throw cannot erase the fact
+            // that an unchecked send proceeded (review: the error path must keep
+            // the skipped evidence; the exception itself is re-thrown unchanged).
             const callerNote = selfCheckNote(exec)
+            if (callerNote.length > 0) recordSelfCheckSkipped('s2s_message', resolved.sessionId)
             // Record before delivering: the row must exist for the delivery to
             // advance it, and a message that is lost mid-flight is exactly the one a
             // status query later needs to find.
@@ -338,6 +342,9 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             }
             S2sLifecycleService.assertSafeSessionId(resolved.sessionId)
             const from = args.from ?? String(exec.agent?.id ?? 'unknown')
+            // T29: same skipped-check record as s2s_message — a wake that proceeds
+            // without identity evidence must be visible even if queue/record throws.
+            if (selfCheckNote(exec).length > 0) recordSelfCheckSkipped('s2s_resume', resolved.sessionId)
             const msgId = 'wake-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
             // Record before queueing, exactly as `s2s_message` does. Without this the
             // dormant `drain()` reaches `markInboxed()` with no row to advance: the
@@ -420,6 +427,19 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             lines.push('  ' + u.msgId + ' -> ' + u.resolvedSessionId + '  at=' + new Date(u.at).toISOString())
           }
           lines.push('  These appear in the target\'s session log but are absent from the ledger, so s2s_reconcile cannot see them. Read them with s2s_history.')
+        }
+
+        // T29: sends that proceeded WITHOUT a self-target check (caller id
+        // unavailable at the time). Printed only when non-empty, for the same
+        // reason as the block above. This is the surviving evidence when a
+        // budget/queue/delivery throw erased the receipt.
+        const skipped = readSelfCheckSkipped()
+        if (skipped.length > 0) {
+          lines.push('self-target checks SKIPPED (caller identity unavailable): ' + skipped.length
+            + ' send(s)/queue(s) proceeded without a self check — latest ' + (skipped.length > 0 ? new Date(skipped[skipped.length - 1]!.at).toISOString() : '') + ':')
+          for (const s of skipped) {
+            lines.push('  ' + s.tool + ' -> ' + s.target + '  at=' + new Date(s.at).toISOString())
+          }
         }
 
         // History durability: T11 gave history a durable read path, so the old
