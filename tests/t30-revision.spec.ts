@@ -22,6 +22,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { buildTools } from '../src/tools.ts'
 import { S2sLedger } from '../src/ledger.ts'
 import { S2sDiscoveryService, headerFromJsonl, headerFromZstd } from '../src/discovery.ts'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as sqliteStorage from '@deepseek-ai/dsh-storage-sqlite'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
@@ -236,22 +237,22 @@ describe('T30 blocker 2: warm and cold name resolution share one priority order'
   })
 })
 
-describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
-  async function realLedger() {
-    const root = await mkdtemp(join(tmpdir(), 's2s-cancel-'))
-    dirs.push(root)
-    const ctx = new Context()
-    await ctx.plugin(Storage)
-    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
-    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
-    ctx.storage.mount('domain', facility)
-    ctx.provide('storageDomain', facility as never)
-    const ledger = new S2sLedger(ctx)
-    await ledger.open()
-    disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
-    return { ledger, root }
-  }
+async function realLedger() {
+  const root = await mkdtemp(join(tmpdir(), 's2s-cancel-'))
+  dirs.push(root)
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+  const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+  ctx.storage.mount('domain', facility)
+  ctx.provide('storageDomain', facility as never)
+  const ledger = new S2sLedger(ctx)
+  await ledger.open()
+  disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
+  return { ledger, root, ctx }
+}
 
+describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
   it('★ queued → cancelled with the reason on the row (revision/lastError)', async () => {
     const { ledger } = await realLedger()
     await ledger.record({ msgId: 'm-1', from: CALLER, to: PEER, text: 't' })
@@ -357,6 +358,92 @@ describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
     expect(row!.lastError).toContain('archived') // the refusal reason, verbatim
   })
 })
+
+describe('T30 drain-refusal accounting: REAL lifecycle, real msgIds, every entry point', () => {
+  interface Entry { msgId: string; from: string; text: string; createdAt: number }
+
+  async function realLifecycleHarness(opts: { archived?: string[] } = {}) {
+    const { ledger, root, ctx } = await realLedger()
+    // A live agent with spied handover methods, found by the service.
+    const agentStub = { status: 'idle', followup: vi.fn(() => undefined), inject: vi.fn(() => undefined) }
+    ctx.provide('agents', {
+      get: (id: unknown) => (String(id) === ARCHIVED || String(id) === PEER ? agentStub : undefined),
+      resume: vi.fn(async () => ({})),
+    } as any)
+    const live = { ids: opts.archived ?? [] }
+    const { S2sLifecycleService } = await import('../src/lifecycle.ts')
+    const lifecycle = new S2sLifecycleService(ctx, {
+      mailboxDir: join(root, 'mailboxes'),
+      autoResume: 'allow',
+    })
+    // The SAME shared policy verdict the tools use (dispatch on the live set).
+    lifecycle.setTargetPolicyCheck(async function(sessionId) {
+      if (live.ids.includes(sessionId)) return { code: 'S2S_ARCHIVED_TARGET' as const, message: 'the session is archived' }
+      return undefined
+    })
+    return { lifecycle, ledger, agentStub, live, ctx }
+  }
+
+  it('★ ENTRY already-live: queueForDormant returns refused, mailbox kept, REAL row cancelled, no followup/inject', async () => {
+    const { lifecycle, ledger, agentStub } = await realLifecycleHarness({ archived: [ARCHIVED] })
+    // The tools' own order: record the row, then call queueForDormant (the
+    // already-live branch drains immediately).
+    await ledger.record({ msgId: 'm-live', from: CALLER, to: ARCHIVED, text: 't' })
+    const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-live' })
+    expect(outcome).toBe('refused')
+    expect(agentStub.followup).not.toHaveBeenCalled()
+    expect(agentStub.inject).not.toHaveBeenCalled()
+    // REAL storage: the row is cancelled with the refusal.
+    const row = await ledger.get('m-live')
+    expect(row!.status).toBe('cancelled')
+    expect(row!.lastError).toContain('archived')
+  })
+
+  it('★ ENTRY agent/created auto-drain: the event-driven drain is ALSO gated, per real msgId', async () => {
+    // This is the bypass path the review called out: the message is recorded
+    // and enqueued, and the session is manually reopened — `agent/created`
+    // fires a drain with NO tool call in between.
+    const { lifecycle, ledger, agentStub, ctx } = await realLifecycleHarness({ archived: [ARCHIVED] })
+    await ledger.record({ msgId: 'm-created', from: CALLER, to: ARCHIVED, text: 't' })
+    // Enqueue through the real mailbox (public path the tools use).
+    await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-created' })
+    expect((await ledger.get('m-created'))!.status).toBe('cancelled') // enqueue-time refusal already cancelled it
+    // Now simulate the archive being lifted and re-applied around a manual
+    // reopen: the queued message must NOT be handed over while archived.
+    agentStub.followup.mockClear()
+    agentStub.inject.mockClear()
+    // Fire the same event the host fires on manual reopen.
+    const root = (ctx as unknown as { root: { emit: (t: string, p: unknown) => void } }).root
+    root.emit('agent/created', { agent: { id: SessionId(ARCHIVED), status: 'idle', followup: agentStub.followup, inject: agentStub.inject } })
+    // The drain runs through the policy check: still archived ⇒ refused.
+    expect(agentStub.followup).not.toHaveBeenCalled()
+    expect(agentStub.inject).not.toHaveBeenCalled()
+  })
+
+  it('★ a normal peer is still handed over through the same gated drain', async () => {
+    const { lifecycle, ledger, agentStub } = await realLifecycleHarness({ archived: [] })
+    await ledger.record({ msgId: 'm-peer', from: CALLER, to: PEER, text: 't' })
+    const outcome = await lifecycle.queueForDormant({ sessionId: PEER, from: CALLER, text: 't', msgId: 'm-peer' })
+    expect(outcome).toBe('resumed') // eligible peer: handed over normally
+    const drained = { refused: [] as Array<{ msgId: string }> }
+    expect(drained.refused).toEqual([])
+    expect(agentStub.followup).toHaveBeenCalledTimes(1)
+    const row = await ledger.get('m-peer')
+    expect(row!.status).toBe('inboxed') // handed over, not cancelled
+  })
+
+  it('mailbox entries are KEPT on refusal (peek is non-destructive; nothing dropped)', async () => {
+    const { lifecycle, ledger } = await realLifecycleHarness({ archived: [ARCHIVED] })
+    await ledger.record({ msgId: 'm-keep', from: CALLER, to: ARCHIVED, text: 't' })
+    await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-keep' })
+    // The mailbox still holds the message (user's queue preserved).
+    const count = await lifecycle.queuedCount(ARCHIVED)
+    expect(count).toBe(1)
+    // And the row is cancelled with the refusal.
+    expect((await ledger.get('m-keep'))!.status).toBe('cancelled')
+  })
+})
+
 const CALLER = 'session-11111111-2222-3333-4444-555555555555'
 const PEER = 'session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 const ARCHIVED = 'session-cccccccc-dddd-eeee-ffff-000000000000'

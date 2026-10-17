@@ -178,7 +178,11 @@ export class S2sLifecycleService extends Service {
       // reviewer see "resumes: none recorded" for a wake that visibly succeeded
       // — the observation existed, it was just not recorded for this path.
       this.rememberResume(entry.sessionId, undefined, 'already live: no resume was performed, so no preset was composed')
-      await this.drain(entry.sessionId)
+      const drained = await this.drain(entry.sessionId)
+      // T30: a refused drain means NOTHING was handed over — the tools must not
+      // report "Woke/handed". The mailbox and its (now cancelled) rows carry the
+      // refusal.
+      if (drained.refused.length > 0) return 'refused'
       return 'resumed'
     }
     const registry = this.ctx.agents as typeof this.ctx.agents & {
@@ -211,7 +215,11 @@ export class S2sLifecycleService extends Service {
       ...(setup === undefined ? {} : { setup: setup }),
     })
     this.resumed.set(entry.sessionId, handle)
-    await this.drain(entry.sessionId)
+    const drained = await this.drain(entry.sessionId)
+    // T30: the resume-path drain can also be refused (the archive flipped
+    // between the pre-resume gate and this drain). Nothing was handed over, so
+    // the caller must not report a wake — same rule as the already-live branch.
+    if (drained.refused.length > 0) return 'refused'
     return 'resumed'
   }
 
@@ -433,20 +441,38 @@ export class S2sLifecycleService extends Service {
   async drain(sessionId: string): Promise<{ delivered: number; refused: Array<{ msgId: string; code: S2sErrorCode; message: string }> }> {
     const agent = this.ctx.agents.get(SessionId(sessionId))
     if (agent === undefined) return { delivered: 0, refused: [] }
+    const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
     // T30: the LAST gate before followup/inject. This covers every drain entry
     // point — the resume path above, the already-live branch, and the
     // `agent/created` auto-drain (which bypasses the tools entirely, so without
     // this check a manually reopened session would receive queued messages
-    // without any target-policy evaluation). A refusal KEEPS the entries in the
-    // mailbox (the user's queue — never silently dropped; the read is not
-    // destructive here) and logs the refusal loudly (G9).
+    // without any target-policy evaluation).
+    //
+    // The refusal accounting is per REAL msgId (review blocker: a placeholder
+    // id leaves ghost rows). The mailbox is PEEKED non-destructively first, so
+    // every queued msgId is known; a refusal then cancels each corresponding
+    // ledger row WITH the refusal reason while KEEPING the mailbox intact — no
+    // retryable ghost work, and nothing is silently dropped.
     if (this.targetPolicyCheck !== undefined) {
       const refusal = await this.targetPolicyCheck(sessionId)
       if (refusal !== undefined) {
-        // Session-level gate: the enqueue-time tool owns the ledger cancel for
-        // these rows (it holds their msgIds); the mailbox is kept intact.
-        this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); mailbox kept`)
-        return { delivered: 0, refused: [{ msgId: '(session-level gate)', code: refusal.code, message: refusal.message }] }
+        const queued = await this.mailbox.peek(sessionId)
+        for (const entry of queued) {
+          if (ledger !== undefined && ledger.isOpen) {
+            try {
+              await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+            } catch (error) {
+              // The row stays queued — visible on its own row and to s2s_status
+              // via the cancel-failure diagnostic; never silently lost.
+              this.ctx.logger.warn(`s2s lifecycle: cancel failed for refused message ${entry.msgId}: ${String(error)}`)
+            }
+          }
+        }
+        this.ctx.logger.warn(`s2s lifecycle: drain to ${sessionId} refused by target policy (${refusal.code}); ${queued.length} message(s) kept in the mailbox with their rows cancelled`)
+        return {
+          delivered: 0,
+          refused: queued.map(entry => ({ msgId: entry.msgId, code: refusal.code, message: refusal.message })),
+        }
       }
     }
     // T6b: the row for a dormant message was created by the caller
@@ -455,7 +481,7 @@ export class S2sLifecycleService extends Service {
     // The handover below **is** the dormant path's `inboxed` moment — the same
     // meaning the live path gives it in `broker.deliver`'s non-`absent` branch
     // (`tools.ts`). Resolved once per drain; the ledger is optional.
-    const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
+    // (`ledger` was resolved at the top of this function — the T30 gate shares it.)
     const entries = await this.mailbox.drain(sessionId)
     let delivered = 0
     /** T30: entries refused AT the handover — per-msgId, for ledger cancel. */

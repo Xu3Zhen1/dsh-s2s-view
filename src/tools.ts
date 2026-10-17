@@ -581,6 +581,29 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               throw new S2sError(rerefusal.message + ' [cancel outcome: ' + cancelOutcome + ']', rerefusal.code)
             }
             const outcome = await lifecycle.queueForDormant({ sessionId: resolved.sessionId, from: from, text: args.text, msgId: msgId })
+            if (outcome === 'refused') {
+              // T30: the lifecycle's drain-time gate refused (the archive
+              // flipped between the pre-resume check and the handover). Nothing
+              // was handed over — the caller must NOT report a wake. The row is
+              // cancelled with the SAME shared verdict, outcome rendered
+              // explicitly.
+              const refusal = discovery.targetPolicyVerdict(resolved)
+              const code = refusal?.code ?? 'S2S_TARGET_POLICY_UNAVAILABLE'
+              const message = refusal?.message ?? 'Refused at the handover point by the target policy.'
+              let cancelOutcome = 'cancel-unavailable'
+              if (ledger !== undefined && ledger.isOpen) {
+                try {
+                  const result = await ledger.cancel(msgId, message)
+                  cancelOutcome = result.outcome === 'cancelled' ? 'cancelled' : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
+                } catch (error) {
+                  cancelOutcome = 'cancel-failed'
+                  recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: String(error) })
+                }
+              } else {
+                recordSelfRefusalCancelFailure({ msgId, at: Date.now(), error: 'ledger not open — queued row could NOT be cancelled' })
+              }
+              throw new S2sError(message + ' The message was kept in the target\'s mailbox (not dropped). [cancel outcome: ' + cancelOutcome + ']', code)
+            }
             const queued = await lifecycle.queuedCount(resolved.sessionId)
             // T9: same restraint as `s2s_message` — a wake hands the queue over, it
             // does not put anything in the target's log on its own.

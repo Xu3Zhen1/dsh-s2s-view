@@ -78,6 +78,29 @@ export class S2sMailbox {
     return names.filter(name => name.endsWith('.json')).length
   }
 
+  /**
+   * NON-destructive read of every queued entry, oldest first (T30).
+   *
+   * `drain()` removes the files it reads, which is exactly wrong for the
+   * target-policy gate: a refusal must KEEP the user's queue intact while the
+   * caller cancels the corresponding ledger rows by msgId. This peek reads the
+   * same files without removing anything.
+   */
+  async peek(sessionId: string): Promise<MailboxEntry[]> {
+    const dir = this.dirFor(sessionId)
+    const names = await readdir(dir).catch(() => [] as string[])
+    const entries: MailboxEntry[] = []
+    for (const name of names.sort()) {
+      if (!name.endsWith('.json')) continue
+      try {
+        entries.push(JSON.parse(await readFile(join(dir, name), 'utf8')) as MailboxEntry)
+      } catch (error) {
+        console.warn(`s2s mailbox: skipped unreadable entry ${name} during peek: ${String(error)}`)
+      }
+    }
+    return entries
+  }
+
   private dirFor(sessionId: string): string {
     if (!SESSION_ID_RE.test(sessionId)) {
       throw new S2sError(`s2s mailbox: unsafe session id ${JSON.stringify(sessionId)}`, 'S2S_INVALID_MESSAGE')
