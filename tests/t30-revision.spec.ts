@@ -821,17 +821,28 @@ describe('T30 review 2026-10-18b: gate-phase × cancel-outcome matrix (dormant p
       expect(resumeCalls).toEqual([])
     }
     // The status diagnostic carries the same outcome (when a ledger exists).
+    // The MAILBOX is asserted for EVERY case: the refusal keeps the user's
+    // queue — one entry, never dropped.
+    const mailboxKept = await lifecycle.queuedCount(ARCHIVED)
+    expect(mailboxKept).toBe(1)
     if (ledger !== undefined) {
       const { readDrainRefusalOutcomes } = await import('../src/ledger-diagnostics.ts')
       const last = readDrainRefusalOutcomes().at(-1)
       expect(last!.msgId).toBe('m-gate')
       expect(last!.cancelOutcome).toBe(expectedOutcome)
-      // Real row state: cancelled only when the cancel succeeded; queued on
-      // no-op/throw (no silent ghost cleanup).
+      // Real row state: no-op means the row was ALREADY cancelled before the
+      // gate (this test pre-cancelled it) — it stays cancelled. A cancel THROW
+      // leaves the row as it was: still queued (no silent ghost cleanup).
       const row = await ledger.get('m-gate')
       if (variant === 'no-op') expect(row!.status).toBe('cancelled')
       else expect(row!.status).toBe('queued')
       await ledger.close()
+    } else {
+      // no-ledger: no diagnostic and no row exist; the mailbox assertion above
+      // is the full observable state for this variant — declared, not skipped.
+      const { readDrainRefusalOutcomes } = await import('../src/ledger-diagnostics.ts')
+      expect(readDrainRefusalOutcomes().at(-1)?.msgId).toBe('m-gate')
+      expect(readDrainRefusalOutcomes().at(-1)?.cancelOutcome).toBe('cancel-unavailable (no ledger)')
     }
     await ctx.fiber.dispose()
   })
