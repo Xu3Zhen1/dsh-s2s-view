@@ -231,13 +231,31 @@ export class S2sLifecycleService extends Service {
     // before the actual resume. The tools-layer gate ran earlier; archive state
     // can flip across the `resumedSetup` await (which reads presets/observations
     // asynchronously). A refusal KEEPS the message in the mailbox — it is the
-    // user's queue, never silently dropped — and the outcome is `'refused'` so
-    // the caller can cancel its ledger row.
+    // user's queue, never silently dropped. NOTE on ordering: `queueForDormant`
+    // is entered AFTER the tools have enqueued this msgId (mailbox.enqueue at
+    // the top of this function), so a refusal here must cancel the recorded row
+    // here — the tools will not cancel again (single ownership).
     if (this.targetPolicyCheck !== undefined) {
       const refusal = await this.targetPolicyCheck(entry.sessionId)
       if (refusal !== undefined) {
-        this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}); message kept in the mailbox`)
-        return { kind: 'refused' as const, code: refusal.code, message: refusal.message, items: [{ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome: 'not-cancelled (refused before any record/queue on this path)' }] }
+        // Single cancel ownership: this path already enqueued (mailbox.enqueue
+        // above) and the tools already recorded the row — cancel it HERE, with
+        // the structured outcome carried on the item. Never claim "not queued".
+        let cancelOutcome = 'cancel-unavailable (no ledger)'
+        const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
+        if (ledger !== undefined && ledger.isOpen) {
+          try {
+            const result = await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+            cancelOutcome = result.outcome === 'cancelled'
+              ? 'cancelled'
+              : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
+          } catch (error) {
+            cancelOutcome = 'cancel-failed: ' + String(error)
+          }
+        }
+        recordDrainRefusalOutcome({ sessionId: entry.sessionId, msgId: entry.msgId, code: refusal.code, cancelOutcome, at: Date.now() })
+        this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}); message kept in the mailbox, cancel outcome: ${cancelOutcome}`)
+        return { kind: 'refused' as const, code: refusal.code, message: refusal.message, items: [{ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome }] }
       }
     }
     // A dormant resume through AgentRegistry.resume does NOT run the host's
@@ -245,6 +263,32 @@ export class S2sLifecycleService extends Service {
     // preset layer at all (tools and prompt sections silently missing). Pass a
     // setup that reproduces the host's composition. See `resumedSetup`.
     const setup = await this.resumedSetup(entry.sessionId)
+    // T30: the policy gate runs HERE — after the async `resumedSetup` read and
+    // immediately before `registry.resume` — exactly as the review required.
+    // An archive flip inside the setup await is caught by this gate; a flip
+    // inside the resume/drain awaits is caught by the per-message gate in
+    // `drain()` below. The refusal keeps the message in the mailbox and cancels
+    // the recorded row (single cancel ownership; the tools never cancel again).
+    if (this.targetPolicyCheck !== undefined) {
+      const refusal = await this.targetPolicyCheck(entry.sessionId)
+      if (refusal !== undefined) {
+        let cancelOutcome = 'cancel-unavailable (no ledger)'
+        const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
+        if (ledger !== undefined && ledger.isOpen) {
+          try {
+            const result = await ledger.cancel(entry.msgId, refusal.code + ': ' + refusal.message)
+            cancelOutcome = result.outcome === 'cancelled'
+              ? 'cancelled'
+              : 'not-cancelled (' + result.outcome + (result.outcome === 'not-cancellable' ? ': ' + result.status : '') + ')'
+          } catch (error) {
+            cancelOutcome = 'cancel-failed: ' + String(error)
+          }
+        }
+        recordDrainRefusalOutcome({ sessionId: entry.sessionId, msgId: entry.msgId, code: refusal.code, cancelOutcome, at: Date.now() })
+        this.ctx.logger.warn(`s2s lifecycle: delivery to ${entry.sessionId} refused by target policy (${refusal.code}) after setup, before resume; cancel outcome: ${cancelOutcome}`)
+        return { kind: 'refused' as const, code: refusal.code, message: refusal.message, items: [{ msgId: entry.msgId, code: refusal.code, message: refusal.message, cancelOutcome }] }
+      }
+    }
     const handle = await registry.resume({
       resumeSessionId: entry.sessionId,
       ...(setup === undefined ? {} : { setup: setup }),

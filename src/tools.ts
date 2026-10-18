@@ -246,7 +246,7 @@ function safeClassify(discovery: S2sDiscoveryService, filter: S2sArchiveFilterSt
  * @param resolved - the resolved target (for the label).
  * @param outcome - the lifecycle's structured refusal.
  */
-function renderRefusedOutcome(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, outcome: S2sRefusedOutcome): string {
+export function renderRefusedOutcome(resolved: Extract<S2sResolveResult, { kind: 'ok' }>, outcome: S2sRefusedOutcome): string {
   const byOutcome = new Map<string, string[]>()
   for (const item of outcome.items) {
     const list = byOutcome.get(item.cancelOutcome) ?? []
