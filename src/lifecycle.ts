@@ -227,14 +227,11 @@ export class S2sLifecycleService extends Service {
       this.ctx.logger.warn('s2s lifecycle: agent registry has no resume capability; message stays queued')
       return 'queued'
     }
-    // T30: re-run the target policy AFTER the async setup read, immediately
-    // before the actual resume. The tools-layer gate ran earlier; archive state
-    // can flip across the `resumedSetup` await (which reads presets/observations
-    // asynchronously). A refusal KEEPS the message in the mailbox — it is the
-    // user's queue, never silently dropped. NOTE on ordering: `queueForDormant`
-    // is entered AFTER the tools have enqueued this msgId (mailbox.enqueue at
-    // the top of this function), so a refusal here must cancel the recorded row
-    // here — the tools will not cancel again (single ownership).
+    // T30: pre-setup policy gate (BEFORE the async setup read). This is the
+    // cheap early-out: a session that is already illegal never pays for the
+    // setup read. A SECOND gate runs after the setup await (see below) because
+    // archive state can flip across that await; a refusal here cancels the row
+    // itself (single cancel ownership — the tools will not cancel again).
     if (this.targetPolicyCheck !== undefined) {
       const refusal = await this.targetPolicyCheck(entry.sessionId)
       if (refusal !== undefined) {

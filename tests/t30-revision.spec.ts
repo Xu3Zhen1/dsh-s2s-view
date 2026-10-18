@@ -35,7 +35,16 @@ afterEach(async () => {
   for (const dispose of disposers.splice(0)) {
     try { await dispose() } catch { /* cleanup must not mask the real result */ }
   }
-  for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true })
+  for (const dir of dirs.splice(0)) {
+    // Windows can hold the sqlite -shm/-wal handles briefly after close; a
+    // failed sweep must not mask the test result (retry once, then give up).
+    try {
+      await rm(dir, { recursive: true, force: true })
+    } catch {
+      await new Promise(r => setTimeout(r, 50))
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
 })
 
 const BARE = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -490,9 +499,164 @@ async function firstMsgId(ledger: S2sLedger): Promise<string> {
 }
 
 describe('T30 review 2026-10-18: honest refusal rendering, single cancel ownership, setup-await barrier', () => {
+
+  // ★ Review 2026-10-18: BOTH tools through REAL execute with the SAME mixed
+  // four-outcome batch. Assertions: grouped counts + msgId ownership, the
+  // refusal code, ledger.cancel = 0 calls, NO broker handover, NO queuedCount
+  // success branch. The pre/post verdict stubs PASS so the refusal comes only
+  // from the lifecycle layer.
+  const MIXED = {
+    kind: 'refused' as const,
+    code: 'S2S_ARCHIVED_TARGET' as const,
+    message: 'the session is archived',
+    items: [
+      { msgId: 'm-c1', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'cancelled' },
+      { msgId: 'm-c2', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'cancelled' },
+      { msgId: 'm-n1', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'not-cancelled (not-found)' },
+      { msgId: 'm-f1', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'cancel-failed: EBUSY' },
+      { msgId: 'm-f2', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'cancel-failed: EBUSY' },
+      { msgId: 'm-u1', code: 'S2S_ARCHIVED_TARGET' as const, message: 'x', cancelOutcome: 'cancel-unavailable (no ledger)' },
+    ],
+  }
+
+  it.each([
+    ['s2s_message', { name: 'a', text: 'x' }],
+    ['s2s_resume', { name: 'a', text: 'x' }],
+  ])('★ %s renders the mixed four-outcome batch verbatim, cancels NOTHING, hands over NOTHING', async (toolName, args) => {
+    const root = await mkdtemp(join(tmpdir(), 's2s-matrix-'))
+    dirs.push(root)
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    const ledger = new S2sLedger(ctx)
+    await ledger.open()
+    const cancelSpy = vi.spyOn(ledger, 'cancel')
+    const discovery = {
+      list: vi.fn(async () => [] as any[]),
+      resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'session-cccccccc-dddd-eeee-ffff-000000000000', title: 'a', state: 'dormant', workspaceDir: 'ws', matchedBy: 'exact' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] }) as const),
+      classifyTarget: vi.fn(() => 'eligible' as const),
+      targetPolicyVerdict: vi.fn(() => undefined), // pre-check passes; refusal comes from the lifecycle
+    }
+    const handover = vi.fn(() => 'idle')
+    const queuedCount = vi.fn(async () => 1)
+    const defs = buildTools({
+      ctx: { on: vi.fn(() => vi.fn()), get: vi.fn(() => undefined) },
+      broker: { deliver: handover, history: vi.fn(() => []) },
+      discovery,
+      ledger,
+      lifecycle: {
+        queueForDormant: vi.fn(async () => MIXED),
+        queuedCount,
+        resumeReport: vi.fn(() => undefined),
+        resumeReports_: vi.fn(() => []),
+      },
+    } as any)
+    const msg = defs.find((d) => d.name === toolName) as unknown as Tool
+    const out = await msg.execute(args as any, { agent: { id: 'session-11111111-2222-3333-4444-555555555555' } })
+    // Grouped per outcome, counts + msgIds verbatim:
+    expect(out.text).toContain('2 message(s) cancelled [m-c1, m-c2]')
+    expect(out.text).toContain('1 message(s) not-cancelled (not-found) [m-n1]')
+    expect(out.text).toContain('2 message(s) cancel-failed: EBUSY [m-f1, m-f2]')
+    expect(out.text).toContain('1 message(s) cancel-unavailable (no ledger) [m-u1]')
+    expect(out.text).toContain('S2S_ARCHIVED_TARGET')
+    // Single cancel ownership: the TOOL never cancels.
+    expect(cancelSpy).not.toHaveBeenCalled()
+    // No handover, no queuedCount success branch.
+    expect(handover).not.toHaveBeenCalled()
+    expect(queuedCount).not.toHaveBeenCalled()
+    await ledger.close(); await ctx.fiber.dispose()
+  })
+
+  // ★ Review: the two NEW lifecycle refusal branches must carry REAL cancel
+  // outcomes (no-op / throw / ledger unavailable), not hard-coded success.
+  async function branchHarness(opts: { ledgerOpen: boolean; failWith?: Error }) {
+    const root = await mkdtemp(join(tmpdir(), 's2s-branch-'))
+    dirs.push(root)
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    const ledger = new S2sLedger(ctx)
+    await ledger.open()
+    if (opts.failWith !== undefined) vi.spyOn(ledger, 'cancel').mockRejectedValue(opts.failWith)
+    ctx.provide('agents', {
+      get: (id: unknown) => (String(id) === ARCHIVED ? { status: 'idle', followup: vi.fn(), inject: vi.fn() } : undefined),
+      resume: vi.fn(async () => ({})),
+    } as any)
+    const live = { ids: ['session-cccccccc-dddd-eeee-ffff-000000000000'] }
+    const { S2sLifecycleService } = await import('../src/lifecycle.ts')
+    const lifecycle = new S2sLifecycleService(ctx, { mailboxDir: join(root, 'mb'), autoResume: 'allow' })
+    lifecycle.setTargetPolicyCheck(async function() {
+      return live.ids.includes(ARCHIVED) ? { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' } : undefined
+    })
+    return { lifecycle, ledger, live, root, ctx }
+  }
+
+  it('★ pre-resume gate: cancel no-op (already cancelled) is reported as not-cancelled, not success', async () => {
+    const { lifecycle, ledger, live, ctx } = await branchHarness({ ledgerOpen: true })
+    await ledger.record({ msgId: 'm-noop', from: CALLER, to: ARCHIVED, text: 't' })
+    // The row is ALREADY cancelled: the gate's cancel lands in not-cancellable.
+    await ledger.cancel('m-noop', 'pre-cancelled')
+    const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-noop' })
+    if (typeof outcome === 'object' && outcome.kind === 'refused') {
+      expect(outcome.items[0]!.cancelOutcome).toBe('not-cancelled (not-cancellable: cancelled)')
+    } else { throw new Error('expected structured refusal') }
+    // The diagnostic sees the same truth.
+    const { readDrainRefusalOutcomes } = await import('../src/ledger-diagnostics.ts')
+    const last = readDrainRefusalOutcomes().at(-1)
+    expect(last!.msgId).toBe('m-noop')
+    expect(last!.cancelOutcome).toBe('not-cancelled (not-cancellable: cancelled)')
+    await ledger.close(); await ctx.fiber.dispose()
+  })
+
+  it('★ pre-resume gate: cancel THROW is reported as cancel-failed, not success', async () => {
+    const { lifecycle, ledger } = await branchHarness({ ledgerOpen: true, failWith: new Error('EACCES') })
+    await ledger.record({ msgId: 'm-throw', from: CALLER, to: ARCHIVED, text: 't' })
+    const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-throw' })
+    if (typeof outcome === 'object' && outcome.kind === 'refused') {
+      expect(outcome.items[0]!.cancelOutcome).toBe('cancel-failed: Error: EACCES')
+    } else { throw new Error('expected structured refusal') }
+    // The row stays queued (no silent ghost cleanup claimed).
+    expect((await ledger.get('m-throw'))!.status).toBe('queued')
+    await ledger.close()
+  })
+
+  it('★ pre-resume gate: ledger unavailable reports cancel-unavailable, never success', async () => {
+    // No ledger mounted: the service sees none.
+    const root = await mkdtemp(join(tmpdir(), 's2s-nolg-'))
+    dirs.push(root)
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    ctx.provide('agents', {
+      get: (id: unknown) => (String(id) === ARCHIVED ? { status: 'idle', followup: vi.fn(), inject: vi.fn() } : undefined),
+      resume: vi.fn(async () => ({})),
+    } as any)
+    const live = { ids: ['session-cccccccc-dddd-eeee-ffff-000000000000'] }
+    const { S2sLifecycleService } = await import('../src/lifecycle.ts')
+    const lifecycle = new S2sLifecycleService(ctx, { mailboxDir: join(root, 'mb'), autoResume: 'allow' })
+    lifecycle.setTargetPolicyCheck(async function() {
+      return live.ids.includes(ARCHIVED) ? { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' } : undefined
+    })
+    const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-nolg' })
+    if (typeof outcome === 'object' && outcome.kind === 'refused') {
+      expect(outcome.items[0]!.cancelOutcome).toBe('cancel-unavailable (no ledger)')
+    } else { throw new Error('expected structured refusal') }
+    await ctx.fiber.dispose()
+  })
   it('★ renderRefusedOutcome aggregates MIXED cancel outcomes (not all-cancelled)', async () => {
-    // The aggregator is exercised through the real tool path: two refused
-    // items with DIFFERENT outcomes must render as two grouped parts.
+    // Direct helper-level check of the aggregator's grouping (the REAL tool
+    // path over the same aggregator is covered by the it.each matrix below).
+    // Two items with DIFFERENT outcomes must render as two grouped parts.
     const { renderRefusedOutcome } = await import('../src/tools.ts')
     const outcome = {
       kind: 'refused' as const,
