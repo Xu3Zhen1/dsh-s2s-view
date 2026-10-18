@@ -598,7 +598,7 @@ describe('T30 review 2026-10-18: honest refusal rendering, single cancel ownersh
     return { lifecycle, ledger, live, root, ctx }
   }
 
-  it('★ pre-resume gate: cancel no-op (already cancelled) is reported as not-cancelled, not success', async () => {
+  it('★ ALREADY-LIVE drain refusal: cancel no-op (already cancelled) is reported as not-cancelled, not success', async () => {
     const { lifecycle, ledger, live, ctx } = await branchHarness({ ledgerOpen: true })
     await ledger.record({ msgId: 'm-noop', from: CALLER, to: ARCHIVED, text: 't' })
     // The row is ALREADY cancelled: the gate's cancel lands in not-cancellable.
@@ -615,7 +615,7 @@ describe('T30 review 2026-10-18: honest refusal rendering, single cancel ownersh
     await ledger.close(); await ctx.fiber.dispose()
   })
 
-  it('★ pre-resume gate: cancel THROW is reported as cancel-failed, not success', async () => {
+  it('★ ALREADY-LIVE drain refusal: cancel THROW is reported as cancel-failed, not success', async () => {
     const { lifecycle, ledger } = await branchHarness({ ledgerOpen: true, failWith: new Error('EACCES') })
     await ledger.record({ msgId: 'm-throw', from: CALLER, to: ARCHIVED, text: 't' })
     const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-throw' })
@@ -627,7 +627,7 @@ describe('T30 review 2026-10-18: honest refusal rendering, single cancel ownersh
     await ledger.close()
   })
 
-  it('★ pre-resume gate: ledger unavailable reports cancel-unavailable, never success', async () => {
+  it('★ ALREADY-LIVE drain refusal: ledger unavailable reports cancel-unavailable, never success', async () => {
     // No ledger mounted: the service sees none.
     const root = await mkdtemp(join(tmpdir(), 's2s-nolg-'))
     dirs.push(root)
@@ -741,5 +741,98 @@ describe('T30 review 2026-10-18: honest refusal rendering, single cancel ownersh
     expect(resumeCalls).toEqual([]) // resume NEVER ran
     expect((await ledger.get('m-barrier'))!.status).toBe('cancelled')
     await ledger.close(); await ctx.fiber.dispose()
+  })
+})
+
+describe('T30 review 2026-10-18b: gate-phase × cancel-outcome matrix (dormant path, resume spy)', () => {
+  /**
+   * A DORMANT-path harness: agents.get returns undefined (no already-live
+   * shortcut), a resume spy records actual resume calls, and the policy check
+   * refuses from the requested gate phase. The setup stub is a REAL async
+   * function with an await window so the post-setup gate genuinely sits
+   * between it and the resume.
+   */
+  async function gateHarness(opts: { phase: 'pre-setup' | 'post-setup'; failWith?: Error; noLedger?: boolean }) {
+    const root = await mkdtemp(join(tmpdir(), 's2s-gatephase-'))
+    dirs.push(root)
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    let ledger: S2sLedger | undefined
+    if (opts.noLedger !== true) {
+      ledger = new S2sLedger(ctx)
+      await ledger.open()
+      if (opts.failWith !== undefined) vi.spyOn(ledger, 'cancel').mockRejectedValue(opts.failWith)
+    }
+    const resumeCalls: string[] = []
+    const setupCalls: string[] = []
+    ctx.provide('agents', {
+      get: () => undefined, // DORMANT: no already-live shortcut
+      resume: vi.fn(async (o: any) => { resumeCalls.push(o.resumeSessionId); return {} }),
+    } as any)
+    const { S2sLifecycleService } = await import('../src/lifecycle.ts')
+    const lifecycle = new S2sLifecycleService(ctx, { mailboxDir: join(root, 'mb'), autoResume: 'allow' })
+    // The policy check: pre-setup refuses immediately; post-setup PASSES the
+    // first call (the pre-setup gate) and refuses from the second (the
+    // post-setup gate after the setup await) — the phase distinction under test.
+    let checkCalls = 0
+    lifecycle.setTargetPolicyCheck(async function() {
+      checkCalls++
+      if (opts.phase === 'pre-setup') return { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' }
+      return checkCalls === 1 ? undefined : { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' }
+    })
+    // A real async setup with an observable call count.
+    ;(lifecycle as any).resumedSetup = vi.fn(async (id: string) => { setupCalls.push(id); await new Promise(r => setTimeout(r, 3)); return undefined })
+    return { lifecycle, ledger, resumeCalls, setupCalls, root, ctx }
+  }
+
+  it.each([
+    ['pre-setup', 'no-op', 'not-cancelled (not-cancellable: cancelled)'],
+    ['pre-setup', 'throw', 'cancel-failed: Error: EACCES'],
+    ['pre-setup', 'no-ledger', 'cancel-unavailable (no ledger)'],
+    ['post-setup', 'no-op', 'not-cancelled (not-cancellable: cancelled)'],
+    ['post-setup', 'throw', 'cancel-failed: Error: EACCES'],
+    ['post-setup', 'no-ledger', 'cancel-unavailable (no ledger)'],
+  ])('★ %s gate + %s: the refusal item carries the REAL outcome; setup/resume calls match the phase', async (phase, variant, expectedOutcome) => {
+    const failWith = variant === 'throw' ? new Error('EACCES') : undefined
+    const { lifecycle, ledger, resumeCalls, setupCalls, ctx } = await gateHarness({ phase: phase as any, failWith, noLedger: variant === 'no-ledger' })
+    if (ledger !== undefined) {
+      await ledger.record({ msgId: 'm-gate', from: CALLER, to: ARCHIVED, text: 't' })
+      if (variant === 'no-op') await ledger.cancel('m-gate', 'pre-cancelled')
+    }
+    const outcome = await lifecycle.queueForDormant({ sessionId: ARCHIVED, from: CALLER, text: 't', msgId: 'm-gate' })
+    // Structured refusal with the REAL outcome on the item.
+    expect(typeof outcome).toBe('object')
+    if (typeof outcome !== 'object' || outcome.kind !== 'refused') throw new Error('expected structured refusal')
+    expect(outcome.code).toBe('S2S_ARCHIVED_TARGET')
+    expect(outcome.items.map(i => i.msgId)).toEqual(['m-gate'])
+    expect(outcome.items[0]!.cancelOutcome).toBe(expectedOutcome)
+    // Phase evidence:
+    // - pre-setup: refused BEFORE setup ⇒ setup AND resume never called.
+    // - post-setup: setup ran once, then the gate refused ⇒ resume never called.
+    if (phase === 'pre-setup') {
+      expect(setupCalls).toEqual([])
+      expect(resumeCalls).toEqual([])
+    } else {
+      expect(setupCalls).toEqual([ARCHIVED])
+      expect(resumeCalls).toEqual([])
+    }
+    // The status diagnostic carries the same outcome (when a ledger exists).
+    if (ledger !== undefined) {
+      const { readDrainRefusalOutcomes } = await import('../src/ledger-diagnostics.ts')
+      const last = readDrainRefusalOutcomes().at(-1)
+      expect(last!.msgId).toBe('m-gate')
+      expect(last!.cancelOutcome).toBe(expectedOutcome)
+      // Real row state: cancelled only when the cancel succeeded; queued on
+      // no-op/throw (no silent ghost cleanup).
+      const row = await ledger.get('m-gate')
+      if (variant === 'no-op') expect(row!.status).toBe('cancelled')
+      else expect(row!.status).toBe('queued')
+      await ledger.close()
+    }
+    await ctx.fiber.dispose()
   })
 })
