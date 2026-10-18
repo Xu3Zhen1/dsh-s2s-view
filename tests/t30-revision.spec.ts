@@ -838,8 +838,8 @@ describe('T30 review 2026-10-18b: gate-phase × cancel-outcome matrix (dormant p
       else expect(row!.status).toBe('queued')
       await ledger.close()
     } else {
-      // no-ledger: no diagnostic and no row exist; the mailbox assertion above
-      // is the full observable state for this variant — declared, not skipped.
+      // No ledger row exists; the diagnostic still exists and must carry the
+      // refusal — the full observable state for this variant.
       const { readDrainRefusalOutcomes } = await import('../src/ledger-diagnostics.ts')
       expect(readDrainRefusalOutcomes().at(-1)?.msgId).toBe('m-gate')
       expect(readDrainRefusalOutcomes().at(-1)?.cancelOutcome).toBe('cancel-unavailable (no ledger)')
