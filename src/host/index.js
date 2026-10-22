@@ -136,8 +136,22 @@ export function apply(ctx) {
     return Response.json({ sessions }, { headers: { 'cache-control': 'no-store' } })
   }
 
+  // `requestBody: 'buffered'` is REQUIRED, not decorative. The Connection
+  // shared handler resolves `requestBodyMode` as `route.requestBody` for a
+  // matched exact route and only falls back to `'buffered'` for UNMATCHED
+  // paths — so omitting this field yields `undefined`, which the bridge reads
+  // as "streaming" and then attaches a body to this GET. `new Request(...,
+  // { method: 'GET', body })` throws `Request with GET/HEAD method cannot have
+  // body`, and the Host webserver's error middleware turns any handler
+  // exception into an empty 400. Declaring the mode selects the buffered
+  // (no-body) branch this read-only route actually needs.
   ctx.effect(
-    () => ctx.connection.fetch.register({ path: ROUTE, methods: ['GET', 'HEAD'], fetch }),
+    () => ctx.connection.fetch.register({
+      path: ROUTE,
+      methods: ['GET', 'HEAD'],
+      requestBody: 'buffered',
+      fetch,
+    }),
     's2s-history-host: read-only route',
   )
 }
