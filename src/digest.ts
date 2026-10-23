@@ -118,7 +118,16 @@ interface SessionModuleLike {
 
 /** The shape `readSession` resolves to, as far as this view reads it. */
 interface StoredLog {
-  readonly session: { readonly id: string } | undefined
+  /**
+   * The COMPLETE detached creation header, passed through verbatim.
+   *
+   * It must not be narrowed: `Session.create` replay-validates it with the
+   * host's `validateSessionHeader`, which requires `version === 4`, a matching
+   * `id`, and a numeric `createdAt`. An earlier revision kept only `{ id }`,
+   * which made EVERY replay throw `session header version must be 4, got
+   * undefined` and turned the whole timeline column into a read failure.
+   */
+  readonly session: unknown
   readonly events: readonly unknown[]
   readonly inheritedEventCount: unknown
 }
@@ -150,10 +159,52 @@ function localTime(epochMs: number | undefined): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** Epoch ms of a finished session's header time. */
+/** Epoch ms of a finished session's creation time, read from its header. */
 function headerTime(snapshot: unknown): number | undefined {
-  const t = (snapshot as { headerTime?: unknown })?.headerTime
+  // `listSessions()` returns `{ header, live, persisted }`, so the creation
+  // instant lives at `header.createdAt`. Reading a top-level `headerTime` was
+  // always undefined — which is why the "last=" column reported `time unknown`
+  // for every row. `listRowId` below reads `header.id` from the same shape and
+  // works, which is the control that proves the row shape.
+  const t = (snapshot as { header?: { createdAt?: unknown } })?.header?.createdAt
   return typeof t === 'number' && Number.isFinite(t) ? t : undefined
+}
+
+/**
+ * Fill each row's `title` from the host's title folder, in one batch.
+ *
+ * Titles are a *view* concern here: a failure to fold them must not sink the
+ * digest, so this never throws. The host settles each id independently
+ * (`{ status: 'fulfilled', value: { session, title? } }` or
+ * `{ status: 'rejected', reason }`), and a session without a title event omits
+ * `title` entirely rather than yielding an empty string.
+ * @param query - the host session-query service.
+ * @param rows - rows to annotate.
+ * @returns the rows, with `title` filled in where the host knows one.
+ */
+async function attachTitles(query: SessionQueryLike, rows: readonly DigestRow[]): Promise<DigestRow[]> {
+  if (rows.length === 0) return [...rows]
+  let settled: unknown
+  try {
+    settled = await withDeadline(query.readTitleSnapshots(rows.map(row => row.sessionId)), READ_TIMEOUT_MS)
+  } catch {
+    // Titles are decorative; leave every row untitled rather than reporting a
+    // read error that would blame the session for a title-folding failure.
+    return [...rows]
+  }
+  if (!Array.isArray(settled)) return [...rows]
+  const byId = new Map<string, string>()
+  for (const entry of settled) {
+    const result = entry as { status?: unknown; value?: { session?: { id?: unknown }, title?: unknown } }
+    if (result?.status === 'rejected') continue
+    const id = result?.value?.session?.id
+    const title = result?.value?.title
+    if (typeof id === 'string' && typeof title === 'string' && title.length > 0) byId.set(id, title)
+  }
+  return rows.map(row => {
+    const title = byId.get(row.sessionId)
+    return title === undefined ? row : { ...row, title }
+  })
 }
 
 /** Session id of one `irreversible.list` row. */
@@ -237,9 +288,12 @@ async function readStoredLog(sessionId: string): Promise<StoredLog> {
   if (record === undefined || record === null) throw new Error('session-query returned no log')
   const events = (record as { events?: unknown }).events
   if (!Array.isArray(events)) throw new Error('session-query returned no event log')
-  const session = (record as { session?: { id?: unknown } }).session
+  // Pass the header through COMPLETE. Narrowing it here is what broke the
+  // timeline: `Session.create` below replay-validates the header, and a
+  // `{ id }`-only shape fails the host's `validateSessionHeader` on `version`.
+  const session = (record as { session?: unknown }).session
   return {
-    session: session !== undefined && typeof session.id === 'string' ? { id: session.id } : undefined,
+    session: session !== undefined && session !== null && typeof session === 'object' ? session : undefined,
     events,
     inheritedEventCount: (record as { inheritedEventCount?: unknown }).inheritedEventCount ?? 0,
   }
@@ -391,9 +445,18 @@ async function buildDigest(
     })
     : []
 
+  // Titles: read them in ONE batch through the host's folder.
+  //
+  // `readTitleSnapshots` was declared on the interface from the start but never
+  // called, so `title` stayed hardcoded `undefined` and every row rendered as
+  // `(untitled)` even when the session had a title. The host returns one
+  // settled result per unique id (`{ status, value }`), where `value` is
+  // `{ session, title? }` — a session with no title event simply omits `title`.
+  const titled = await attachTitles(query, rows)
+
   const cap = await timelineCapability()
   const rowsWithTimeline: DigestRow[] = []
-  for (const row of rows) {
+  for (const row of titled) {
     if (cap.read === undefined) {
       rowsWithTimeline.push({ ...row, readError: cap.reason })
       continue
