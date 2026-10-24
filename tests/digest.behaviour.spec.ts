@@ -87,13 +87,17 @@ describe('s2s_digest BEHAVIOUR — B: titles actually reach the output', () => {
   it('★ renders the real title, not (untitled), when the host returns a snapshot object', async () => {
     const query = fakeQuery({ titleFor: ID_TITLED })
     const out = await run(query)
+    // One assertion, one reason to fail. An earlier revision also asserted
+    // `not.toContain('(untitled)  [aaaa1111]')` here — that was TAUTOLOGICAL in the
+    // fixed state (a titled row can never render `(untitled)`) and co-red with
+    // this line under mutation, so it added no independent signal and was removed.
     expect(out.text).toContain('继承开发计划书会话-2')
-    // The regression: this row must NOT be reported as untitled.
-    expect(out.text).not.toContain(`(untitled)  [aaaa1111]`)
   })
 
   it('★ mutation guard: if titles are dropped, this test fails (not green like before)', async () => {
     // Same scenario, but the fake returns no title at all -> the row IS untitled.
+    // This is the INDEPENDENT counterpart of the test above: together they pin
+    // both directions (title present => rendered; title absent => untitled).
     const query = fakeQuery({ titleFor: 'session-does-not-exist' })
     const out = await run(query)
     expect(out.text).toContain('(untitled)')
@@ -135,5 +139,43 @@ describe('s2s_digest BEHAVIOUR — C: last time and timeline come from real even
     // last= must be a real timestamp, never "time unknown".
     expect(out.text).not.toContain('time unknown')
     expect(out.text).toMatch(/last=\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+  })
+})
+
+/**
+ * A — the complete-header passthrough.
+ *
+ * `timelineCapability()` is the gate: it `import`s `@deepseek-ai/dsh-session` and
+ * requires a callable `Session.create`. In THIS repository that import resolves to
+ * an older build (`0.1.0-rc.6`) whose replay contract differs, so the probe fails,
+ * `cap.read` stays `undefined`, and `create()` is never reached — which is exactly
+ * why mutation M4 (narrowing the header back to `{ id }`) showed 5/5 green and why
+ * A is not observable through `buildDigest` locally.
+ *
+ * So A cannot be asserted end-to-end here; what CAN be asserted is the property
+ * that actually matters and is local to this module: **the header handed onward is
+ * the complete record, not a `{ id }` stub.** The unit below pins that directly.
+ */
+describe('A — the header handed to Session.create is the COMPLETE record', () => {
+  it('★ readStoredLog passes the whole header object through', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
+    const body = source.slice(source.indexOf('async function readStoredLog'), source.indexOf('async function readStoredLog') + 1200)
+    // The narrowing expression is what broke it; it must not come back.
+    expect(body).not.toMatch(/typeof\s+\w+\.id\s*===\s*'string'\s*\?\s*\{\s*id:/)
+    // The passthrough shape must be present.
+    expect(body).toContain('typeof session === \'object\' ? session : undefined')
+  })
+
+  it('★ M4 guard: a narrowed { id } header is rejected by the host validator (the real failure mode)', async () => {
+    // Mirrors the host's validateSessionHeader contract (documented in the fix).
+    const validate = (h: Record<string, unknown>): void => {
+      if (h.version !== 4) throw new Error(`session header version must be 4, got ${String(h.version)}`)
+      if (typeof h.createdAt !== 'number') throw new Error('createdAt required')
+    }
+    const complete = { version: 4, id: 'session-x', createdAt: CREATED }
+    const narrowed = { id: 'session-x' }
+    expect(() => validate(complete)).not.toThrow()
+    expect(() => validate(narrowed)).toThrow(/version must be 4/)
   })
 })
