@@ -93,6 +93,20 @@ interface TimelineCapability {
 /** Cached probe result: the session module is resolved once per process. */
 let capability: TimelineCapability | undefined
 
+/**
+ * Last title-folding diagnostic for the current call, if any.
+ *
+ * G9: a fallback path must leave an observable trace. Without this, a broken
+ * title read is indistinguishable from "this session has no title" — the exact
+ * ambiguity that hid the `(untitled)` regression.
+ */
+let titleDiagnostic: string | undefined
+
+/** Record why titles could not be folded (cleared at the start of each digest). */
+function noteTitleDiagnostic(reason: string): void {
+  titleDiagnostic = reason
+}
+
 /** Structural view of the host's `sessionQuery` service. */
 interface SessionQueryLike {
   listSessions(signal?: AbortSignal): Promise<unknown>
@@ -206,27 +220,48 @@ function titleTextOf(raw: unknown): string | undefined {
  */
 async function attachTitles(query: SessionQueryLike, rows: readonly DigestRow[]): Promise<DigestRow[]> {
   if (rows.length === 0) return [...rows]
+  // G9: a fallback must leave an observable trace. Titles are decorative, so a
+  // failure must not sink the digest — but it must not be silent either, or a
+  // broken title path is indistinguishable from "this session has no title".
+  if (typeof (query as { readTitleSnapshots?: unknown }).readTitleSnapshots !== 'function') {
+    noteTitleDiagnostic('unavailable: the host sessionQuery exposes no readTitleSnapshots()')
+    return [...rows]
+  }
   let settled: unknown
   try {
     settled = await withDeadline(query.readTitleSnapshots(rows.map(row => row.sessionId)), READ_TIMEOUT_MS)
-  } catch {
-    // Titles are decorative; leave every row untitled rather than reporting a
-    // read error that would blame the session for a title-folding failure.
+  } catch (error: unknown) {
+    noteTitleDiagnostic('read failed: ' + messageOf(error))
     return [...rows]
   }
-  if (!Array.isArray(settled)) return [...rows]
+  if (!Array.isArray(settled)) {
+    noteTitleDiagnostic('read failed: readTitleSnapshots did not resolve to an array (got ' + typeof settled + ')')
+    return [...rows]
+  }
   const byId = new Map<string, string>()
+  let rejected = 0
   for (const entry of settled) {
     const result = entry as {
       sessionId?: unknown
       status?: unknown
+      reason?: unknown
       value?: { session?: { id?: unknown }, title?: unknown }
     }
-    if (result?.status === 'rejected') continue
+    if (result?.status === 'rejected') {
+      rejected++
+      continue
+    }
     // Prefer the settlement's own sessionId; fall back to the cloned header id.
     const id = typeof result?.sessionId === 'string' ? result.sessionId : result?.value?.session?.id
     const title = titleTextOf(result?.value?.title)
     if (typeof id === 'string' && title !== undefined) byId.set(id, title)
+  }
+  if (byId.size === 0 && rejected > 0) {
+    noteTitleDiagnostic(
+      rejected === settled.length
+        ? 'read failed: all ' + rejected + ' session(s) were rejected by the title folder'
+        : 'partial: ' + rejected + ' of ' + settled.length + ' session(s) rejected, no titles folded',
+    )
   }
   return rows.map(row => {
     const title = byId.get(row.sessionId)
@@ -453,6 +488,7 @@ async function buildDigest(
       + 'Mount the session-query + session-query-sqlite bundles in the profile, then retry.'
   }
   currentQuery = query
+  titleDiagnostic = undefined
 
   const listed = await query.listSessions()
   const rows: DigestRow[] = Array.isArray(listed)
@@ -522,6 +558,9 @@ async function buildDigest(
   if (selected.note !== undefined && shown.length > 0) lines.push(`(${selected.note})`)
   lines.push('')
   lines.push('rows carry the last event TYPE and time only — no message text. Use session_event_read for content.')
+  // G9: surface a title-folding failure instead of letting every `(untitled)`
+  // row look like a session that simply has no title.
+  if (titleDiagnostic !== undefined) lines.push('[titles] ' + titleDiagnostic)
   return lines.join('\n')
 }
 

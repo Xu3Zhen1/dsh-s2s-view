@@ -212,3 +212,22 @@ describe('B. digest titles come from readTitleSnapshots', () => {
     expect(out[1]!.title).toBeUndefined()
   })
 })
+
+describe('G9. a broken title path must leave a trace, not look like "no title"', () => {
+  it('★ the source emits a [titles] diagnostic when folding fails', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
+    // The failure branches must record a reason…
+    expect(source).toContain('noteTitleDiagnostic(')
+    // …and the reason must reach the caller, otherwise `(untitled)` is ambiguous.
+    expect(source).toContain("'[titles] '")
+  })
+
+  it('★ distinguishes "no readTitleSnapshots on the service" from "no title event"', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
+    // The pre-flight capability check is what separates "API missing" from "no data".
+    expect(source).toContain('readTitleSnapshots?: unknown')
+    expect(source).toContain('exposes no readTitleSnapshots()')
+  })
+})
