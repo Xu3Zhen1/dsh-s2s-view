@@ -513,13 +513,18 @@ async function buildDigest(
   // `readTitleSnapshots` was declared on the interface from the start but never
   // called, so `title` stayed hardcoded `undefined` and every row rendered as
   // `(untitled)` even when the session had a title. The host returns one
-  // settled result per unique id (`{ status, value }`), where `value` is
-  // `{ session, title? }` — a session with no title event simply omits `title`.
-  const titled = await attachTitles(query, rows)
+  // settled result per unique id (`{ sessionId, status, value }`), where `value`
+  // is `{ session, title? }` and `value.title` is a title SNAPSHOT object
+  // (`{ title, messageSeqs, source, eventSeq, updatedAt }`), not a string.
+  //
+  // Titles are read LATE, for the rows that will actually be printed: folding
+  // all known sessions (367 at the time of writing) is a full-corpus scan and
+  // blew the 8 s deadline, which surfaced as `[titles] read failed: timed out`.
+  // A digest showing at most `limit` rows must never pay for the whole corpus.
 
   const cap = await timelineCapability()
   const rowsWithTimeline: DigestRow[] = []
-  for (const row of titled) {
+  for (const row of rows) {
     if (cap.read === undefined) {
       rowsWithTimeline.push({ ...row, readError: cap.reason })
       continue
@@ -541,7 +546,8 @@ async function buildDigest(
   const limit = args.limit === undefined || !Number.isFinite(args.limit)
     ? DEFAULT_LIMIT
     : Math.min(Math.max(Math.floor(args.limit), 1), MAX_LIMIT)
-  const shown = ordered.slice(0, limit)
+  const page = ordered.slice(0, limit)
+  const shown = await attachTitles(query, page)
 
   const header = `${DIGEST_TOOL_NAME}: ${shown.length} of ${ordered.length} conversation(s)`
     + (rows.length !== ordered.length ? ` (from ${rows.length} known)` : '')

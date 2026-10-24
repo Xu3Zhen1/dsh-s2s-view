@@ -231,3 +231,31 @@ describe('G9. a broken title path must leave a trace, not look like "no title"',
     expect(source).toContain('exposes no readTitleSnapshots()')
   })
 })
+
+describe('★ titles are folded for the SHOWN page only, never the whole corpus', () => {
+  /**
+   * Measured on the real host: folding titles for all 367 known sessions blew the
+   * 8 s deadline and surfaced as `[titles] read failed: timed out after 8000ms`,
+   * so every row stayed `(untitled)`. A digest that prints at most `limit` rows
+   * must not pay for a full-corpus title scan.
+   */
+  it('the attachTitles call happens AFTER the page slice, not before', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
+    const sliceAt = source.indexOf('const page = ordered.slice(0, limit)')
+    const attachAt = source.indexOf('const shown = await attachTitles(query, page)')
+    expect(sliceAt).toBeGreaterThan(-1)
+    expect(attachAt).toBeGreaterThan(-1)
+    // Ordering is the whole point: titles must be read for `page`, not for `rows`.
+    expect(attachAt).toBeGreaterThan(sliceAt)
+  })
+
+  it('★ does NOT fold titles for the whole corpus any more', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
+    // The old, timed-out call shape.
+    expect(source).not.toContain('attachTitles(query, rows)')
+    // And the argument really is the page.
+    expect(source).toContain('attachTitles(query, page)')
+  })
+})
