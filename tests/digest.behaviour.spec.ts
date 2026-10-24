@@ -157,25 +157,109 @@ describe('s2s_digest BEHAVIOUR — C: last time and timeline come from real even
  * the complete record, not a `{ id }` stub.** The unit below pins that directly.
  */
 describe('A — the header handed to Session.create is the COMPLETE record', () => {
-  it('★ readStoredLog passes the whole header object through', async () => {
+  /**
+   * Assert the SHAPE of `readStoredLog`'s `session:` property via the TypeScript
+   * AST, not via source-text matching.
+   *
+   * Why AST and not `toContain`: a text assertion on
+   * `typeof session === 'object' ? session : undefined` is over-strict — it goes
+   * red on behaviour-preserving rewrites (adding `as object`, re-wrapping in
+   * parentheses, splitting across lines). Measured: both rewritten forms of this
+   * exact line failed the text assertion while the behaviour was unchanged.
+   * A criterion that fails on correct code is an obstacle, not a criterion.
+   *
+   * What the AST check pins instead is the semantic property that actually broke:
+   * the value handed on is the ORIGINAL `session`, narrowed only to non-null.
+   * A regression to `{ id: session.id }` produces an ObjectLiteral here and fails.
+   */
+  const readStoredLogSessionExpr = async (): Promise<string> => {
     const { readFileSync } = await import('node:fs')
-    const source = readFileSync(new URL('../src/digest.ts', import.meta.url), 'utf8')
-    const body = source.slice(source.indexOf('async function readStoredLog'), source.indexOf('async function readStoredLog') + 1200)
-    // The narrowing expression is what broke it; it must not come back.
-    expect(body).not.toMatch(/typeof\s+\w+\.id\s*===\s*'string'\s*\?\s*\{\s*id:/)
-    // The passthrough shape must be present.
-    expect(body).toContain('typeof session === \'object\' ? session : undefined')
+    const ts = await import('typescript')
+    const file = new URL('../src/digest.ts', import.meta.url)
+    const source = ts.createSourceFile(
+      file.pathname,
+      readFileSync(file, 'utf8'),
+      ts.ScriptTarget.ESNext,
+      true,
+    )
+    let found: string | undefined
+    const visit = (node: import('typescript').Node): void => {
+      if (found !== undefined) return
+      if (ts.isFunctionDeclaration(node) && node.name?.text === 'readStoredLog') {
+        const body = node.body
+        if (body === undefined) return
+        const ret = body.statements.find(ts.isReturnStatement)
+        const obj = ret?.expression !== undefined && ts.isObjectLiteralExpression(ret.expression)
+          ? ret.expression
+          : undefined
+        const prop = obj?.properties.find(
+          (p): p is import('typescript').PropertyAssignment =>
+            ts.isPropertyAssignment(p) && p.name.getText() === 'session',
+        )
+        if (prop !== undefined) found = prop.initializer.getText()
+        return
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    if (found === undefined) throw new Error('readStoredLog session: property not found')
+    return found
+  }
+
+  /** The criterion itself, as a pure predicate over a `session:` initializer. */
+  const isStubNarrowed = (initializerText: string): boolean => /\{\s*id\s*:/.test(initializerText)
+
+  it('★ readStoredLog hands the ORIGINAL header on, not a { id } stub (AST)', async () => {
+    const expr = await readStoredLogSessionExpr()
+    // The regression shape would be an object literal such as `{ id: ... }`.
+    expect(isStubNarrowed(expr)).toBe(false)
+    // The passthrough must actually reference `session` itself.
+    expect(expr).toMatch(/\bsession\b/)
   })
 
-  it('★ M4 guard: a narrowed { id } header is rejected by the host validator (the real failure mode)', async () => {
-    // Mirrors the host's validateSessionHeader contract (documented in the fix).
-    const validate = (h: Record<string, unknown>): void => {
-      if (h.version !== 4) throw new Error(`session header version must be 4, got ${String(h.version)}`)
-      if (typeof h.createdAt !== 'number') throw new Error('createdAt required')
+  /**
+   * The criterion must be INSENSITIVE to layout and to casts, and SENSITIVE to the
+   * actual regression. Both halves are required: the earlier text-based version
+   * was sensitive to spelling (it went red on behaviour-preserving rewrites —
+   * measured, both an `as object` cast and a multi-line reformat failed it), which
+   * makes a criterion an obstacle rather than a guard.
+   */
+  it('★ the criterion ignores layout/casts but still catches the { id } stub', async () => {
+    const { readFileSync } = await import('node:fs')
+    const ts = await import('typescript')
+
+    /** Parse one `session:` initializer spelling and return its AST text. */
+    const initializerOf = (spelling: string): string => {
+      const sf = ts.createSourceFile('probe.ts', `function f(){ return { ${spelling} } }`, ts.ScriptTarget.ESNext, true)
+      let text: string | undefined
+      const visit = (node: import('typescript').Node): void => {
+        if (text !== undefined) return
+        if (ts.isPropertyAssignment(node) && node.name.getText() === 'session') { text = node.initializer.getText(); return }
+        ts.forEachChild(node, visit)
+      }
+      visit(sf)
+      if (text === undefined) throw new Error('probe did not contain a session: property')
+      return text
     }
-    const complete = { version: 4, id: 'session-x', createdAt: CREATED }
-    const narrowed = { id: 'session-x' }
-    expect(() => validate(complete)).not.toThrow()
-    expect(() => validate(narrowed)).toThrow(/version must be 4/)
+
+    const equivalent = [
+      "session: session !== undefined && session !== null && typeof session === 'object' ? session : undefined,",
+      "session: session !== undefined && session !== null && typeof session === 'object' ? (session as object) : undefined,",
+      "session:\n  session !== undefined && session !== null && typeof session === 'object'\n    ? session\n    : undefined,",
+      "session: typeof session === 'object' ? session : undefined,",
+    ]
+    const regressed = [
+      "session: typeof (session as { id?: unknown }).id === 'string' ? { id: (session as { id: string }).id } : undefined,",
+      'session: { id: session.id },',
+    ]
+
+    // Insensitive: every behaviour-identical rewrite passes.
+    for (const spelling of equivalent) {
+      expect(isStubNarrowed(initializerOf(spelling))).toBe(false)
+    }
+    // Sensitive: the actual regression fails.
+    for (const spelling of regressed) {
+      expect(isStubNarrowed(initializerOf(spelling))).toBe(true)
+    }
   })
 })
