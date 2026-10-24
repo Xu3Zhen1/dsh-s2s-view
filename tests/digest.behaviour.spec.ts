@@ -158,45 +158,74 @@ describe('s2s_digest BEHAVIOUR — C: last time and timeline come from real even
  */
 describe('A — the header handed to Session.create is the COMPLETE record', () => {
   /**
-   * Assert the SHAPE of `readStoredLog`'s `session:` property via the TypeScript
-   * AST, not via source-text matching.
+   * A STRUCTURAL criterion, evaluated by walking AST node kinds.
    *
-   * Why AST and not `toContain`: a text assertion on
-   * `typeof session === 'object' ? session : undefined` is over-strict — it goes
-   * red on behaviour-preserving rewrites (adding `as object`, re-wrapping in
-   * parentheses, splitting across lines). Measured: both rewritten forms of this
-   * exact line failed the text assertion while the behaviour was unchanged.
-   * A criterion that fails on correct code is an obstacle, not a criterion.
+   * History of this criterion (all three failures measured, not theorised):
+   *  1. `expect(body).toContain("...? session : undefined")` — a TEXT assertion.
+   *     Over-strict: adding `as object` or reformatting across lines turned it red
+   *     on behaviour-identical code. An obstacle, not a criterion.
+   *  2. `getText()` then `/\{\s*id\s*:/` — still TEXT matching, one AST call deep.
+   *     Bypassed cleanly: a real regression that builds the stub dynamically
+   *     (`const stub = {}; stub['id'] = ...`) contains no `{ id:` literal and went
+   *     green. Also "accidentally right" on `as { id: string }`, which matched the
+   *     TYPE ANNOTATION rather than the stub — right verdict, wrong reason.
+   *  3. This version. The verdict comes from node KINDS only: the value handed on
+   *     must BE the original `session` identifier (optionally behind a conditional
+   *     or a type assertion). An object literal, an IIFE, a call — anything that
+   *     computes a new object — fails, no matter how it is spelled.
    *
-   * What the AST check pins instead is the semantic property that actually broke:
-   * the value handed on is the ORIGINAL `session`, narrowed only to non-null.
-   * A regression to `{ id: session.id }` produces an ObjectLiteral here and fails.
+   * The lesson: **an AST is worth traversing, not stringifying.** Taking `getText()`
+   * and running a regex on it walks straight back into text matching.
    */
-  const readStoredLogSessionExpr = async (): Promise<string> => {
+  const unwrap = (ts: typeof import('typescript'), node: import('typescript').Node): import('typescript').Node => {
+    let current = node
+    for (;;) {
+      if (ts.isParenthesizedExpression(current)) { current = current.expression; continue }
+      if (ts.isAsExpression(current) || ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current)) {
+        current = current.expression
+        continue
+      }
+      return current
+    }
+  }
+
+  /** True when the initializer hands on the ORIGINAL `session` object. */
+  const passesHeaderThrough = (ts: typeof import('typescript'), initializer: import('typescript').Node): boolean => {
+    /** Either branch of a conditional may carry the passthrough. */
+    const isOriginalSession = (node: import('typescript').Node): boolean => {
+      const candidate = unwrap(ts, node)
+      return ts.isIdentifier(candidate) && candidate.text === 'session'
+    }
+    const outer = unwrap(ts, initializer)
+    // Both `guard ? session : undefined` and `guard ? undefined : session` are
+    // valid passthroughs — check both arms rather than assuming one order.
+    if (ts.isConditionalExpression(outer)) {
+      return isOriginalSession(outer.whenTrue) || isOriginalSession(outer.whenFalse)
+    }
+    return isOriginalSession(outer)
+    // An object literal / IIFE / call computes a NEW object => the header was
+    // narrowed, no matter how it is spelled.
+  }
+
+  /** Locate the `session:` initializer node in `readStoredLog`'s return object. */
+  const readStoredLogSessionInitializer = async (): Promise<import('typescript').Node> => {
     const { readFileSync } = await import('node:fs')
     const ts = await import('typescript')
     const file = new URL('../src/digest.ts', import.meta.url)
-    const source = ts.createSourceFile(
-      file.pathname,
-      readFileSync(file, 'utf8'),
-      ts.ScriptTarget.ESNext,
-      true,
-    )
-    let found: string | undefined
+    const source = ts.createSourceFile(file.pathname, readFileSync(file, 'utf8'), ts.ScriptTarget.ESNext, true)
+    let found: import('typescript').Node | undefined
     const visit = (node: import('typescript').Node): void => {
       if (found !== undefined) return
       if (ts.isFunctionDeclaration(node) && node.name?.text === 'readStoredLog') {
         const body = node.body
         if (body === undefined) return
         const ret = body.statements.find(ts.isReturnStatement)
-        const obj = ret?.expression !== undefined && ts.isObjectLiteralExpression(ret.expression)
-          ? ret.expression
-          : undefined
+        const obj = ret?.expression !== undefined && ts.isObjectLiteralExpression(ret.expression) ? ret.expression : undefined
         const prop = obj?.properties.find(
           (p): p is import('typescript').PropertyAssignment =>
             ts.isPropertyAssignment(p) && p.name.getText() === 'session',
         )
-        if (prop !== undefined) found = prop.initializer.getText()
+        if (prop !== undefined) found = prop.initializer
         return
       }
       ts.forEachChild(node, visit)
@@ -206,60 +235,65 @@ describe('A — the header handed to Session.create is the COMPLETE record', () 
     return found
   }
 
-  /** The criterion itself, as a pure predicate over a `session:` initializer. */
-  const isStubNarrowed = (initializerText: string): boolean => /\{\s*id\s*:/.test(initializerText)
+  /** Parse one candidate initializer spelling into a node. */
+  const initializerNodeOf = async (spelling: string): Promise<import('typescript').Node> => {
+    const ts = await import('typescript')
+    const sf = ts.createSourceFile('probe.ts', `function f(){ return { ${spelling} } }`, ts.ScriptTarget.ESNext, true)
+    let node: import('typescript').Node | undefined
+    const visit = (n: import('typescript').Node): void => {
+      if (node !== undefined) return
+      if (ts.isPropertyAssignment(n) && n.name.getText() === 'session') { node = n.initializer; return }
+      ts.forEachChild(n, visit)
+    }
+    visit(sf)
+    if (node === undefined) throw new Error('probe did not contain a session: property')
+    return node
+  }
 
-  it('★ readStoredLog hands the ORIGINAL header on, not a { id } stub (AST)', async () => {
-    const expr = await readStoredLogSessionExpr()
-    // The regression shape would be an object literal such as `{ id: ... }`.
-    expect(isStubNarrowed(expr)).toBe(false)
-    // The passthrough must actually reference `session` itself.
-    expect(expr).toMatch(/\bsession\b/)
+  it('★ readStoredLog hands the ORIGINAL header on, not a computed stub (structural)', async () => {
+    const ts = await import('typescript')
+    const initializer = await readStoredLogSessionInitializer()
+    expect(passesHeaderThrough(ts, initializer)).toBe(true)
   })
 
   /**
-   * The criterion must be INSENSITIVE to layout and to casts, and SENSITIVE to the
-   * actual regression. Both halves are required: the earlier text-based version
-   * was sensitive to spelling (it went red on behaviour-preserving rewrites —
-   * measured, both an `as object` cast and a multi-line reformat failed it), which
-   * makes a criterion an obstacle rather than a guard.
+   * The criterion must be INSENSITIVE to layout/casts and SENSITIVE to the real
+   * regression — including regressions that share no text with the ones above.
    */
-  it('★ the criterion ignores layout/casts but still catches the { id } stub', async () => {
-    const { readFileSync } = await import('node:fs')
+  it('★ criterion self-check: equivalent rewrites pass, every real stub fails', async () => {
     const ts = await import('typescript')
-
-    /** Parse one `session:` initializer spelling and return its AST text. */
-    const initializerOf = (spelling: string): string => {
-      const sf = ts.createSourceFile('probe.ts', `function f(){ return { ${spelling} } }`, ts.ScriptTarget.ESNext, true)
-      let text: string | undefined
-      const visit = (node: import('typescript').Node): void => {
-        if (text !== undefined) return
-        if (ts.isPropertyAssignment(node) && node.name.getText() === 'session') { text = node.initializer.getText(); return }
-        ts.forEachChild(node, visit)
-      }
-      visit(sf)
-      if (text === undefined) throw new Error('probe did not contain a session: property')
-      return text
-    }
 
     const equivalent = [
       "session: session !== undefined && session !== null && typeof session === 'object' ? session : undefined,",
       "session: session !== undefined && session !== null && typeof session === 'object' ? (session as object) : undefined,",
       "session:\n  session !== undefined && session !== null && typeof session === 'object'\n    ? session\n    : undefined,",
       "session: typeof session === 'object' ? session : undefined,",
+      "session: session === null || session === undefined ? undefined : session,",
     ]
+
+    // Real regressions. The last two deliberately avoid the `{ id:` literal —
+    // they were the ones that defeated the previous regex criterion.
     const regressed = [
       "session: typeof (session as { id?: unknown }).id === 'string' ? { id: (session as { id: string }).id } : undefined,",
       'session: { id: session.id },',
+      `session: ((): unknown => {
+        if (session === undefined || session === null || typeof session !== 'object') return undefined
+        const stub: Record<string, unknown> = {}
+        stub['id'] = (session as Record<string, unknown>)['id']
+        return stub
+      })(),`,
+      `session: ((): unknown => {
+        if (session === undefined || session === null || typeof session !== 'object') return undefined
+        const id = (session as { id: string }).id
+        return { id }
+      })(),`,
     ]
 
-    // Insensitive: every behaviour-identical rewrite passes.
     for (const spelling of equivalent) {
-      expect(isStubNarrowed(initializerOf(spelling))).toBe(false)
+      expect(passesHeaderThrough(ts, await initializerNodeOf(spelling))).toBe(true)
     }
-    // Sensitive: the actual regression fails.
     for (const spelling of regressed) {
-      expect(isStubNarrowed(initializerOf(spelling))).toBe(true)
+      expect(passesHeaderThrough(ts, await initializerNodeOf(spelling))).toBe(false)
     }
   })
 })
