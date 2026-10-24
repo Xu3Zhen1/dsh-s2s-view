@@ -171,8 +171,19 @@ describe('A — the header handed to Session.create is the COMPLETE record', () 
    *     TYPE ANNOTATION rather than the stub — right verdict, wrong reason.
    *  3. This version. The verdict comes from node KINDS only: the value handed on
    *     must BE the original `session` identifier (optionally behind a conditional
-   *     or a type assertion). An object literal, an IIFE, a call — anything that
-   *     computes a new object — fails, no matter how it is spelled.
+   *     or a type assertion).
+   *
+   * SCOPE — read this before trusting the criterion further than it goes:
+   * the guard's protective surface is the union of the samples actually tested
+   * below, NOT "every way of computing a new object". The self-check verifies
+   * three stub-building regressions (literal `{ id: … }`,
+   * `const id = …; return { id }`, dynamic `stub['id'] = …`); `Object.assign` is
+   * NOT among them — it is named here only as a shape the criterion is expected
+   * to reject, and that expectation is unverified. The criterion has NOT been
+   * shown to catch every possible spelling, and it cannot see a regression that
+   * passes `session` through here and discards it downstream. Claiming "this
+   * whole family is covered" would be the same over-claim this file exists to
+   * stop repeating.
    *
    * The lesson: **an AST is worth traversing, not stringifying.** Taking `getText()`
    * and running a regex on it walks straight back into text matching.
@@ -203,8 +214,10 @@ describe('A — the header handed to Session.create is the COMPLETE record', () 
       return isOriginalSession(outer.whenTrue) || isOriginalSession(outer.whenFalse)
     }
     return isOriginalSession(outer)
-    // An object literal / IIFE / call computes a NEW object => the header was
-    // narrowed, no matter how it is spelled.
+    // Anything that is not the original `session` identifier — an object literal,
+    // an IIFE, a call — computes a NEW object, so the header was narrowed. Scope
+    // note: this rejects the tested shapes; it is not proof that every conceivable
+    // stub spelling is caught, and `Object.assign` is untested here (see SCOPE).
   }
 
   /** Locate the `session:` initializer node in `readStoredLog`'s return object. */
