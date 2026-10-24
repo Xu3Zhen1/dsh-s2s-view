@@ -171,13 +171,35 @@ function headerTime(snapshot: unknown): number | undefined {
 }
 
 /**
+ * Title text from one `readTitleSnapshots` settled value.
+ *
+ * **The host returns a title SNAPSHOT OBJECT, not a bare string.** Its shape is
+ * `{ title, messageSeqs, source, eventSeq, updatedAt }` (see
+ * `@deepseek-ai/dsh-session-title`'s `titleSnapshotFromState`). The snapshot is
+ * what `readTitleSnapshots` hands back under `value.title`; the string lives at
+ * `value.title.title`.
+ *
+ * An earlier revision of this function tested `typeof value.title === 'string'`
+ * and therefore skipped EVERY title — the digest kept rendering `(untitled)` for
+ * sessions whose logs plainly carried a `session/title` event. A bare string is
+ * still accepted so a host that flattens the snapshot keeps working.
+ * @param raw - `value.title` from the settled result.
+ * @returns the title text, or `undefined` when there is none.
+ */
+function titleTextOf(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw.length > 0 ? raw : undefined
+  const nested = (raw as { title?: unknown } | undefined)?.title
+  return typeof nested === 'string' && nested.length > 0 ? nested : undefined
+}
+
+/**
  * Fill each row's `title` from the host's title folder, in one batch.
  *
  * Titles are a *view* concern here: a failure to fold them must not sink the
  * digest, so this never throws. The host settles each id independently
- * (`{ status: 'fulfilled', value: { session, title? } }` or
- * `{ status: 'rejected', reason }`), and a session without a title event omits
- * `title` entirely rather than yielding an empty string.
+ * (`{ sessionId, status: 'fulfilled', value } | { sessionId, status: 'rejected', reason }`);
+ * the session id is on the settlement itself (not only inside `value.session`),
+ * and a session with no title event omits `title` from `value` entirely.
  * @param query - the host session-query service.
  * @param rows - rows to annotate.
  * @returns the rows, with `title` filled in where the host knows one.
@@ -195,11 +217,16 @@ async function attachTitles(query: SessionQueryLike, rows: readonly DigestRow[])
   if (!Array.isArray(settled)) return [...rows]
   const byId = new Map<string, string>()
   for (const entry of settled) {
-    const result = entry as { status?: unknown; value?: { session?: { id?: unknown }, title?: unknown } }
+    const result = entry as {
+      sessionId?: unknown
+      status?: unknown
+      value?: { session?: { id?: unknown }, title?: unknown }
+    }
     if (result?.status === 'rejected') continue
-    const id = result?.value?.session?.id
-    const title = result?.value?.title
-    if (typeof id === 'string' && typeof title === 'string' && title.length > 0) byId.set(id, title)
+    // Prefer the settlement's own sessionId; fall back to the cloned header id.
+    const id = typeof result?.sessionId === 'string' ? result.sessionId : result?.value?.session?.id
+    const title = titleTextOf(result?.value?.title)
+    if (typeof id === 'string' && title !== undefined) byId.set(id, title)
   }
   return rows.map(row => {
     const title = byId.get(row.sessionId)

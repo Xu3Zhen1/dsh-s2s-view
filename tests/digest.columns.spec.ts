@@ -39,6 +39,13 @@ function headerTime(snapshot: unknown): number | undefined {
   return typeof t === 'number' && Number.isFinite(t) ? t : undefined
 }
 
+/** Mirrors src/digest.ts::titleTextOf (the host returns a SNAPSHOT, not a string). */
+function titleTextOf(raw: unknown): string | undefined {
+  if (typeof raw === 'string') return raw.length > 0 ? raw : undefined
+  const nested = (raw as { title?: unknown } | undefined)?.title
+  return typeof nested === 'string' && nested.length > 0 ? nested : undefined
+}
+
 /** Mirrors src/digest.ts::attachTitles's fold (the pure part). */
 function foldTitles(
   rows: ReadonlyArray<{ sessionId: string; title: string | undefined }>,
@@ -47,11 +54,15 @@ function foldTitles(
   if (!Array.isArray(settled)) return [...rows]
   const byId = new Map<string, string>()
   for (const entry of settled) {
-    const result = entry as { status?: unknown; value?: { session?: { id?: unknown }, title?: unknown } }
+    const result = entry as {
+      sessionId?: unknown
+      status?: unknown
+      value?: { session?: { id?: unknown }, title?: unknown }
+    }
     if (result?.status === 'rejected') continue
-    const id = result?.value?.session?.id
-    const title = result?.value?.title
-    if (typeof id === 'string' && typeof title === 'string' && title.length > 0) byId.set(id, title)
+    const id = typeof result?.sessionId === 'string' ? result.sessionId : result?.value?.session?.id
+    const title = titleTextOf(result?.value?.title)
+    if (typeof id === 'string' && title !== undefined) byId.set(id, title)
   }
   return rows.map(row => {
     const title = byId.get(row.sessionId)
@@ -145,5 +156,59 @@ describe('B. digest titles come from readTitleSnapshots', () => {
     // name twice (declaration + docstring) and called it zero times.
     const calls = source.match(/query\.readTitleSnapshots\(/g) ?? []
     expect(calls.length).toBeGreaterThan(0)
+  })
+
+  /**
+   * The regression that the first version of the B fix shipped.
+   *
+   * `readTitleSnapshots` hands back the host's title SNAPSHOT under `value.title`
+   * — an object `{ title, messageSeqs, source, eventSeq, updatedAt }` produced by
+   * `titleSnapshotFromState` — not a bare string. Testing
+   * `typeof value.title === 'string'` therefore skipped every title, and the
+   * digest kept printing `(untitled)` although the logs plainly carried a
+   * `session/title` event. Pinned with the REAL shape below.
+   */
+  it('★ reads the title out of the host SNAPSHOT object (the shape that was missed)', () => {
+    const rows = [{ sessionId: 'session-aaa', title: undefined as string | undefined }]
+    const settled = [{
+      sessionId: 'session-aaa',
+      status: 'fulfilled',
+      value: {
+        session: { version: 4, id: 'session-aaa', createdAt: 1_792_776_900_000 },
+        // Exactly what @deepseek-ai/dsh-session-title returns:
+        title: {
+          title: '继承开发计划书会话-2，你接',
+          messageSeqs: [10],
+          source: { kind: 'fallback' },
+          eventSeq: 15,
+          updatedAt: 1_792_776_900_000,
+        },
+      },
+    }]
+    expect(titleTextOf((settled[0]!.value as { title: unknown }).title)).toBe('继承开发计划书会话-2，你接')
+    expect(foldTitles(rows, settled)[0]!.title).toBe('继承开发计划书会话-2，你接')
+  })
+
+  it('★ negative control: a string-only test would have skipped that snapshot', () => {
+    // The exact predicate the first B attempt used.
+    const oldAccepts = (v: unknown): boolean => typeof v === 'string' && v.length > 0
+    const snapshot = { title: '继承开发计划书会话-2，你接', messageSeqs: [10] }
+    expect(oldAccepts(snapshot)).toBe(false)   // why every title was dropped
+    expect(titleTextOf(snapshot)).toBe('继承开发计划书会话-2，你接') // and what fixes it
+  })
+
+  it('still accepts a flattened string title, and keys by the settlement sessionId', () => {
+    const rows = [
+      { sessionId: 'session-aaa', title: undefined as string | undefined },
+      { sessionId: 'session-bbb', title: undefined as string | undefined },
+    ]
+    const settled = [
+      // keyed by top-level sessionId only (no value.session.id)
+      { sessionId: 'session-aaa', status: 'fulfilled', value: { title: 'flat string title' } },
+      { sessionId: 'session-bbb', status: 'fulfilled', value: {} },
+    ]
+    const out = foldTitles(rows, settled)
+    expect(out[0]!.title).toBe('flat string title')
+    expect(out[1]!.title).toBeUndefined()
   })
 })
