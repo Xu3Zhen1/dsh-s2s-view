@@ -45,6 +45,91 @@ async function sessionDir(root: string, name: string, id: string) {
 const titleLine = (title: string): string => `{"type":"session/title","data":{"title":"${title}"}}\n`
 const headerLine = (id: string): string => `{"type":"session","version":4,"id":"${id}","cwd":"/ws"}\n`
 
+// ───────────────────────────────────────────────────────────────────────────
+// Shared instrumentation for the structural checks.
+//
+// ★★ THESE LIVE AT MODULE SCOPE ON PURPOSE. A previous version had the reverse
+// test use its OWN copy of the slice logic (`methodBody2`), so removing the real
+// criterion's defences left the suite 8/8 GREEN: the "reverse test" was
+// decoration, not protection. Cross-review caught it (2026-10-26) with the
+// decisive experiment — cross-file slice + length invariant deleted ⇒ 8 passed.
+// Sharing ONE implementation is what makes the reverse test actually guard the
+// real assertion. Do not copy these into the tests again.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Strip comments. A doc comment that merely NAMES an identifier must never
+ *  satisfy a structural assertion — that is how an assertion gets satisfied by
+ *  prose instead of code. */
+const stripComments = (s: string): string => s
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .split('\n')
+  .filter((line) => !line.trim().startsWith('//'))
+  .join('\n')
+
+/**
+ * Extract one method's source from ONE file's text.
+ *
+ * Line-based on purpose. Two earlier attempts were wrong:
+ *  1. locating at the first textual mention ⇒ usually the doc comment that
+ *     names the method;
+ *  2. ending at the next `private async ` in a CONCATENATED multi-file string
+ *     ⇒ runs into later files (measured: 37,257-char slice in a 27,083-char
+ *     file) and produced a false green;
+ *  3. brace matching ⇒ the signature's return type can contain braces
+ *     (`Promise<{ origin: … }>`), so the scan closes on the return type
+ *     (measured: 137-char body, cut mid-signature).
+ * The end is the first later line whose indentation equals the declaration's
+ * and whose text is `}`.
+ */
+const methodBody = (fileCode: string, name: string): string | undefined => {
+  const ls = fileCode.split('\n')
+  let start = -1
+  let indent = ''
+  for (let i = 0; i < ls.length; i++) {
+    if (ls[i]!.includes('private async ' + name + '(')) {
+      start = i
+      indent = (ls[i]!.match(/^\s*/) ?? [''])[0]!
+      break
+    }
+  }
+  if (start < 0) return undefined
+  for (let i = start + 1; i < ls.length; i++) {
+    if (ls[i] === indent + '}') return ls.slice(start, i + 1).join('\n')
+  }
+  return undefined // no terminator ⇒ caller asserts loudly
+}
+
+/** Locate a method across a set of already-stripped file texts. */
+const locateAcross = (
+  codes: string[],
+  name: string,
+  paths: string[],
+): { file: string; body: string; fileLen: number } | undefined => {
+  for (let i = 0; i < codes.length; i++) {
+    const body = methodBody(codes[i]!, name)
+    if (body !== undefined) return { file: paths[i]!, body, fileLen: codes[i]!.length }
+  }
+  return undefined
+}
+
+/** Read and strip every `.ts`/`.js` file under `src/`. */
+async function loadSrcTree(root: URL): Promise<{ paths: string[]; codes: string[] }> {
+  const { readdir, readFile } = await import('node:fs/promises')
+  const walk = async (dir: URL): Promise<URL[]> => {
+    const out: URL[] = []
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const child = new URL(e.name + (e.isDirectory() ? '/' : ''), dir)
+      if (e.isDirectory()) { if (e.name !== 'node_modules') out.push(...await walk(child)) }
+      else if (e.name.endsWith('.ts') || e.name.endsWith('.js')) out.push(child)
+    }
+    return out
+  }
+  const files = await walk(root)
+  const codes: string[] = []
+  for (const f of files) codes.push(stripComments(await readFile(f, 'utf8')))
+  return { paths: files.map((f) => f.pathname), codes }
+}
+
 describe('s2s discovery L4 title read across log formats', () => {
   it('★ reads a title from a v4-ONLY session log (the current format)', async () => {
     const root = await mkdtemp(join(tmpdir(), 's2s-v4-'))
@@ -164,26 +249,12 @@ describe('s2s discovery L4 title read across log formats', () => {
     // occurrences of the log names — so widening the scan is green today and
     // covers a future third reader in another module for free.
     const { readdir: readDir, readFile: readSource } = await import('node:fs/promises')
-    const srcRoot = new URL('../src/', import.meta.url)
-    const strip = (s: string): string => s
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .split('\n')
-      .filter((line) => !line.trim().startsWith('//'))
-      .join('\n')
-    const walk = async (dir: URL): Promise<URL[]> => {
-      const out: URL[] = []
-      for (const e of await readDir(dir, { withFileTypes: true })) {
-        const child = new URL(e.name + (e.isDirectory() ? '/' : ''), dir)
-        if (e.isDirectory()) { if (e.name !== 'node_modules') out.push(...await walk(child)) }
-        else if (e.name.endsWith('.ts') || e.name.endsWith('.js')) out.push(child)
-      }
-      return out
-    }
-    const files = await walk(srcRoot)
+    // Shared instrumentation (module scope) — see the block near the top. NOT
+    // redefined here: the reverse test must exercise the SAME slice logic, or
+    // it stops guarding anything.
+    const { paths, codes } = await loadSrcTree(new URL('../src/', import.meta.url))
     // Proves the scan is not vacuously green over an empty set.
-    expect(files.length).toBeGreaterThan(10)
-    const codes: string[] = []
-    for (const f of files) codes.push(strip(await readSource(f, 'utf8')))
+    expect(codes.length).toBeGreaterThan(10)
     const all = codes.join('\n')
     // 1. The constant exists, once, with the newest-first order.
     const defs = all.match(/const SESSION_LOG_CANDIDATES = \['session\.v4\.jsonl\.zstd', 'session\.jsonl\.zstd'\] as const/g) ?? []
@@ -196,151 +267,99 @@ describe('s2s discovery L4 title read across log formats', () => {
     const plainLiterals = (all.match(/'session\.jsonl'/g) ?? []).length
     expect(plainLiterals).toBe(1)
     // 4. Both known readers consume the constant — asserted as a SET of the
-    //    functions that mention it, NOT as a count. ★ A bare `uses.length === 3`
-    //    was the wrong shape: adding a legitimate third reader would turn it red
-    //    for the wrong reason, and a third reader is exactly what this check is
-    //    supposed to welcome.
-    //    ★★ SLICE BOUNDARY — third attempt; the first two were wrong.
-    //
-    //    Attempt 1: located the reader at its first textual mention (usually the
-    //      doc comment that NAMES it) ⇒ wrong region.
-    //    Attempt 2: ended the slice at the next `private async ` in the WHOLE
-    //      CONCATENATED source; for readTitleFromFs (last method of
-    //      discovery.ts) that ran into later files — measured 37,257-char slice
-    //      against a 27,083-char file. It produced a FALSE GREEN: hardcoded
-    //      reader + a third reader appended after it ⇒ 7/7 passed (verified).
-    //    Attempt 3: brace matching — ALSO wrong, because the signature's return
-    //      type contains braces (`Promise<{ origin: … }>`), so the scan closed
-    //      on the return type: body measured 137 chars, cut mid-signature.
-    //
-    //    Final: line-based. The body ends at the first line after the
-    //    declaration whose indentation equals the declaration's and whose text
-    //    is `}`. Independent of brace counting and of any other file, and the
-    //    reverse test below fails if it ever drifts again.
-    const methodBody = (fileCode: string, name: string): string | undefined => {
-      const ls = fileCode.split('\n')
-      let start = -1
-      let indent = ''
-      for (let i = 0; i < ls.length; i++) {
-        if (ls[i]!.includes('private async ' + name + '(')) {
-          start = i
-          indent = (ls[i]!.match(/^\s*/) ?? [''])[0]!
-          break
-        }
-      }
-      if (start < 0) return undefined
-      for (let i = start + 1; i < ls.length; i++) {
-        if (ls[i] === indent + '}') return ls.slice(start, i + 1).join('\n')
-      }
-      return undefined // no terminator ⇒ caller asserts loudly
-    }
-    const locate = (name: string): { file: string; body: string; fileLen: number } | undefined => {
-      for (let i = 0; i < files.length; i++) {
-        const body = methodBody(codes[i]!, name)
-        if (body !== undefined) return { file: files[i]!.pathname, body, fileLen: codes[i]!.length }
-      }
-      return undefined
-    }
+    //    functions that mention it, NOT as a count. A bare `uses.length === 3`
+    //    was the wrong shape: a legitimate third reader would redden it for the
+    //    wrong reason, and a third reader is exactly what this check welcomes.
     for (const reader of ['readOriginFromFs', 'readTitleFromFs']) {
-      const found = locate(reader)
+      const found = locateAcross(codes, reader, paths)
       // Fail loudly if the declaration shape changed, rather than silently
       // passing over an empty slice.
       expect(found === undefined, 'declaration of ' + reader + ' not found — update this check').toBe(false)
-      // ★ A method body MUST NOT exceed the file that holds it. This is exactly
-      //   the invariant attempt 2 violated (37k slice, 27k file), and it turns a
-      //   runaway slice into a loud failure instead of silently widening the
-      //   check into unrelated modules.
+      // ★ A method body MUST NOT exceed the file that holds it. This invariant
+      //   is what turned a runaway cross-file slice into a loud failure.
       expect(found!.body.length).toBeLessThanOrEqual(found!.fileLen)
       expect(found!.body).toContain('SESSION_LOG_CANDIDATES')
     }
   })
 
   it('★ a hardcoded reader stays RED even when a third reader follows it (slice-boundary reverse test)', async () => {
-    // ★ The reverse test cross-review demanded, and the reason it exists: the
-    // previous slice implementation reported this exact scenario as 7/7 green.
-    // If a future edit reintroduces a cross-file / over-long slice, THIS goes
-    // red even though the "readers share one list" test would go green again.
+    // ★ Why this test exists: an earlier slice implementation ended at the next
+    // `private async` in a CONCATENATED source, so readTitleFromFs' slice ran on
+    // into later files (37,257 chars in a 27,083-char file) and reported this
+    // exact scenario as 7/7 green.
     //
-    // Method: mutate a SCRATCH COPY of discovery.ts (never the real file) by
-    //   (a) replacing the constant loop in readTitleFromFs with a concatenated
-    //       literal list — which also sidesteps `literalArraySites`, and
-    //   (b) appending a legitimate third reader AFTER readTitleFromFs,
-    // then run the same locate()/methodBody() logic the real test uses.
-    const { readFile: readSource, readdir: readDir } = await import('node:fs/promises')
-    const strip2 = (s: string): string => s
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .split('\n')
-      .filter((line) => !line.trim().startsWith('//'))
-      .join('\n')
-    const walk2 = async (dir: URL): Promise<URL[]> => {
-      const out: URL[] = []
-      for (const e of await readDir(dir, { withFileTypes: true })) {
-        const child = new URL(e.name + (e.isDirectory() ? '/' : ''), dir)
-        if (e.isDirectory()) { if (e.name !== 'node_modules') out.push(...await walk2(child)) }
-        else if (e.name.endsWith('.ts') || e.name.endsWith('.js')) out.push(child)
-      }
-      return out
-    }
-    const srcFiles = await walk2(new URL('../src/', import.meta.url))
-    const srcCodes: string[] = []
-    for (const f of srcFiles) srcCodes.push(strip2(await readSource(f, 'utf8')))
+    // ★★ It calls locateAcross() — the SAME function the criterion above uses.
+    // The first version of this test carried its OWN copy of the slice logic
+    // (`methodBody2`). Cross-review destroyed it with one experiment: revert the
+    // real criterion to the cross-file form AND delete the length invariant ⇒
+    // 8/8 still passed. The reverse test was decoration. Sharing the
+    // implementation is the whole point; re-inline it and the guard evaporates.
+    //
+    // Mutation is applied to an IN-MEMORY copy of the tree — never the real file.
+    const { readFile } = await import('node:fs/promises')
+    const { paths, codes } = await loadSrcTree(new URL('../src/', import.meta.url))
 
-    // Find the file that declares readTitleFromFs, and mutate a copy of it.
+    // (a) hardcode readTitleFromFs WITHOUT a literal filename array (string
+    //     concatenation sidesteps the `literalArraySites` check on purpose, so
+    //     only the per-reader assertion can catch it).
     let targetIdx = -1
-    let original = ''
-    for (let i = 0; i < srcFiles.length; i++) {
-      const c = await readSource(srcFiles[i]!, 'utf8')
-      if (c.includes('private async readTitleFromFs(')) { targetIdx = i; original = c; break }
+    let mutated = ''
+    for (let i = 0; i < codes.length; i++) {
+      // note: `codes` is comment-stripped; mutate the RAW file and re-strip.
+      const raw = await readFile(new URL('file://' + paths[i]!), 'utf8')
+      if (!raw.includes('for (const name of SESSION_LOG_CANDIDATES) {')) continue
+      if (!raw.includes('private async readTitleFromFs(')) continue
+      const m = raw.replace(
+        'for (const name of SESSION_LOG_CANDIDATES) {',
+        "for (const name of ['session.' + 'v4.jsonl.zstd', 'session.' + 'jsonl.zstd']) {",
+      )
+      if (m === raw) continue
+      targetIdx = i
+      mutated = m
+      break
     }
     expect(targetIdx).toBeGreaterThan(-1)
-    // (a) hardcode without a literal filename array
-    const mutated = original.replace(
-      'for (const name of SESSION_LOG_CANDIDATES) {',
-      "for (const name of ['session.' + 'v4.jsonl.zstd', 'session.' + 'jsonl.zstd']) {",
-    )
-    expect(mutated).not.toBe(original) // the mutation actually applied
-    // (b) a legitimate third reader, appended AFTER readTitleFromFs
+    // (b) a legitimate third reader appended AFTER readTitleFromFs.
     const withThird = mutated.trimEnd()
       + '\n\nexport function zzThirdReader(dir: string): string[] {\n  return SESSION_LOG_CANDIDATES.map((n) => dir + n)\n}\n'
 
-    const codes2 = srcCodes.slice()
-    codes2[targetIdx] = strip2(withThird)
+    const codes2 = codes.slice()
+    codes2[targetIdx] = stripComments(withThird)
 
-    // Re-run the SAME locate logic on the mutated tree.
-    const methodBody2 = (fileCode: string, name: string): string | undefined => {
-      const at = fileCode.indexOf('private async ' + name + '(')
-      if (at < 0) return undefined
-      const paren = fileCode.indexOf('(', at)
-      if (paren < 0) return undefined
-      let pdepth = 0
-      let afterParams = -1
-      for (let i = paren; i < fileCode.length; i++) {
-        if (fileCode[i] === '(') pdepth += 1
-        else if (fileCode[i] === ')') {
-          pdepth -= 1
-          if (pdepth === 0) { afterParams = i; break }
-        }
-      }
-      if (afterParams < 0) return undefined
-      const open = fileCode.indexOf('{', afterParams)
-      if (open < 0) return undefined
-      let depth = 0
-      for (let i = open; i < fileCode.length; i++) {
-        const ch = fileCode[i]
-        if (ch === '{') depth += 1
-        else if (ch === '}') { depth -= 1; if (depth === 0) return fileCode.slice(at, i + 1) }
-      }
-      return undefined
-    }
-    let body: string | undefined
-    for (let i = 0; i < srcFiles.length; i++) {
-      const b = methodBody2(codes2[i]!, 'readTitleFromFs')
-      if (b !== undefined) { body = b; break }
-    }
-    expect(body).toBeDefined()
-    // THE ASSERTION THAT MATTERS: the hardcoded reader must be caught.
-    expect(body).not.toContain('SESSION_LOG_CANDIDATES')
-    // ...while the third reader is legitimately present in the same tree.
+    const found = locateAcross(codes2, 'readTitleFromFs', paths)
+    expect(found).toBeDefined()
+    // THE ASSERTION THAT MATTERS: the hardcoded reader must be caught by the
+    // very function the real criterion calls.
+    expect(found!.body).not.toContain('SESSION_LOG_CANDIDATES')
+    // ...while the third reader is legitimately present in the same tree, i.e.
+    // this is exactly the future scenario the criterion is supposed to welcome.
     expect(codes2[targetIdx]).toContain('zzThirdReader')
+  })
+
+  it('★ the reverse test actually depends on the criterion (no self-guarding blind spot)', async () => {
+    // Pins the property cross-review used to expose the flaw: the reverse test
+    // must call the shared implementation, not a private copy. If someone
+    // re-inlines the slice logic, this goes red.
+    const { readFile } = await import('node:fs/promises')
+    const self = await readFile(new URL(import.meta.url), 'utf8')
+    const code = stripComments(self)
+    // Count *definitions* of the slice helper. Match at line start so this
+    // assertion's own needle (which sits inside a string/regex literal) is not
+    // counted — measured: a bare match of the pattern found 2, the second being
+    // this very line.
+    const defs = code.split('\n').filter((l) => /^\s*const methodBody = \(/.test(l))
+    expect(defs).toHaveLength(1)
+    // No second *definition* of the slice logic under another name. Asserted by
+    // shape (a second `const <name> = (fileCode`, i.e. a duplicate extractor),
+    // not by searching for a specific identifier — a self-referential needle
+    // would match this very assertion and fail always.
+    const extractors = code.split('\n').filter((l) => /^\s*const \w+ = \(fileCode/.test(l))
+    expect(extractors).toHaveLength(1)
+    // The reverse test must reach for the shared locator.
+    const reverseAt = code.indexOf('slice-boundary reverse test')
+    expect(reverseAt).toBeGreaterThan(-1)
+    const reverseBody = code.slice(reverseAt)
+    expect(reverseBody).toContain('locateAcross(')
+    expect((reverseBody.split('\n').filter((l) => /^\s*const \w+ = \(fileCode/.test(l)))).toHaveLength(0)
   })
 })
