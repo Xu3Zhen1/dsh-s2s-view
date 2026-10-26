@@ -174,7 +174,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       })
     })
   })
-  ctx.plugin(toolsPlugin)
+  ctx.plugin(toolsPlugin, { scheduleConfigured: config.schedule !== undefined })
   ctx.plugin(digestPlugin)
 }
 

@@ -262,9 +262,17 @@ export function renderRefusedOutcome(resolved: Extract<S2sResolveResult, { kind:
     + '. The message(s) stay in the target\'s mailbox (never dropped).'
 }
 
-export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger }): ToolDefinition[] {
+export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S2sDiscoveryService; lifecycle?: S2sLifecycleService; budget?: S2sBudget; schedule?: S2sScheduleService; ledger?: S2sLedger; scheduleConfigured?: boolean }): ToolDefinition[] {
   const ctx = deps.ctx
   const broker = deps.broker, discovery = deps.discovery, lifecycle = deps.lifecycle, budget = deps.budget, schedule = deps.schedule, ledger = deps.ledger
+  // ★ Whether the operator CONFIGURED a schedule block — passed down from the
+  // parent plugin, which is the only place `config.schedule` is visible.
+  // Without it the status report could not tell "no block configured" (benign)
+  // from "a block IS configured but the service never mounted" (a fault), and
+  // had to print a line admitting it could not distinguish them. This closes
+  // that: the two states are now separable at the source, not guessed at the
+  // reporting site.
+  const scheduleConfigured = deps.scheduleConfigured === true
   const resolve = async function(name: string | undefined, sessionId: string | undefined): Promise<S2sResolveResult | { kind: 'err'; reason: string }> {
     if ((name === undefined || name.length === 0) && (sessionId === undefined || sessionId.length === 0)) {
       return { kind: 'err', reason: 'Provide a name (the session title) or a session_id.' }
@@ -719,11 +727,42 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
 
         // Queue depth is the one per-session number that needs no ledger: the
         // mailbox is on disk, so it is honest even on a storage-less host.
+        //
+        // ★★ BUT "0" MUST NOT MEAN TWO THINGS (G9, measured on the live host
+        // 2026-10-26): `queuedCount(id)` does no existence check, so
+        //     queue: nonexistent-session-00000000 = 0 message(s) waiting.
+        // rendered identically to a real session with an empty queue. "Nothing
+        // waiting" and "there is no such session" are the same shape again.
+        // When the caller named a session explicitly, resolve it first and say
+        // so plainly; `queuedCount` is then only called for a real id.
         if (lifecycle !== undefined) {
           const targets = args.session_id === undefined
             ? [...new Set(reports.map(function(r) { return r.sessionId }))]
             : [args.session_id]
           for (const id of targets) {
+            if (args.session_id !== undefined) {
+              // `resolve` returns `{ kind: 'err' }` for a bad request and the
+              // discovery variants for a real lookup — handle ALL of them, or an
+              // unhandled kind would fall through to `queuedCount` and print a
+              // fabricated 0 (the very defect this block exists to prevent).
+              const resolved = await resolve(undefined, args.session_id)
+              if (resolved.kind === 'err') {
+                lines.push('queue: ' + id + ' = UNKNOWN — ' + resolved.reason
+                  + ' This is NOT "0 waiting".')
+                continue
+              }
+              if (resolved.kind === 'not-found') {
+                lines.push('queue: ' + id + ' = UNKNOWN — no session answers to this id'
+                  + ' (corpus of ' + String(resolved.totalCandidates ?? 0) + ' sessions).'
+                  + ' This is NOT "0 waiting": a non-existent id has no queue to read.')
+                continue
+              }
+              if (resolved.kind === 'ambiguous') {
+                lines.push('queue: ' + id + ' = UNKNOWN — this id matches several sessions.'
+                  + ' This is NOT "0 waiting".')
+                continue
+              }
+            }
             const queued = await lifecycle.queuedCount(id)
             lines.push('queue: ' + id + ' = ' + queued + ' message(s) waiting.')
           }
@@ -811,10 +850,20 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             // added above is that the plugin logger is not persisted, so the
             // status line is the only retrievable half. Staying silent built the
             // very "legal empty vs broken feature" pair we are trying to remove.
-            lines.push('schedule replay: NOT MOUNTED — no `s2sSchedule` service in this context, so there is'
-              + ' no replay to report. Either no `schedule` config block is present (benign) or the'
-              + ' sub-plugin failed to mount (a fault); this line alone cannot distinguish them.'
-              + ' `s2s_schedule` reports "not configured" in the benign case.')
+            //
+            // ★★ AND THE TWO STATES ARE SEPARABLE, so we must not lump them.
+            // `scheduleConfigured` is threaded down from the parent plugin, the
+            // only place `config.schedule` exists. An earlier version of this
+            // line admitted "this line alone cannot distinguish them" — honest,
+            // but it threw away information that WAS available one level up.
+            // A diagnostic that says "I cannot tell" when it could tell is a
+            // weaker fault than a silent one, not a fix.
+            lines.push(scheduleConfigured
+              ? 'schedule replay: MOUNT FAILED — a `schedule` config block IS present, but no'
+                + ' `s2sSchedule` service exists in this context, so the sub-plugin did not mount.'
+                + ' This is a FAULT, not an unused feature: configured scheduled prompts will NOT fire.'
+              : 'schedule replay: NOT CONFIGURED — no `schedule` config block is present, so there is'
+                + ' nothing to replay. This is benign (an unused optional feature), not a fault.')
           }
         }
 
@@ -1085,8 +1134,12 @@ export const name = 's2s-tools'
 
 export const inject = ['s2sBroker', 's2sDiscovery', 'tools']
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config?: { scheduleConfigured?: boolean }): void {
   const tools = ctx.get('tools') as { register(definition: ToolDefinition): () => void }
+  // Passed by the parent plugin (see index.ts); absent means "assume not
+  // configured", which is the safe reading — it can only under-claim a fault,
+  // never invent one.
+  const scheduleConfigured = config?.scheduleConfigured === true
   // Independent cold-start sampler, registered on the tool pipeline rather than
   // inside `s2s_status`: the stamp must be produced by the FIRST s2s_* call of
   // any kind, because a stamp written by the status handler is created BY the
@@ -1126,7 +1179,7 @@ export function apply(ctx: Context): void {
   // Optional like the others: the tools must still work when no ledger is
   // mounted, they just cannot report delivery state.
   const ledger = ctx.get('s2sLedger') as S2sLedger | undefined
-  const disposers = buildTools({ ctx: ctx, broker: broker, discovery: discovery, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }), ...(ledger === undefined ? {} : { ledger: ledger }) }).map(function(d) { return tools.register(d) })
+  const disposers = buildTools({ ctx: ctx, broker: broker, discovery: discovery, scheduleConfigured: scheduleConfigured, ...(lifecycle === undefined ? {} : { lifecycle: lifecycle }), ...(budget === undefined ? {} : { budget: budget }), ...(schedule === undefined ? {} : { schedule: schedule }), ...(ledger === undefined ? {} : { ledger: ledger }) }).map(function(d) { return tools.register(d) })
   ctx.effect(function() { return function() { for (const d of disposers) d() } }, 's2s-tools.disposers')
   // T30: the lifecycle's own gates (before `registry.resume` and inside
   // `drain`, which `agent/created` can trigger without any tool call) run the
