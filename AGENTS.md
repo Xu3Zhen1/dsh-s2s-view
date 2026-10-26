@@ -98,6 +98,14 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
 - **Report counts with their scope, timestamp, and definition.** Live data
   drifts; the same probe reads 209 then 215. Prefer claims that hold regardless
   of when you measure.
+- **When the plausible counting bases disagree, do not pick one — say so.** A
+  count is only meaningful against a definition. If "how many" comes out as 6 by
+  leftover artefacts, 5 by affected working trees and 2 by at-risk commits, the
+  honest statement is that no single number exists, plus the bases and why they
+  differ. Picking one and silently dropping the others is how an unverifiable
+  number gets quoted as fact later. (2026-10-26: a rule about not writing
+  unverified claims shipped with an unverified count of incidents — no test can
+  catch that, because a wrong number in a document turns nothing red.)
 
 ---
 
@@ -139,12 +147,13 @@ too — do not write that a role was handed over until the new holder has writte
 
 This repository is worked by several concurrent sessions (implementation, git, cross-review)
 in the **same** checkout. On 2026-10-26 this cost us repeatedly: a mutation injected for
-verification was left in the tree while another line ran its gate; at least twice a leftover
-string sat one `git add -A` away from being committed as if it were the fix (once already
-staged); and a temporary probe file was picked up by the test runner and inflated the suite
-count. **No single incident count is asserted here on purpose** — "how many" depends on the
-unit (leftover artefacts / affected trees / at-risk commits) and the three bases do not
-agree. The enumerated list with per-item evidence lives in the handoff page.
+verification was left in the tree while another line ran its gate; in at least two of those
+episodes a leftover string sat one `git add -A` away from being committed as if it were the
+fix (one of them already staged); and a temporary probe file was picked up by the test runner
+and inflated the suite count. **No single incident count is asserted here on purpose** —
+"how many" depends on the unit (leftover artefacts / affected trees / at-risk commits) and
+the three bases do not agree. The enumerated list with per-item evidence lives in the
+handoff page.
 
 **`git checkout -- <file>` and `git restore <file>` are WRITE operations, not recovery.** They
 overwrite whatever is there without asking. One line "restoring" a file silently erased another
