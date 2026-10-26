@@ -23,7 +23,9 @@
 - **job 模型**:`{ id, target(本会话), everySeconds?/atIso?, text, nextAt, enabled, createdAt }`。
 - **持久化**:会话日志事件(如 `s2s/schedule-change`)或 job 文件;重放恢复 `nextAt`。
 - **触发**:进程内 timer;到点 idle 才注入(不打断)/ busy 跳过并推后 / dormant 由 s2s 拉活。
-- **注入**:`source: { kind: 's2s-schedule' }` + framing「这是调度的任务指令,请执行;来源 = 任务创建者」——防注入 + 保执行语义。
+- **注入**:`source: { kind: 'dsh-s2s' }`(注:**不是** `s2s-schedule`) + framing「这是调度的任务指令,请执行;来源 = 任务创建者」——防注入 + 保执行语义。
+  ★ **订正(2026-10-26,按源码实测)**:本文件原先写 `kind: 's2s-schedule'`,与实现不符。`src/source.ts:22` 声明的是**单一的** `S2S_MESSAGE_SOURCE = { kind: 'dsh-s2s' }`,broker/lifecycle/schedule **三处共用同一个**。理由在 `src/source.ts` 头注释:session format v4 要求 producer-owned `source.kind`,而 `ledger`/`reconcile`/`history` 都按 `source.kind === 'dsh-s2s'` 认归属(`src/history.ts:151`)——若调度消息自用一个 kind,它会**不被认作 s2s 投递**,`landed` 判定永远匹配不到。
+  ★ **判据纪律**:凡「某 source kind 是什么」的断言,**不能凭文档**,要 `grep S2S_MESSAGE_SOURCE src/*.ts` 并看它被几处共用。
 - **工具**:`s2s_schedule action=list / create / cancel`。
 
 ## 3. 间隔(我们的面)

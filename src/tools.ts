@@ -473,9 +473,21 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             // T9: `drain()` hands the queue to the agent, which is the same handover
             // the live path reports — so the same restraint applies. The old wording
             // said a bare "delivered", which a reader takes as "it is in the log".
+            //
+            // The three outcomes are kept apart because each is a different fact.
+            // `'already-live'` is reachable HERE only through a race: `resolved.state`
+            // is a snapshot taken before the `record`/`budget.check` awaits, so a
+            // target woken in that window reaches `queueForDormant` and comes back
+            // without a resume. Wording it "Woke" would claim a wake that did not
+            // happen; wording it "Queued … nothing has been delivered yet" would be
+            // the opposite lie, since the queue WAS handed over. Both are I1
+            // violations, so it gets its own line.
+            const head = labelOf(resolved)
             const base = outcome === 'resumed'
-              ? 'Woke "' + labelOf(resolved) + '"' + matchNote + ' and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
-              : 'Queued for "' + labelOf(resolved) + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
+              ? 'Woke "' + head + '"' + matchNote + ' and handed the queued message(s) to it (queue now: ' + queued + '). Log presence is confirmed by s2s_reconcile / s2s_history.'
+              : outcome === 'already-live'
+                ? 'Handed the queued message(s) to "' + head + '"' + matchNote + ', which was ALREADY live by the time the queue reached it (queue now: ' + queued + ')— no resume was performed. The session looked dormant when resolved, so this state changed mid-call. Log presence is confirmed by s2s_reconcile / s2s_history.'
+                : 'Queued for "' + head + '" (' + queued + ' total). It is dormant and autoResume is off, so nothing has been delivered yet.'
             return { text: base + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
           })()
         } catch (error: unknown) {
@@ -576,9 +588,23 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             const confirm = recorded
               ? ' Log presence is confirmed by s2s_reconcile / s2s_history.'
               : ' This message is NOT tracked in the ledger, so s2s_reconcile cannot see it — read the target\'s own log with s2s_history instead.'
-            return { text: outcome === 'resumed'
-              ? 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved) + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm + selfCheckNote(exec)
-              : 'Session "' + labelOf(resolved) + '" is dormant; queued (' + queued + ' total) — nothing delivered yet.' + selfCheckNote(exec) }
+            // I1: the receipt must match which of the two handover paths ran.
+            // `queueForDormant` reports `'resumed'` only when `registry.resume`
+            // actually ran; a target that was live all along reports
+            // `'already-live'`, and that branch must NOT say "resumed" — nothing
+            // was woken and no preset was composed (see `presetUnavailableReason`
+            // in `s2s_status`). Before this split both paths printed "resumed and
+            // the queued message(s) were handed to it", which claimed a wake that
+            // never happened for any live target — and `s2s_resume` has no state
+            // guard, so that was an ordinary call path, not an edge case.
+            const head = 'Session "' + labelOf(resolved) + '"' + matchNoteOf(resolved)
+            if (outcome === 'resumed') {
+              return { text: head + ' resumed and the queued message(s) were handed to it (queue now: ' + queued + ').' + confirm + selfCheckNote(exec) }
+            }
+            if (outcome === 'already-live') {
+              return { text: head + ' was already live — NO resume was performed (so no preset was composed); the queued message(s) were handed to the running agent (queue now: ' + queued + ').' + confirm + selfCheckNote(exec) }
+            }
+            return { text: head + ' is dormant; queued (' + queued + ' total) — nothing delivered yet.' + selfCheckNote(exec) }
           })()
         } catch (error: unknown) {
           // Only the T29 self refusal is rendered. Other S2sError codes keep their existing contract (e.g. the unsafe-id guard in s2s_resume is asserted to REJECT upstream), so this wrapper must not swallow them.
@@ -722,6 +748,34 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + (lc.oldestAgeMs === undefined ? '' : ' (oldest entry ' + Math.round(lc.oldestAgeMs / 1000) + 's old)')
             + ' — success TTL=' + (lc.successTtlMs / 1000) + 's, failure TTL=' + (lc.failureTtlMs / 1000)
             + 's. A failed read uses the shorter TTL on purpose, so a momentary outage recovers quickly.')
+        }
+
+        // ★ Schedule replay failures (G9, added 2026-10-26).
+        //
+        // `S2sScheduleService.load()` used to swallow a corrupt job file with
+        // `catch { /* skip */ }` and read an unreadable directory as "no jobs".
+        // Either way a scheduled prompt silently never fires. A logger line is
+        // NOT enough on this host — the plugin logger is not persisted anywhere,
+        // so after the fact there is no way to tell "never scheduled" from
+        // "scheduled and lost". This line is the retrievable half of that trace.
+        //
+        // Reached via `ctx.get` (not the injected `schedule`) so the report is
+        // available even when the schedule sub-plugin is mounted by a different
+        // path; a diagnostic must never be the thing that breaks the tool.
+        {
+          const scheduleSvc = ctx === undefined
+            ? undefined
+            : (function(): S2sScheduleService | undefined {
+                try { return ctx.get('s2sSchedule') as S2sScheduleService | undefined } catch { return undefined }
+              })()
+          if (scheduleSvc !== undefined) {
+            const errs = scheduleSvc.loadErrors ?? []
+            lines.push(errs.length === 0
+              ? 'schedule replay: 0 persisted job(s) failed to load in this process (absent/empty dir is normal).'
+              : 'schedule replay: ' + errs.length + ' persisted job(s) FAILED to load — those prompts will NOT fire'
+                + ' (process-scoped record; first 20 shown):')
+            for (const e of errs.slice(0, 20)) lines.push('  ' + e)
+          }
         }
 
         // Sweep exposure (T24). The ledger arms a timer, but "armed" and

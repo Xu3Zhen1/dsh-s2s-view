@@ -344,6 +344,10 @@ describe('T30 blocker 3: real storage-backed ledger.cancel', () => {
       classifyTarget: vi.fn((id: string) => (live.ids.includes(id) ? 'archived' : 'eligible') as const),
       targetPolicyVerdict: vi.fn((info: { sessionId: string }) => (live.ids.includes(info.sessionId) ? { code: 'S2S_ARCHIVED_TARGET' as const, message: 'archived' } : undefined)),
     }
+    // Never reached: the budget check flips `ARCHIVED` into the archive set, so
+    // the post-record re-check throws before this is called. Kept as the plain
+    // 'resumed' value precisely so a future refactor that DOES reach it cannot
+    // pass by accident.
     const queueForDormant = vi.fn(async () => 'resumed' as const)
     const queuedCount = vi.fn(async () => 1)
     let budgetCalls = 0
@@ -439,7 +443,9 @@ describe('T30 drain-refusal accounting: REAL lifecycle, real msgIds, every entry
     const { lifecycle, ledger, agentStub } = await realLifecycleHarness({ archived: [] })
     await ledger.record({ msgId: 'm-peer', from: CALLER, to: PEER, text: 't' })
     const outcome = await lifecycle.queueForDormant({ sessionId: PEER, from: CALLER, text: 't', msgId: 'm-peer' })
-    expect(outcome).toBe('resumed') // eligible peer: handed over normally
+    // `agents.get` returns the live stub for PEER, so this is the already-live
+    // handover, NOT a resume — the value says which one happened.
+    expect(outcome).toBe('already-live') // eligible peer: handed over without a resume
     const drained = { refused: [] as Array<{ msgId: string }> }
     expect(drained.refused).toEqual([])
     expect(agentStub.followup).toHaveBeenCalledTimes(1)

@@ -130,6 +130,62 @@ describe('s2s schedule service', () => {
     expect(q.mock.calls[0]![0]).toMatchObject({ sessionId: 'sess-1', from: 's2s-schedule', text: 'wake me' })
   })
 
+  it('★ tick does NOT count a target-policy REFUSAL as fired (I1)', async () => {
+    // Found while auditing the discarded return value: `fired += 1` used to run
+    // unconditionally after `queueForDormant`, so a job whose message the target
+    // policy refused (archived/subagent/unknown target) incremented the success
+    // count AND had its one-shot consumed by `settleMissed` — a prompt that was
+    // cancelled reported as delivered, and gone forever.
+    //
+    // Both halves are asserted: the count must not include it, AND the refusal
+    // must leave a trace. A fix that silently skipped counting would pass the
+    // first assertion while being equally unobservable (the G9 rule this repo
+    // keeps re-learning: "no trace" is indistinguishable from "fine").
+    const q = vi.fn(async () => ({
+      kind: 'refused' as const,
+      code: 'S2S_ARCHIVED_TARGET' as const,
+      message: 'the session is archived',
+      items: [{ msgId: 'm-1', code: 'S2S_ARCHIVED_TARGET' as const, message: 'the session is archived', cancelOutcome: 'cancelled' }],
+    }))
+    const { svc, ctx } = await makeService(() => undefined, { queueForDormant: q })
+    const warn = vi.fn()
+    ctx.logger.warn = warn as never
+    const job = await svc.create({ targetSessionId: 'sess-1', text: 'must-not-vanish', atIso: new Date(Date.now() - 1000).toISOString() })
+    expect(await svc.tick(job.nextAt + 1)).toBe(0) // NOT fired
+    expect(q).toHaveBeenCalledTimes(1)
+    // Loud retirement, naming the policy code — not a silent skip.
+    const text = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(text).toContain('REFUSED')
+    expect(text).toContain('S2S_ARCHIVED_TARGET')
+    expect(text).toContain('NOT delivered')
+    // The one-shot is retired rather than retried every second against an
+    // ineligible target (that would be a 1s infinite loop).
+    const after = (await svc.list())[0]!
+    expect(after.enabled).toBe(false)
+  })
+
+  it('tick still counts a QUEUED dormant handover (autoResume=deny)', async () => {
+    // The other side of the same branch: `'queued'` means the entry really is in
+    // the mailbox and will be drained on reopen. Counting it is honest, and
+    // retrying instead would enqueue a duplicate every tick.
+    const q = vi.fn(async () => 'queued' as const)
+    const { svc } = await makeService(() => undefined, { queueForDormant: q })
+    const job = await svc.create({ targetSessionId: 'sess-1', text: 'hold it', everySeconds: 600 })
+    expect(await svc.tick(job.nextAt + 1)).toBe(1)
+    expect(q).toHaveBeenCalledTimes(1)
+  })
+
+  it('tick counts both already-live and resumed handovers', async () => {
+    // The three-way outcome split must not accidentally drop these two, which
+    // ARE successful handovers even though only one of them resumed anything.
+    for (const outcome of ['resumed', 'already-live'] as const) {
+      const q = vi.fn(async () => outcome)
+      const { svc } = await makeService(() => undefined, { queueForDormant: q })
+      const job = await svc.create({ targetSessionId: 'sess-1', text: 'wake', everySeconds: 600 })
+      expect(await svc.tick(job.nextAt + 1)).toBe(1)
+    }
+  })
+
   it('tick retries (never drops) a one-shot whose target is absent with no lifecycle', async () => {
     const { svc } = await makeService(() => undefined)
     const job = await svc.create({ targetSessionId: 'sess-1', text: 'once', atIso: new Date(Date.now() - 1000).toISOString() })
@@ -169,5 +225,129 @@ describe('s2s schedule service', () => {
     await ctx2.plugin(S2sScheduleService, { dir, timerIntervalMs: 0 })
     const svc2 = ctx2.get('s2sSchedule') as S2sScheduleService
     expect(await svc2.list()).toHaveLength(0)
+  })
+
+  it('★ a corrupt job file is SKIPPED but not SILENT (G9)', async () => {
+    // The old body was `catch { /* skip a corrupt job file */ }` — the job was
+    // dropped with no trace anywhere, and the plugin logger is not persisted in
+    // this host, so afterwards nothing could distinguish "that prompt was never
+    // scheduled" from "it was scheduled and silently lost". Same defect family
+    // as the `(untitled)` digest column and the discarded queueForDormant value.
+    const { writeFile } = await import('node:fs/promises')
+    const { dir } = await makeService(() => undefined)
+    await writeFile(join(dir, 'bad.json'), 'not json', 'utf8')
+    await writeFile(join(dir, 'noid.json'), JSON.stringify({ text: 'has no id' }), 'utf8')
+    await writeFile(join(dir, 'good.json'), JSON.stringify({ id: 'ok-1', targetSessionId: 'sess-1', text: 'kept', nextAt: Date.now() + 60000, enabled: true, createdAt: Date.now() }), 'utf8')
+
+    const ctx2 = new Context()
+    const warn = vi.fn()
+    ctx2.logger.warn = warn as never
+    ctx2.provide('agents', { get: () => undefined } as never)
+    await ctx2.plugin(S2sScheduleService, { dir, timerIntervalMs: 0 })
+    const svc2 = ctx2.get('s2sSchedule') as S2sScheduleService
+    // The good job still loads; the two bad ones do not.
+    expect(await svc2.list()).toHaveLength(1)
+    // …but both are RECORDED with their reason, and both warned.
+    expect(svc2.loadErrors).toHaveLength(2)
+    expect(svc2.loadErrors.join('\n')).toContain('bad.json')
+    expect(svc2.loadErrors.join('\n')).toContain('noid.json')
+    const said = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(said).toContain('will NOT fire')
+    expect(said).toContain('SKIPPED')
+  })
+
+  it('★ a schedule directory that does not exist is GENUINELY EMPTY (no false alarm)', async () => {
+    // The other side of the same branch, and the reason the code must special-case
+    // ENOENT: a deployment that never scheduled anything has no directory, and
+    // reporting that as an error would make the normal state look broken.
+    //
+    // ★ MEASURED BOUNDARY (2026-10-26): on Windows `readdir` reports **ENOENT**
+    // for a path whose parent is a regular FILE (`ENOTDIR` is not surfaced), so
+    // "path blocked by a file" and "directory absent" are INDISTINGUISHABLE
+    // here. I could not construct a portable non-ENOENT failure, so the
+    // error branch is asserted only structurally (below) and its runtime path
+    // stays unverified. Say so rather than claim coverage.
+    const ctx2 = new Context()
+    const warn = vi.fn()
+    ctx2.logger.warn = warn as never
+    ctx2.provide('agents', { get: () => undefined } as never)
+    const missing = await mkdtemp(join(tmpdir(), 's2s-sched-'))
+    dirs.push(missing)
+    await ctx2.plugin(S2sScheduleService, { dir: join(missing, 'never-created', 'schedules'), timerIntervalMs: 0 })
+    const svc2 = ctx2.get('s2sSchedule') as S2sScheduleService
+    expect(await svc2.list()).toHaveLength(0)
+    expect(svc2.loadErrors).toHaveLength(0) // absent ≠ unreadable
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('★ load() distinguishes ENOENT from other readdir failures (structural)', async () => {
+    // Structural because the runtime failure is not constructible on Windows
+    // (see the test above). This pins the guard itself: the error branch must
+    // test the code and must NOT be an unconditional `.catch(() => [])`, which
+    // was the original defect — an unreadable directory read as "no jobs".
+    const { readFile: readSource } = await import('node:fs/promises')
+    const src = await readSource(new URL('../src/schedule.ts', import.meta.url), 'utf8')
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('//'))
+      .join('\n')
+    // The old silent form must be gone.
+    expect(code).not.toContain(".catch(() => [] as string[])")
+    expect(code).not.toContain('catch { /* skip a corrupt job file */ }')
+    // And the classification must key on ENOENT explicitly.
+    expect(code).toContain("code !== 'ENOENT'")
+    expect(code).toContain('loadErrors.push')
+  })
+
+  it('★ loadErrors is READABLE from s2s_status (a logger line is not retrievable, G9)', async () => {
+    // The dataset rule this repo keeps re-learning: the plugin logger is not
+    // persisted anywhere, so "we warned about it" is unverifiable after the
+    // fact. A trace only counts if a tool can read it back. Before this, a lost
+    // scheduled prompt left nothing observable at all.
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    await ctx.plugin(S2sScheduleService, { dir: join(await mkdtemp(join(tmpdir(), 's2s-sched-'))), timerIntervalMs: 0 })
+    const svc = ctx.get('s2sSchedule') as S2sScheduleService
+    svc.loadErrors = ['/fake/bad.json: Unexpected token', '/fake/noid.json: missing id/targetSessionId']
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+      discovery: {
+        list: vi.fn(async () => []),
+        resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        targetPolicyVerdict: vi.fn(() => undefined),
+        classifyTarget: vi.fn(() => 'eligible' as const),
+      },
+    } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('schedule replay: 2 persisted job(s) FAILED to load')
+    expect(out.text).toContain('will NOT fire')
+    expect(out.text).toContain('/fake/bad.json')
+    expect(out.text).toContain('/fake/noid.json')
+  })
+
+  it('s2s_status says so when nothing failed to load (no false alarm)', async () => {
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    await ctx.plugin(S2sScheduleService, { dir: join(await mkdtemp(join(tmpdir(), 's2s-sched-'))), timerIntervalMs: 0 })
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+      discovery: {
+        list: vi.fn(async () => []),
+        resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        targetPolicyVerdict: vi.fn(() => undefined),
+        classifyTarget: vi.fn(() => 'eligible' as const),
+      },
+    } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('schedule replay: 0 persisted job(s) failed to load')
   })
 })

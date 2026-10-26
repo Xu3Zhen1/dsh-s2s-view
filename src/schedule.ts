@@ -141,7 +141,15 @@ export class S2sScheduleService extends Service {
   /**
    * Fire every due job at `nowMs`. idle -> follow-up turn; busy -> push the
    * next fire forward (no interruption); absent (dormant) -> delegate to the
-   * s2s lifecycle when mounted, else push forward. Returns the number fired.
+   * s2s lifecycle when mounted, else push forward.
+   *
+   * @returns the number of jobs whose prompt actually LEFT this service — an
+   *   `inject` into a live agent, or a lifecycle handover (`'resumed'` /
+   *   `'already-live'` / `'queued'`, which all mean the message is now the
+   *   mailbox's problem). A **target-policy refusal is NOT counted**: the
+   *   lifecycle cancelled the row, nothing was delivered and nothing durable was
+   *   left behind. Before this, a refusal was counted as fired AND the one-shot
+   *   was consumed by `settleMissed` — a dropped prompt reported as a success.
    * Public: tests call it with a fixed clock; the auto-timer just calls it.
    */
   async tick(nowMs: number): Promise<number> {
@@ -153,8 +161,29 @@ export class S2sScheduleService extends Service {
       const step = job.everySeconds !== undefined ? job.everySeconds * 1000 : undefined
       if (agent === undefined) {
         if (this.lifecycle !== undefined) {
-          await this.lifecycle.queueForDormant({ sessionId: job.targetSessionId, from: 's2s-schedule', text: job.text, msgId: 'sched-' + job.id + '-' + nowMs })
-          fired += 1
+          // The outcome is READ, not discarded. Discarding it made a refusal
+          // indistinguishable from a handover: `fired` counted a job whose
+          // message the target policy had just cancelled, and the one-shot was
+          // then consumed by `settleMissed` — a silently dropped prompt with a
+          // success count on top. `'queued'` still counts (autoResume=deny: the
+          // entry really did reach the mailbox, and retrying would enqueue a
+          // DUPLICATE every second), but a refusal must not:
+          const outcome = await this.lifecycle.queueForDormant({ sessionId: job.targetSessionId, from: 's2s-schedule', text: job.text, msgId: 'sched-' + job.id + '-' + nowMs })
+          if (typeof outcome === 'object' && outcome.kind === 'refused') {
+            // Nothing was handed over: the lifecycle cancelled the ledger row with
+            // the policy code and KEPT the message in the mailbox (it is the user's
+            // queue — T30's rule). Retrying every second against a target that is
+            // archived/subagent/unknown would never succeed and would append a new
+            // mailbox entry per tick, so the job is retired here instead. The
+            // retirement is LOUD (G9): the reason and its code are named, because
+            // "the prompt never fired" must not look like "there was no prompt".
+            this.ctx.logger.warn('s2s schedule: job ' + job.id + ' -> ' + job.targetSessionId
+              + ' was REFUSED by the target policy (' + outcome.code + ': ' + outcome.message + ');'
+              + ' the message was NOT delivered, its ledger row is cancelled, the mailbox entry is kept,'
+              + ' and the job is being retired from the timer')
+          } else {
+            fired += 1
+          }
         }
         await this.settleMissed(job, nowMs, step)
         continue
@@ -205,17 +234,54 @@ export class S2sScheduleService extends Service {
     agent.followup(message)
   }
 
+  /**
+   * Replay persisted jobs. **Both** failure modes are made observable (G9):
+   *
+   * - an unreadable directory must not look like "no jobs were ever scheduled"
+   *   — that reading would make a whole schedule silently vanish on mount;
+   * - a corrupt job file must not be skipped quietly: the job it represents is
+   *   a prompt the user asked for, and dropping it silently means the prompt
+   *   simply never fires, with nothing anywhere saying so.
+   *
+   * Both are reported through the logger AND counted, so `s2s_status` can show a
+   * non-zero `loadErrors` even when the process has moved on. Logging alone
+   * would be unverifiable later: this repo's plugin logger is not persisted
+   * anywhere (a lesson already recorded on the whiteboard).
+   */
   private async load(): Promise<void> {
-    const names = await readdir(this.dir).catch(() => [] as string[])
+    const names = await readdir(this.dir).then(
+      (value) => value,
+      (error: unknown) => {
+        // ENOENT = this deployment never scheduled anything: genuinely empty.
+        // Any OTHER error means jobs may exist that we could not read.
+        if ((error as { code?: string } | undefined)?.code !== 'ENOENT') {
+          this.loadErrors.push('readdir ' + this.dir + ': ' + String(error))
+          this.ctx.logger.warn('s2s schedule: cannot list ' + this.dir + ' (' + String(error)
+            + '); previously scheduled jobs may be MISSING from this process')
+        }
+        return [] as string[]
+      },
+    )
     for (const name of names) {
       if (!name.endsWith('.json')) continue
       const file = join(this.dir, name)
       try {
         const job = JSON.parse(await readFile(file, 'utf8')) as ScheduleJob
         if (typeof job?.id === 'string' && typeof job?.targetSessionId === 'string') this.jobs.set(job.id, job)
-      } catch { /* skip a corrupt job file */ }
+        else {
+          this.loadErrors.push(file + ': missing id/targetSessionId')
+          this.ctx.logger.warn('s2s schedule: job file ' + file + ' has no usable id/targetSessionId; SKIPPED')
+        }
+      } catch (error: unknown) {
+        this.loadErrors.push(file + ': ' + String(error))
+        this.ctx.logger.warn('s2s schedule: job file ' + file + ' could not be read (' + String(error)
+          + '); that scheduled prompt will NOT fire')
+      }
     }
   }
+
+  /** Bounded, process-scoped record of jobs that could not be replayed (read by `s2s_status`). */
+  loadErrors: string[] = []
 
   private fileFor(id: string): string {
     return join(this.dir, id + '.json')

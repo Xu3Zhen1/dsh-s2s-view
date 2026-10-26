@@ -34,16 +34,21 @@
 
 缺席的块不挂载(按需加载);`lifecycle`/`budget` 未配置时对应功能关闭。
 
-## 3. 模型工具(6 个)
+## 3. 模型工具(9 个)
 
-| 工具 | 作用 |
-|---|---|
-| `s2s_peers` | 列**当前项目**内在线对端;默认本项目,`all=true` 列所有项目 |
-| `s2s_message` | 发给某对端或广播 project(带预算检查) |
-| `s2s_history` | 进程内最近消息记录(进程私有,不跨重启) |
-| `s2s_schedule` | 会话内定时注入:list / create(every_seconds 周期或 at_iso 单次) / cancel |
-| `s2s_sessions` | 列**当前项目**内会话(标题+短 id+三态);默认本项目,`all=true` 列所有项目 |
-| `s2s_resume` | 用 **name(标题)** 点名(主寻址)或 `session_id`;唤醒 dormant:入信箱;`autoResume=allow` 则 `AgentRegistry.resume` 拉起并立即投递 |
+按「先看清现场 → 再动手 → 再核对结果」排。工具的 `description` 以 `src/tools.ts` / `src/digest.ts` 为准,下表是它的中文转写 + 使用时机。
+
+| 工具 | 作用 | 什么时候用 |
+|---|---|---|
+| `s2s_peers` | 列**当前项目**内在线的对端会话(标题+状态);默认本项目,`all=true` 列所有项目 | 要发消息/唤醒前,先拿准确的**标题**当地址 |
+| `s2s_sessions` | 列**当前项目**内的已知会话(标题+短 id+三态 live-idle/live-busy/dormant);默认本项目,`all=true` 列所有项目 | 需要找 **dormant** 会话(peers 只列 live)或按 `query` 过滤时 |
+| `s2s_digest` | 列已知会话**各自停在哪一步**:标题、短 id、最后活动时间、最后事件类型、回合是否仍开着。**只有标题/id/类型/时间,没有消息正文** | 不知道「该找哪个会话接活」时首选;挑出目标后,正文再用 `s2s_history` 或 `session_event_read` 取 |
+| `s2s_message` | 按 **name(标题,现读)** 或 `session_id` 发消息(带预算检查);live 会话立即投递,dormant 会话入队,`autoResume=allow` 时同时拉起 | 常规投递。**投递回执 ≠ 已送达**,见下面的 `reconcile` |
+| `s2s_resume` | 用 **name(标题)** 点名(主寻址)或 `session_id` 显式唤醒 dormant:入信箱;`autoResume=allow` 则 `AgentRegistry.resume` 拉起并把队列交给它 | 明确要让一个静止会话醒过来并处理堆积消息时 |
+| `s2s_status` | **自检**:ledger 后端与是否打开、各会话队列深度、上次 resume 的 preset 结果、history 是否持久。数值是**取样快照**,会漂 | 投递/唤醒行为反常时先跑它——用来区分**真降级**与**静默降级** |
+| `s2s_reconcile` | 按 `msgId` 是否真出现在目标**会话日志**里,把已登记投递从 `inboxed` 推进到 `landed`——这就是把「写进信箱」变成「已送达」的判定步骤。可重复调用:进度单调、终态行不复活 | 想知道消息**到底进没进**对方日志时(`s2s_message` 的"queued"只是入队) |
+| `s2s_history` | **多源合并**的最近消息:ledger 打开时以 ledger 为权威,目标**会话日志**作为「无存储后端也能跨重启」的兜底,进程内 memory 也参与。每行标 `source`,某源查空会**显式说明**而不是看起来像"没有消息" | 要读消息内容/复盘往来时;也用于 ledger 未登记(untracked)的投递——那些 `reconcile` 看不到 |
+| `s2s_schedule` | 会话内定时注入:`list` 列任务 / `create`(`every_seconds` 周期或 `at_iso` 单次)/ `cancel(job_id)` 取消 | 要给**自己或别的会话**安排一个稍后触发的动作 |
 
 ## 4. 唤醒静止会话流程(name 为主寻址)
 
@@ -57,9 +62,9 @@
 
 ## 5. 验证
 
-- 单元/集成:插件内 `pnpm run typecheck`(0 错)+ `pnpm run test`(96/96)。
+- 单元/集成:插件内 `pnpm run typecheck`(0 错)+ `pnpm run test`(473 passed / 44 files)。
 - profile 载入:\`dump-config \` 应见 `dsh-s2s` 行且**无** `entry "dsh-s2s" not found`;若开 `hub.server` 可用 `curl <port>/` 看是否监听(404=在监听)。
-- 全链路:重启 profile 后,在任一会话的工具列表应出现 `s2s_*` 6 项。
+- 全链路:重启 profile 后,在任一会话的工具列表应出现 `s2s_*` 9 项。
 
 ## 6. 限制
 

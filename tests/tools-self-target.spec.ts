@@ -262,6 +262,27 @@ describe('T29 s2s_resume: refusal, fail-open marker, no regression', () => {
     expect(spies.queueForDormant).toHaveBeenCalledTimes(1)
   })
 
+  it('★★ resume ALREADY-LIVE path must not claim a resume (I1)', async () => {
+    // The defect this pins: `queueForDormant` reported `'resumed'` both when it
+    // really resumed and when the target was live before the call, so this tool
+    // printed "resumed and the queued message(s) were handed to it" for a session
+    // that never went through `registry.resume`. `s2s_resume` has NO state guard,
+    // so this is an ordinary call path, not an edge case.
+    const { by, spies } = await harness(SIBLING, { state: 'dormant' })
+    spies.queueForDormant.mockResolvedValue('already-live')
+    const out = await by('s2s_resume').execute({ name: 'a', text: 'x' }, {})
+    // Both directions, because either alone is satisfiable by a wrong string:
+    // (1) it must not say "resumed"; (2) it must still say the queue was handed
+    // over (the opposite lie — "nothing delivered yet" — is also an I1 breach).
+    expect(out.text).not.toContain('resumed')
+    expect(out.text).not.toContain('Woke')
+    expect(out.text).toContain('was already live')
+    expect(out.text).toContain('handed')
+    // The marker still rides along: this return is post-resolution.
+    expect(out.text).toContain('caller identity unavailable')
+    expect(spies.queueForDormant).toHaveBeenCalledTimes(1)
+  })
+
   it('★ resume lifecycle-missing branch returns BEFORE resolution (no marker applies)', async () => {
     // Correction of my own over-claim: s2s_resume checks lifecycle BEFORE
     // resolving, so this branch has no resolution, no side effects and — by the

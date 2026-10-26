@@ -158,6 +158,32 @@ describe('s2s tools execution', () => {
     const out = await by('s2s_message').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
     expect(out.text).toContain('Queued')
   })
+  it('★ s2s_message already-live race outcome must not say Woke (I1)', async () => {
+    // Cross-review found this branch had NO test at all: deleting the whole arm
+    // left the suite fully green, so the `s2s_message` half of the three-way
+    // split was uncovered. It is reachable only through a race (the resolved
+    // `state` snapshot goes stale across the record/budget awaits), which is
+    // exactly why it is easy to lose: no integration path reproduces it, so the
+    // branch needs a unit-level guard or it will silently rot back into "Woke".
+    //
+    // Both directions are asserted on purpose: "must not say Woke" alone is
+    // satisfied by printing nothing useful, while "nothing has been delivered
+    // yet" would be the opposite lie — the queue WAS handed over.
+    const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
+      lifecycle: { queueForDormant: vi.fn(async () => 'already-live' as const), queuedCount: vi.fn(async () => 0) } })
+    const out = await by('s2s_message').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
+    expect(out.text).not.toContain('Woke')
+    expect(out.text).toContain('ALREADY live')
+    expect(out.text).toContain('no resume was performed')
+    expect(out.text).toContain('Handed the queued message(s)')
+    // It must never claim the message is in the target log — that is what
+    // s2s_reconcile is for, and the wording must keep pointing there.
+    expect(out.text).not.toContain('Delivered')
+    expect(out.text).toContain('s2s_reconcile')
+  })
   it('s2s_resume unconfigured', async () => {
     const defs = buildTools({ broker: { deliver: vi.fn(), history: vi.fn() }, discovery: { list: vi.fn(), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
       archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
@@ -177,6 +203,19 @@ describe('s2s tools execution', () => {
     // target's log, which is the only sense of "delivered" this project accepts.
     expect(out.text).toContain('resumed and the queued message(s) were handed to it')
     expect(out.text).not.toContain('delivered')
+  })
+  it('s2s_resume already-live outcome does not claim a wake', async () => {
+    // The `'already-live'` member exists because a live target needs no resume.
+    // Its receipt must say so and must still report the handover.
+    const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 's1', title: 'a', state: 'dormant', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),},
+      lifecycle: { queueForDormant: vi.fn(async () => 'already-live' as const), queuedCount: vi.fn(async () => 0) } })
+    const out = await by('s2s_resume').execute({ name: 'a', text: 'hi' }, { agent: { id: 'y' } })
+    expect(out.text).not.toContain('resumed')
+    expect(out.text).toContain('was already live')
+    expect(out.text).toContain('resume was performed')
   })
   it('s2s_resume not-found', async () => {
     const { by } = makeTools({ discovery: { resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),

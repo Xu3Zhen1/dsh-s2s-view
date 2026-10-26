@@ -24,7 +24,7 @@
 - **进程内投递**:`S2sBroker.deliver(sessionId, {from,text})` → `ctx.agents.get(...)` → `agent.followup`(空闲)/`inject`(忙碌)。零网络、零序列化。
 - **name 主寻址**:`s2s_resume(name: "开发", ...)` / `s2s_message(name: "产品", ...)`;标题取自**标题缓存**(0.1.7+ 读宿主的零 I/O 投影缓存,其余宿主读本地缓存),因此**改名在下一个标题检查点后生效**,而非同一瞬间;同名→`ambiguous`(用 `session_id` 消歧),查无→`not-found`+候选。
 - **拉起静止会话**:入信箱 → `autoResume=allow` 时 `AgentRegistry.resume` 拉起 → 投递;拉起的会话保留 live-idle(不自动归眠)。
-- **6 个模型工具**:`s2s_peers`(本项目 live)/ `s2s_sessions`(本项目 标题+三态;`all=true` 全量)/ `s2s_message`(发/唤醒)/ `s2s_resume`(显式唤醒)/ `s2s_history`(进程作用域历史)/ `s2s_schedule`(会话内定时注入)。
+- **9 个模型工具**:`s2s_peers`(本项目 live)/ `s2s_sessions`(本项目 标题+三态;`all=true` 全量)/ `s2s_message`(发/唤醒)/ `s2s_resume`(显式唤醒)/ `s2s_status`(自检:ledger 后端与是否打开、各会话队列深度、上次 resume 的 preset 结果、history 是否持久;用于区分**真降级**与**静默降级**)/ `s2s_reconcile`(按 `msgId` 是否出现在目标会话日志里,把已登记投递从 `inboxed` 推进到 `landed`;可重复调用、进度单调)/ `s2s_history`(多源合并的最近消息:ledger 权威、目标会话日志兜底、进程内 memory 参与,每行标 source)/ `s2s_schedule`(会话内定时注入)/ `s2s_digest`(列已知会话的停止点:标题、短 id、最后活动时间、最后事件类型、回合是否仍开着;只给元数据不给正文)。
 - **持久信箱**:`~/.dsh/s2s/mailboxes/<sessionId>/*.json`,原子写、时序命名、损坏自愈。
 - **按需加载**:`lifecycle`/`budget` 配置块缺席即不挂载;broker/discovery/tools 恒挂(核心)。
 
@@ -64,8 +64,8 @@
 ```sh
 pnpm install
 pnpm run typecheck     # 0 错
-pnpm run test          # 24/24
-pnpm run build         # 产出 lib/index.js (~28kB)
+pnpm run test          # 473 passed / 44 files
+pnpm run build         # 产出 lib/index.js (~198kB,实测 202,504 B)
 ```
 
 ## License

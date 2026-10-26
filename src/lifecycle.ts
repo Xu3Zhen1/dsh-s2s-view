@@ -121,8 +121,20 @@ export interface S2sRefusedOutcome {
   readonly items: readonly S2sRefusedItem[]
 }
 
-/** The outcome of `queueForDormant`. */
-export type S2sQueueOutcome = 'queued' | 'resumed' | S2sRefusedOutcome
+/**
+ * The outcome of `queueForDormant`.
+ *
+ * `'resumed'` and `'already-live'` are **deliberately distinct** even though both
+ * end with the queue handed over. A caller that only knows "handed over" cannot
+ * write an honest receipt: the target that was ALREADY live never went through
+ * `registry.resume`, so no preset was composed and nothing was woken. Collapsing
+ * the two into one value is what made `s2s_resume` print
+ * "resumed and the queued message(s) were handed to it" for a session that was
+ * live the whole time — I1 (never claim more than happened) at the wording level.
+ * There is no state where the union can be narrowed back to two members without
+ * re-introducing that overclaim.
+ */
+export type S2sQueueOutcome = 'queued' | 'resumed' | 'already-live' | S2sRefusedOutcome
 
 /**
  * The lifecycle service. Mounted only when a `lifecycle` config block is
@@ -188,8 +200,11 @@ export class S2sLifecycleService extends Service {
   /**
    * Queue one message for a (presumed dormant) session and, when allowed,
    * resume it and deliver immediately.
-   * @returns `'resumed'` when the session was resumed and drained now,
-   *   `'queued'` when the entry waits in the mailbox.
+   * @returns `'resumed'` when `registry.resume` actually ran and the queue was
+   *   drained now; `'already-live'` when the target needed no resume and the
+   *   queue was drained into the existing agent; `'queued'` when the entry waits
+   *   in the mailbox. `'resumed'` and `'already-live'` must not be merged: the
+   *   first means a wake happened, the second means it did not.
    */
   async queueForDormant(entry: { sessionId: string; from: string; text: string; replyTo?: string; msgId: string }): Promise<S2sQueueOutcome> {
     const record: MailboxEntry = {
@@ -218,7 +233,11 @@ export class S2sLifecycleService extends Service {
       // report "Woke/handed". The mailbox and its (now cancelled) rows carry the
       // refusal.
       if (drained.refused.length > 0) return { kind: 'refused', code: drained.refused[0]!.code, message: drained.refused[0]!.message, items: drained.refused }
-      return 'resumed'
+      // NOT `'resumed'`: nothing was woken here. The old shared value made the
+      // tool print "resumed and the queued message(s) were handed to it" for a
+      // target that was live before the call — the exact overclaim I1 forbids,
+      // and the one `presetUnavailableReason` above already admits in words.
+      return 'already-live'
     }
     const registry = this.ctx.agents as typeof this.ctx.agents & {
       resume?: (options: { resumeSessionId: string; setup?: AgentSetup }) => Promise<ResumedHandle>

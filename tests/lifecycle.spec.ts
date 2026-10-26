@@ -137,7 +137,14 @@ describe('s2s lifecycle', () => {
     const { lifecycle, resume, setLive, followups } = await harness('allow')
     setLive(true)
     const outcome = await lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'hi', msgId: 'm1' })
-    expect(outcome).toBe('resumed')
+    // ★ I1 at the VALUE level: this path never calls `registry.resume`, so it must
+    // not report `'resumed'`. It used to — and `s2s_resume` has no state guard, so
+    // an ordinary call on a live session printed "resumed and the queued
+    // message(s) were handed to it" for a session that was live the whole time.
+    // `'already-live'` is a distinct member of the union for exactly this reason;
+    // narrowing it back to `'resumed'` re-introduces the overclaim.
+    expect(outcome).toBe('already-live')
+    expect(outcome).not.toBe('resumed')
     expect(resume).not.toHaveBeenCalled() // live session: never resume again
     expect(followups).toHaveLength(1) // delivered to the live idle agent
     expect(String((followups[0] as { content: { text: string }[] }).content[0]!.text)).toContain('hi')

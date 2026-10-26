@@ -164,6 +164,24 @@ export interface S2sDiscoveryConfig {
 /** Max concurrent title reads / log scans; bounds open FDs on a large corpus. */
 const READ_CONCURRENCY = 8
 
+/**
+ * The session-log names, **newest format first**, shared by every on-disk reader.
+ *
+ * This constant is load-bearing, not tidiness: `readOriginFromFs` and
+ * `readTitleFromFs` used to each hardcode their own list, and they drifted —
+ * the origin reader searched v4→v3→plain while the title reader searched
+ * v3→plain, so every v4-only session read as "no title" (measured 2026-10-26:
+ * 47 of the 111 reachable `session-*` dirs are v4-only) and the 2 dirs whose v4
+ * and v3 logs disagree returned a **stale** title instead. Both are the same
+ * question — "which file holds this session's current log?" — so they must read
+ * the answer from one place or they will drift again.
+ *
+ * `SESSION_LOG_PLAIN` is separate because it is text, not zstd frames.
+ */
+const SESSION_LOG_CANDIDATES = ['session.v4.jsonl.zstd', 'session.jsonl.zstd'] as const
+/** Last-resort human-readable log (plain JSONL); only consulted when no zstd exists. */
+const SESSION_LOG_PLAIN = 'session.jsonl'
+
 /** Run `fn` over `items` with bounded concurrency, preserving input order. */
 async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length)
@@ -695,10 +713,7 @@ export class S2sDiscoveryService extends Service {
    *   session header was read and the identity is unknown.
    */
   private async readOriginFromFs(sessionDir: string, expectedBareId: string): Promise<{ origin: string | undefined; headerProven: boolean }> {
-    const paths = [
-      join(sessionDir, 'session.v4.jsonl.zstd'),
-      join(sessionDir, 'session.jsonl.zstd'),
-    ]
+    const paths = SESSION_LOG_CANDIDATES.map((name) => join(sessionDir, name))
     for (const p of paths) {
       const read = await readFile(p).then(z => ({ z }), (error: unknown) => ({ error }))
       if ('error' in read) {
@@ -714,7 +729,7 @@ export class S2sDiscoveryService extends Service {
       const header = headerFromZstd(read.z, expectedBareId)
       return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
     }
-    const plainRead = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').then(t => ({ t }), (error: unknown) => ({ error }))
+    const plainRead = await readFile(join(sessionDir, SESSION_LOG_PLAIN), 'utf8').then(t => ({ t }), (error: unknown) => ({ error }))
     if ('t' in plainRead) {
       const header = headerFromJsonl(plainRead.t, expectedBareId)
       return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
@@ -733,16 +748,55 @@ export class S2sDiscoveryService extends Service {
     return agent !== undefined ? (agent.status === 'idle' ? 'live-idle' : 'live-busy') : 'dormant'
   }
 
+  /**
+   * L4 title read: the on-disk scan used when `sessionQuery` and the projection
+   * cache cannot answer.
+   *
+   * **Search order comes from {@link SESSION_LOG_CANDIDATES}, the same constant
+   * `readOriginFromFs` consumes** — that sharing is the fix, not a tidy-up. The
+   * two readers used to hardcode their own order and drifted: this one only
+   * looked at the two OLD names, silently returning "no title" for every session
+   * written in the current v4 format. Measured on this host (2026-10-26,
+   * `~/.dsh/sessions`): of the 111 `session-*` dirs the FS enumeration can
+   * actually reach, **47 are v4-ONLY** — for all of them L4 found nothing — and
+   * among the 49 dirs holding BOTH, **2 carry a different latest title in each
+   * file**, so reading v3 first also returns a stale title rather than none.
+   * "No title" and "this session has no title" then look identical, which is the
+   * G9 silence this project forbids. Two lists that must agree, with no
+   * mechanical tie between them, is the defect CLASS; the constant is the fix.
+   *
+   * Error rule, also copied from `readOriginFromFs`: `ENOENT` means "this format
+   * does not exist here", so trying the next one is legitimate; **any other
+   * error means a log exists but cannot be read**, and its title is therefore
+   * unprovable. Downgrading to an older format in that case would resurrect a
+   * stale v3 title and hide the corruption, so it stops instead.
+   *
+   * @param sessionDir - the session's own directory.
+   * @returns the latest title, or `undefined` when no readable log carries one
+   *   (the caller caches that absence, so it must not be guessed).
+   */
   private async readTitleFromFs(sessionDir: string): Promise<string | undefined> {
-    try {
-      const z = await readFile(join(sessionDir, 'session.jsonl.zstd')).catch(() => undefined)
-      if (z !== undefined) {
-        const title = latestTitleFromZstd(z)
-        if (title !== undefined) return title
+    for (const name of SESSION_LOG_CANDIDATES) {
+      const read = await readFile(join(sessionDir, name)).then(z => ({ z }), (error: unknown) => ({ error }))
+      if ('error' in read) {
+        if ((read.error as { code?: string } | undefined)?.code === 'ENOENT') continue
+        return undefined
       }
-      const plain = await readFile(join(sessionDir, 'session.jsonl'), 'utf8').catch(() => undefined)
-      if (plain !== undefined) return titleFromJsonl(plain)
-    } catch {}
+      let title: string | undefined
+      try {
+        title = latestTitleFromZstd(read.z)
+      } catch {
+        // A v4/v3 log that cannot be decoded is a finding, not a reason to guess.
+        return undefined
+      }
+      if (title !== undefined) return title
+      // Decoded cleanly but carries no `session/title` event: a later format with
+      // no title is still authoritative — an older frozen file must not override
+      // the live log's absence.
+      return undefined
+    }
+    const plainRead = await readFile(join(sessionDir, SESSION_LOG_PLAIN), 'utf8').then(t => ({ t }), (error: unknown) => ({ error }))
+    if ('t' in plainRead) return titleFromJsonl(plainRead.t)
     return undefined
   }
 }
