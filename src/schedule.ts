@@ -58,7 +58,18 @@ export class S2sScheduleService extends Service {
   private readonly dir: string
   private readonly timerIntervalMs: number
   private readonly jobs = new Map<string, ScheduleJob>()
-  private readonly ready: Promise<void>
+  /**
+   * Resolves when the mount-time replay finished.
+   *
+   * **Public on purpose, and awaited by every reader.** It used to be private,
+   * so a caller could read `loadErrors` before `load()` had run and see an empty
+   * array — measured 2026-10-26: `loadErrors.length` read **0 immediately after
+   * mount** and **1 after 50 ms** for the same corrupt job file. That is the
+   * exact moment failures are most likely, so the self-report would have said
+   * "0 failed to load" precisely when a job file had just been dropped. A
+   * diagnostic that can be read too early is a diagnostic that lies.
+   */
+  readonly ready: Promise<void>
   private lifecycle?: S2sLifecycleService
   private timer?: ReturnType<typeof setInterval>
 

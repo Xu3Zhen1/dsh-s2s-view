@@ -155,29 +155,71 @@ describe('s2s discovery L4 title read across log formats', () => {
     // readers behave identically at runtime once the constant is used.
     //
     // Deliberately structural (AST-free grep): if someone reintroduces a literal
-    // filename array in this module, this goes red.
-    const { readFile: readSource } = await import('node:fs/promises')
-    const src = await readSource(new URL('../src/discovery.ts', import.meta.url), 'utf8')
-    // Strip comments first — this repo's own discipline: a docstring that merely
-    // MENTIONS the identifier must not satisfy a structural assertion, or the
-    // assertion is satisfied by prose and stops guarding the code.
-    const code = src
+    // filename array anywhere under src/, this goes red.
+    //
+    // ★ SCAN THE WHOLE SOURCE TREE, not one file. Cross-review (2026-10-26)
+    // pointed out the real limit: strength comes from HOW MANY FILES the check
+    // looks at, not from exporting the constant. Measured then: across all 19
+    // `src/**/*.ts` files there is exactly ONE literal filename array and THREE
+    // occurrences of the log names — so widening the scan is green today and
+    // covers a future third reader in another module for free.
+    const { readdir: readDir, readFile: readSource } = await import('node:fs/promises')
+    const { join: joinPath } = await import('node:path')
+    const srcRoot = new URL('../src/', import.meta.url)
+    const strip = (s: string): string => s
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .split('\n')
       .filter((line) => !line.trim().startsWith('//'))
       .join('\n')
-    // 1. The constant exists and is the newest-first order.
-    expect(code).toContain("const SESSION_LOG_CANDIDATES = ['session.v4.jsonl.zstd', 'session.jsonl.zstd'] as const")
-    // 2. No reader builds its own list: exactly ONE literal filename array in
-    //    real code (the constant's own definition). A second one means a reader
-    //    went back to hardcoding.
-    const literalArraySites = code.match(/\[[^\]]*'session\.(?:v4\.)?jsonl\.zstd'[^\]]*\]/g) ?? []
+    const walk = async (dir: URL): Promise<URL[]> => {
+      const out: URL[] = []
+      for (const e of await readDir(dir, { withFileTypes: true })) {
+        const child = new URL(e.name + (e.isDirectory() ? '/' : ''), dir)
+        if (e.isDirectory()) { if (e.name !== 'node_modules') out.push(...await walk(child)) }
+        else if (e.name.endsWith('.ts') || e.name.endsWith('.js')) out.push(child)
+      }
+      return out
+    }
+    const files = await walk(srcRoot)
+    // Proves the scan is not vacuously green over an empty set.
+    expect(files.length).toBeGreaterThan(10)
+    const codes: string[] = []
+    for (const f of files) codes.push(strip(await readSource(f, 'utf8')))
+    const all = codes.join('\n')
+    // 1. The constant exists, once, with the newest-first order.
+    const defs = all.match(/const SESSION_LOG_CANDIDATES = \['session\.v4\.jsonl\.zstd', 'session\.jsonl\.zstd'\] as const/g) ?? []
+    expect(defs).toHaveLength(1)
+    // 2. Exactly ONE literal filename array in the whole tree (that definition).
+    //    A second one means some reader went back to hardcoding.
+    const literalArraySites = all.match(/\[[^\]]*'session\.(?:v4\.)?jsonl\.zstd'[^\]]*\]/g) ?? []
     expect(literalArraySites).toHaveLength(1)
-    // 3. Both readers consume it (1 definition + 2 uses).
-    const uses = code.match(/SESSION_LOG_CANDIDATES/g) ?? []
-    expect(uses.length).toBe(3)
-    // 4. And the plain-log name is not hand-spelled beside them either.
-    const plainLiterals = (code.match(/'session\.jsonl'/g) ?? []).length
-    expect(plainLiterals).toBe(1) // only SESSION_LOG_PLAIN's definition
+    // 3. The plain-log name is not hand-spelled anywhere else.
+    const plainLiterals = (all.match(/'session\.jsonl'/g) ?? []).length
+    expect(plainLiterals).toBe(1)
+    // 4. Both known readers consume the constant — asserted as a SET of the
+    //    functions that mention it, NOT as a count. ★ A bare `uses.length === 3`
+    //    was the wrong shape: adding a legitimate third reader would turn it red
+    //    for the wrong reason, and a third reader is exactly what this check is
+    //    supposed to welcome.
+    //
+    //    Implementation note: locate each reader at its **declaration**
+    //    (`private async <name>(`), not at its first textual mention — the first
+    //    mention is usually the doc comment that NAMES it, and a comment-stripped
+    //    scan would then take a 4000-char slice of the wrong region (measured:
+    //    readTitleFromFs' first hit was its own doc comment, ~8.5k chars before
+    //    the real declaration).
+    const decl = (name: string): string | undefined => {
+      const at = all.indexOf('private async ' + name + '(')
+      if (at < 0) return undefined
+      const next = all.indexOf('private async ', at + 10)
+      return all.slice(at, next < 0 ? all.length : next)
+    }
+    for (const reader of ['readOriginFromFs', 'readTitleFromFs']) {
+      const body = decl(reader)
+      // Fail loudly if the declaration shape changed, rather than silently
+      // passing over an empty slice.
+      expect(body === undefined, 'declaration of ' + reader + ' not found — update this check').toBe(false)
+      expect(body).toContain('SESSION_LOG_CANDIDATES')
+    }
   })
 })

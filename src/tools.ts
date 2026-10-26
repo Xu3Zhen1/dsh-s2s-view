@@ -762,6 +762,14 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         // Reached via `ctx.get` (not the injected `schedule`) so the report is
         // available even when the schedule sub-plugin is mounted by a different
         // path; a diagnostic must never be the thing that breaks the tool.
+        //
+        // ★ AWAIT `ready` BEFORE READING. The mount-time replay is an un-awaited
+        // Promise, so reading `loadErrors` straight after `ctx.get` reported an
+        // empty array while a corrupt job file had in fact just been dropped —
+        // measured 2026-10-26: 0 immediately after mount, 1 after 50 ms. That is
+        // the one moment failures are most likely, so the un-awaited version
+        // said "0 failed" exactly when the truth was "1 failed" (G9: a
+        // diagnostic that can be read too early is a diagnostic that lies).
         {
           const scheduleSvc = ctx === undefined
             ? undefined
@@ -769,7 +777,19 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 try { return ctx.get('s2sSchedule') as S2sScheduleService | undefined } catch { return undefined }
               })()
           if (scheduleSvc !== undefined) {
+            // A failed replay must not break the status tool: report the fault
+            // instead of throwing, and still print the counts we do know.
+            let readyFailed: string | undefined
+            try {
+              await scheduleSvc.ready
+            } catch (error: unknown) {
+              readyFailed = String(error)
+            }
             const errs = scheduleSvc.loadErrors ?? []
+            if (readyFailed !== undefined) {
+              lines.push('schedule replay: UNKNOWN — the mount-time replay itself FAILED (' + readyFailed
+                + '); any persisted job may be missing and this report cannot say which.')
+            }
             lines.push(errs.length === 0
               ? 'schedule replay: 0 persisted job(s) failed to load in this process (absent/empty dir is normal).'
               : 'schedule replay: ' + errs.length + ' persisted job(s) FAILED to load — those prompts will NOT fire'

@@ -300,17 +300,26 @@ describe('s2s schedule service', () => {
     expect(code).toContain('loadErrors.push')
   })
 
-  it('★ loadErrors is READABLE from s2s_status (a logger line is not retrievable, G9)', async () => {
-    // The dataset rule this repo keeps re-learning: the plugin logger is not
-    // persisted anywhere, so "we warned about it" is unverifiable after the
-    // fact. A trace only counts if a tool can read it back. Before this, a lost
-    // scheduled prompt left nothing observable at all.
+  it('★ loadErrors is READABLE from s2s_status — through a REAL load(), not a hand-set array', async () => {
+    // Cross-review caught the first version of this test reading a HAND-SET
+    // array (`svc.loadErrors = [...]`). That proves the renderer prints whatever
+    // it is given; it does not touch the thing this batch fixed — whether what
+    // `load()` produced can reach the report. Worse, hand-setting masked a real
+    // defect (fixed below): `ready` was un-awaited, so status read an EMPTY
+    // array right after mount and said "0 failed" while a file had just been
+    // dropped.
+    //
+    // So: write a genuinely corrupt job file, mount, then call the real tool
+    // with NO manual assignment and NO manual wait — the tool itself must
+    // await the replay.
+    const { writeFile } = await import('node:fs/promises')
     const { buildTools } = await import('../src/tools.ts')
+    const dir = await mkdtemp(join(tmpdir(), 's2s-sched-'))
+    dirs.push(dir)
+    await writeFile(join(dir, 'bad.json'), 'not json', 'utf8')
     const ctx = new Context()
     ctx.provide('agents', { get: () => undefined } as never)
-    await ctx.plugin(S2sScheduleService, { dir: join(await mkdtemp(join(tmpdir(), 's2s-sched-'))), timerIntervalMs: 0 })
-    const svc = ctx.get('s2sSchedule') as S2sScheduleService
-    svc.loadErrors = ['/fake/bad.json: Unexpected token', '/fake/noid.json: missing id/targetSessionId']
+    await ctx.plugin(S2sScheduleService, { dir, timerIntervalMs: 0 })
     const defs = buildTools({
       ctx,
       broker: { deliver: vi.fn(), history: vi.fn(() => []) },
@@ -323,11 +332,59 @@ describe('s2s schedule service', () => {
       },
     } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    // Called IMMEDIATELY — no await, no sleep. If the tool does not await the
+    // replay, this is exactly the call that used to report 0.
     const out = await status.execute({}, { agent: { id: 'sess-a' } })
-    expect(out.text).toContain('schedule replay: 2 persisted job(s) FAILED to load')
-    expect(out.text).toContain('will NOT fire')
-    expect(out.text).toContain('/fake/bad.json')
-    expect(out.text).toContain('/fake/noid.json')
+    expect(out.text).toContain('schedule replay: 1 persisted job(s) FAILED to load')
+    expect(out.text).toContain('bad.json')
+    expect(out.text).not.toContain('schedule replay: 0 persisted job(s) failed')
+  })
+
+  it('★ the mount-time replay is AWAITED before the report is computed (race)', async () => {
+    // The defect in isolation, without the tool: reading straight after mount
+    // must already see the failure. Measured before the fix: 0 at t=0, 1 at
+    // t=50 ms — i.e. the self-report lied at the only moment it mattered.
+    const { writeFile } = await import('node:fs/promises')
+    const dir = await mkdtemp(join(tmpdir(), 's2s-sched-'))
+    dirs.push(dir)
+    await writeFile(join(dir, 'bad.json'), 'not json', 'utf8')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    await ctx.plugin(S2sScheduleService, { dir, timerIntervalMs: 0 })
+    const svc = ctx.get('s2sSchedule') as S2sScheduleService
+    // `ready` is public precisely so a reader can join it instead of racing it.
+    await svc.ready
+    expect(svc.loadErrors).toHaveLength(1)
+  })
+
+  it('★ an UNREADABLE schedule dir is behaviourally verifiable (ENOTDIR) — not just structural', async () => {
+    // ★ CORRECTION (2026-10-26, cross-review): I previously recorded this branch
+    // as "runtime-unconstructible" because I only tried `readdir(<parent is a
+    // file>/sub)`, which yields ENOENT on Windows. The right shape is to make
+    // the configured `dir` ITSELF a regular file:
+    //     readdir(<parent is a file>/sub) => ENOENT
+    //     readdir(<dir itself is a file>) => ENOTDIR   ← the non-ENOENT branch
+    // So the branch DOES have behaviour evidence; the "cannot verify" note in
+    // docs was wrong and has been retracted.
+    const { writeFile } = await import('node:fs/promises')
+    const root = await mkdtemp(join(tmpdir(), 's2s-sched-'))
+    dirs.push(root)
+    const asFile = join(root, 'schedules')
+    await writeFile(asFile, 'this is a file, not a directory', 'utf8')
+
+    const ctx = new Context()
+    const warn = vi.fn()
+    ctx.logger.warn = warn as never
+    ctx.provide('agents', { get: () => undefined } as never)
+    await ctx.plugin(S2sScheduleService, { dir: asFile, timerIntervalMs: 0 })
+    const svc = ctx.get('s2sSchedule') as S2sScheduleService
+    await svc.ready // the replay must have completed before we judge it
+
+    expect(svc.loadErrors).toHaveLength(1)
+    expect(svc.loadErrors[0]).toContain('ENOTDIR')
+    // and it is loud, not silent
+    const said = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(said).toContain('may be MISSING')
   })
 
   it('s2s_status says so when nothing failed to load (no false alarm)', async () => {
