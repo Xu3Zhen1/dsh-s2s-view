@@ -132,3 +132,71 @@ auto-loaded instruction chain, so nothing brings it in.
 
 Cross-line rules for this file's §1: I1 (never claim more than happened) applies to identity
 too — do not write that a role was handed over until the new holder has written its own claim.
+
+---
+
+## 7. Multiple lines share one working tree — claim a file before you mutate it
+
+This repository is worked by several concurrent sessions (implementation, git, cross-review)
+in the **same** checkout. Three separate incidents (2026-10-26) showed what that costs: a
+mutation injected for verification was still in the tree when another line ran its gate, and
+twice the leftover string was one `git add -A` away from being committed as if it were the fix.
+
+**`git checkout -- <file>` and `git restore <file>` are WRITE operations, not recovery.** They
+overwrite whatever is there without asking. One line "restoring" a file silently erased another
+line's in-flight mutation, and the other line's own "restore verified = true" then passed
+*because the file was already clean* — it could not tell "I restored it" from "someone else did".
+If you are about to run either command on a file you did not just write, claim it first.
+
+The protocol (**six** steps; all six ran end to end on 2026-10-26, and step 6 was added
+*by* that run — the hand-back opened a 115-second ownerless window in which a fourth
+party mutated the file nobody had claimed):
+
+1. **Declare before mutating.** Say which files, the **baseline blob** you captured, the
+   **sha16** it corresponds to, a deadline, and what you will NOT touch.
+   ```
+   占用 <file> 基线 blob=<git hash-object> sha16=<16hex>/<bytes> 至 <HH:mm>
+   还原后应达 = 同上 blob/sha16 ｜ 不动 = <files>
+   ```
+2. **Get an explicit ack** from whoever else is editing. A silent tree is not an ack.
+3. **Work only inside the window**, on exactly the declared files.
+4. **Self-prove the restore**, do not assert it:
+   ```
+   git diff HEAD -- <file>            → EMPTY
+   git hash-object <file>             → equals the baseline blob you declared
+   git status --porcelain             → only the other line's expected entries remain
+   ```
+   Note the asymmetry: a **mismatch proves** someone else wrote; a **match only shows no
+   coarse interference** (mtimes are forgeable, so this is evidence, not proof).
+5. **The other line independently re-checks** the blob before committing.
+6. **Announce the hand-back with the restored blob.** Releasing the window silently leaves it
+   ownerless: on 2026-10-26 a restore at `20:57:06` and an unrelated mutation at `20:59:01`
+   fell into exactly that 115-second gap, and nobody had declared the file in between.
+   ```
+   已归还 <file> blob=<git hash-object> ｜ 此后任何写入（含 checkout/restore）须重新声明
+   ```
+
+**Before any commit, the staging set must be a subset of your own declared expectation list.**
+```
+residual@<HH:mm:ss> HEAD=<sha> : ?? = […] ｜ M = […] ｜ src/ diff = […]
+expected for this batch = […]      ← anything outside it: STOP and ask who owns it
+```
+Anything outside the list is **not** automatically yours to commit. This check has already
+prevented one commit that would have silently reverted a verified fix.
+
+Two limits worth stating: the protocol binds only lines that know it (hence it lives here, in
+the auto-loaded file, not in a handoff page), and it cannot attribute blame when two lines
+mutate the same file inside overlapping windows — so **avoid overlapping windows entirely**.
+
+Related, and the same failure shape: `mtime` cannot prove what a file *contained* when read,
+and a hash compared across tools is only meaningful if both sides hash **bytes** (PowerShell
+`Out-String` re-wraps lines; use `Get-FileHash` or `git hash-object` against the file).
+
+**Use file-level backup + copy-back for mutations, not `git checkout`/`git restore`.**
+A ban without a substitute gets routed around: `Copy-Item` the file aside, mutate, copy it
+back, then prove it with `git hash-object`. Reserve `git checkout -- <file>` for the single
+case it is actually for — reverting your *own* uncommitted work in a tree you alone hold.
+
+**`git stash` is the same shape.** It rewrites the working tree, and its name reads like
+"archive" rather than "overwrite" — which makes it the easiest of the three to mistake for a
+safe read. If you must shelve work in a shared tree, copy the files aside instead.
