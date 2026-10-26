@@ -131,14 +131,36 @@ export async function loadSrcTree(root: URL): Promise<{ paths: string[]; codes: 
  * Property (3) is what covers the end-of-file over-reach that (2) cannot catch
  * for a method already last in its file: trailing material is not part of the
  * method node, so the reparse cannot equal the span.
+ *
+ * ★★ Why this is split into `isExactSpan` (pure) + `spanIsExact` (convenience).
+ * The first version only took `(fileCode, name)`, so a test could only assert
+ * TRUE on a real file — there was no way to hand it a span that is KNOWN to be
+ * inexact. Cross-review showed the consequence: replacing the whole body with
+ * `return true` left the suite 9/9 GREEN. A predicate that can only be observed
+ * succeeding has not been shown to discriminate anything; "always yes" and
+ * "correct" were indistinguishable.
+ *
+ * `isExactSpan` takes the span directly, so the negative controls can feed it
+ * an over-reaching or truncated span and assert FALSE. Every claim about this
+ * module is now falsifiable in both directions.
  */
+export const isExactSpan = (span: string, name: string): boolean => {
+  if (span.length === 0) return false
+  if (!span.includes('private async ' + name + '(')) return false
+  // Exactly one method declaration: an over-reach that swallows a following
+  // method fails here.
+  if ((span.match(/private async /g) ?? []).length !== 1) return false
+  // Re-parse the span alone. It must yield exactly this one method, with a body
+  // byte-identical to the span. This is what catches over-reach to end-of-file
+  // (trailing material is not part of the node) and truncation.
+  const wrapped = 'class X {\n' + span + '\n}'
+  const reparsed = parseSource('span.ts', wrapped)
+  const again = methodsIn(reparsed, wrapped)
+  return again.length === 1 && again[0]!.name === name && again[0]!.body === span
+}
+
 export const spanIsExact = (fileCode: string, name: string): boolean => {
   const body = methodBody(fileCode, name)
   if (body === undefined) return false
-  if (!body.includes('private async ' + name + '(')) return false
-  if ((body.match(/private async /g) ?? []).length !== 1) return false
-  const wrapped = 'class X {\n' + body + '\n}'
-  const reparsed = parseSource('span.ts', wrapped)
-  const again = methodsIn(reparsed, wrapped)
-  return again.length === 1 && again[0]!.name === name && again[0]!.body === body
+  return isExactSpan(body, name)
 }

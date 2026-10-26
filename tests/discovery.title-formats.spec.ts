@@ -45,7 +45,7 @@ async function sessionDir(root: string, name: string, id: string) {
 const titleLine = (title: string): string => `{"type":"session/title","data":{"title":"${title}"}}\n`
 const headerLine = (id: string): string => `{"type":"session","version":4,"id":"${id}","cwd":"/ws"}\n`
 
-import { loadSrcTree, locateAcross, methodBody, spanIsExact, stripComments } from './helpers/source-slice.ts'
+import { isExactSpan, loadSrcTree, locateAcross, methodBody, spanIsExact, stripComments } from './helpers/source-slice.ts'
 
 describe('s2s discovery L4 title read across log formats', () => {
   it('★ reads a title from a v4-ONLY session log (the current format)', async () => {
@@ -295,5 +295,47 @@ describe('s2s discovery L4 title read across log formats', () => {
       expect(found).toBeDefined()
       expect(found!.body).toContain('SESSION_LOG_CANDIDATES')
     }
+  })
+
+  it('★ isExactSpan is FALSIFIABLE: it rejects inexact spans, not just accepts exact ones', async () => {
+    // ★★ THIS TEST EXISTS BECAUSE THE PREDICATE HAD NO NEGATIVE CONTROL.
+    // The earlier version only exposed `spanIsExact(fileCode, name)` and only
+    // ever asserted `.toBe(true)` on real files. Cross-review replaced the whole
+    // body with `return true` and the suite stayed 9/9 GREEN — i.e. "always
+    // yes" and "correct" were indistinguishable, so the predicate had shown no
+    // discriminating power at all. (Proven here as a mutation: `always true`
+    // must redden this test; `always false` already did.)
+    //
+    // `isExactSpan` takes the span directly, so both directions are asserted:
+    // an exact span must pass and every known-inexact shape must fail.
+    const { paths, codes } = await loadSrcTree(new URL('../src/', import.meta.url))
+    const reader = 'readOriginFromFs'
+    const owning = codes.find((c) => methodBody(c, reader) !== undefined)!
+    const exact = methodBody(owning, reader)!
+    const at = owning.indexOf('private async ' + reader + '(')
+
+    // 1. POSITIVE: the real span is exact.
+    expect(isExactSpan(exact, reader)).toBe(true)
+
+    // 2. NEGATIVE — over-reach to end of file (trailing members included).
+    const overreach = owning.slice(at)
+    if (overreach !== exact) {
+      expect(isExactSpan(overreach, reader)).toBe(false)
+    }
+    // 3. NEGATIVE — truncated by one character.
+    expect(isExactSpan(exact.slice(0, exact.length - 1), reader)).toBe(false)
+    // 4. NEGATIVE — missing the declaration entirely.
+    expect(isExactSpan('const x = 1', reader)).toBe(false)
+    // 5. NEGATIVE — empty span.
+    expect(isExactSpan('', reader)).toBe(false)
+    // 6. NEGATIVE — wrong method name.
+    expect(isExactSpan(exact, 'readTitleFromFs')).toBe(false)
+    // 7. NEGATIVE — two declarations spliced together (the shape an over-reach
+    //    that swallows a following method produces).
+    const other = methodBody(codes.find((c) => methodBody(c, 'readTitleFromFs') !== undefined)!, 'readTitleFromFs')!
+    expect(isExactSpan(exact + '\n\n' + other, reader)).toBe(false)
+    // The positive case above must be a real, non-trivial span, otherwise the
+    // "exact" branch could be satisfied by something degenerate.
+    expect(exact.length).toBeGreaterThan(200)
   })
 })
