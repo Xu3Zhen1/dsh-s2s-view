@@ -491,15 +491,114 @@ describe('s2s schedule service', () => {
     } as any)
     const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
     const out = await status.execute({}, { agent: { id: 'sess-a' } })
-    // The line must be PRESENT and must name both readings.
-    expect(out.text).toContain('schedule replay: NOT MOUNTED')
+    // ★ With NO config block the line must say NOT CONFIGURED and call it benign.
+    // An earlier version printed "NOT MOUNTED … cannot distinguish them", which
+    // was honest but threw away a fact available one level up; cross-review
+    // pointed out the two states ARE separable, so the report must separate them.
+    expect(out.text).toContain('schedule replay: NOT CONFIGURED')
     expect(out.text).toContain('benign')
-    expect(out.text).toContain('failed to mount')
-    // It must not be mistaken for either of the mounted-state reports.
+    expect(out.text).toContain('not a fault')
+    // It must not be mistaken for the FAULT reading nor for either mounted-state
+    // report — a diagnostic that reports the wrong one of three is worse than a
+    // silent one, because it looks authoritative.
+    expect(out.text).not.toContain('schedule replay: MOUNT FAILED')
     expect(out.text).not.toContain('schedule replay: 0 persisted job(s) failed')
     expect(out.text).not.toContain('schedule replay: UNKNOWN')
     // And the rest of the status must still work (a diagnostic must never break
     // the tool that carries it).
     expect(out.text).toContain('ledger:')
+  })
+
+  it('★ a CONFIGURED-but-unmounted schedule is reported as a FAULT, not as benign', async () => {
+    // ★★ The other half of the split above. Same context (no service mounted),
+    // but the parent plugin says a `schedule` block WAS configured. The two
+    // situations look identical from inside `s2s_status` — only the parent knows
+    // which one it is. Before `scheduleConfigured` was threaded down, these two
+    // were forced into one line; now they must differ, and differ in the
+    // direction that matters (a configured-but-dead scheduler loses prompts,
+    // an unconfigured one loses nothing).
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    expect(ctx.get('s2sSchedule')).toBeUndefined()
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+      discovery: {
+        list: vi.fn(async () => []),
+        resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        targetPolicyVerdict: vi.fn(() => undefined),
+        classifyTarget: vi.fn(() => 'eligible' as const),
+      },
+      scheduleConfigured: true,
+    } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('schedule replay: MOUNT FAILED')
+    expect(out.text).toContain('FAULT')
+    expect(out.text).toContain('will NOT fire')
+    // Must not be softened into the benign reading.
+    expect(out.text).not.toContain('schedule replay: NOT CONFIGURED')
+    expect(out.text).not.toContain('not a fault')
+    expect(out.text).toContain('ledger:')
+  })
+
+  it('★ queue: for a NON-EXISTENT id says UNKNOWN, not "0 waiting" (G9 same-shape defect)', async () => {
+    // ★★ MEASURED ON THE LIVE HOST 2026-10-26: `s2s_status({session_id:
+    // "nonexistent-session-00000000"})` printed
+    //     queue: nonexistent-session-00000000 = 0 message(s) waiting.
+    // `queuedCount(id)` does no existence check, so "nothing is waiting" and
+    // "there is no such session" rendered identically — the same defect class as
+    // the missing `schedule replay:` line, found in the same session.
+    //
+    // Only the EXPLICIT-id branch can do this check (the implicit branch lists
+    // sessions that came from the corpus and therefore exist), which is why the
+    // guard is inside `args.session_id !== undefined`.
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    const queuedCount = vi.fn(async () => 0)
+
+    function build(discoveryResolve: unknown) {
+      return buildTools({
+        ctx,
+        broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+        discovery: {
+          list: vi.fn(async () => []),
+          resolve: vi.fn(async () => discoveryResolve as any),
+          archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+          targetPolicyVerdict: vi.fn(() => undefined),
+          classifyTarget: vi.fn(() => 'eligible' as const),
+        },
+        lifecycle: { queuedCount, resumeReport: vi.fn(() => undefined), resumeReports_: vi.fn(() => []) } as any,
+      } as any)
+    }
+    async function run(discoveryResolve: unknown, args: any) {
+      const defs = build(discoveryResolve)
+      const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+      return (await status.execute(args, { agent: { id: 'sess-a' } })).text
+    }
+
+    // (a) The id does not exist ⇒ UNKNOWN, and the "0 waiting" wording is absent.
+    const missing = await run({ kind: 'not-found', name: 'x', candidates: [], totalCandidates: 42 },
+      { session_id: 'nonexistent-session-00000000' })
+    expect(missing).toContain('queue: nonexistent-session-00000000 = UNKNOWN')
+    expect(missing).toContain('NOT "0 waiting"')
+    expect(missing).not.toContain('nonexistent-session-00000000 = 0 message(s) waiting')
+
+    // (b) A real, resolvable id ⇒ the ordinary count line, and NOT UNKNOWN. This
+    //     is the reverse direction: without it, a version that always said
+    //     UNKNOWN would satisfy (a) and look correct.
+    const real = await run({ kind: 'ok', sessionId: 'sess-real', state: 'live', workspaceDir: 'w', matchedBy: 'exact', targetClass: 'eligible' },
+      { session_id: 'sess-real' })
+    expect(real).toContain('queue: sess-real = 0 message(s) waiting.')
+    expect(real).not.toContain('queue: sess-real = UNKNOWN')
+    // And `queuedCount` must actually have been consulted for the real id — the
+    // count above must not be a literal.
+    queuedCount.mockResolvedValueOnce(3)
+    const counted = await run({ kind: 'ok', sessionId: 'sess-real', state: 'live', workspaceDir: 'w', matchedBy: 'exact', targetClass: 'eligible' },
+      { session_id: 'sess-real' })
+    expect(counted).toContain('queue: sess-real = 3 message(s) waiting.')
   })
 })
