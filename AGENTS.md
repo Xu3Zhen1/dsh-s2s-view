@@ -106,6 +106,15 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   number gets quoted as fact later. (2026-10-26: a rule about not writing
   unverified claims shipped with an unverified count of incidents — no test can
   catch that, because a wrong number in a document turns nothing red.)
+- **A `0` from a line-oriented search is not evidence that a string is absent.**
+  Whatever tool you reach for first — `Select-String`, `grep` without `-z`,
+  `awk` — matches per line, so a needle that spans a line break always returns
+  0. That `0` looks exactly like a confirmed absence and invites you to act on
+  it. Normalise whitespace over the whole file before concluding, and state the
+  scope you used. (2026-10-26: two lines, two sessions, twenty minutes apart —
+  both searched for a phrase that wrapped across `L150`/`L151`, both got 0, both
+  nearly reported a real change as missing. The rule already existed in a skill;
+  what failed is that a casual one-off search does not consult a skill.)
 
 ---
 
