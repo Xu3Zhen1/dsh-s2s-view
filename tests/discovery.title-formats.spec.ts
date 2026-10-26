@@ -338,4 +338,37 @@ describe('s2s discovery L4 title read across log formats', () => {
     // "exact" branch could be satisfied by something degenerate.
     expect(exact.length).toBeGreaterThan(200)
   })
+
+  it('★ spanIsExact covers the "method absent" branch (it returned false, untested)', async () => {
+    // ★★ WHY THIS EXISTS. Cross-review found `spanIsExact`'s
+    // `if (body === undefined) return false` guard had ZERO coverage: the only
+    // two call sites both fed it a file that DOES declare the method, so the
+    // guard never executed. Two mutations proved it —
+    //   · turning that `return false` into `return true`, and
+    //   · deleting the guard outright
+    // both left the suite 10/10 GREEN (verified here; SHA256 confirmed changed,
+    // so the mutation really applied).
+    //
+    // This is the SAME defect class as the missing negative control, one layer
+    // down: `isExactSpan` got its negatives, but its wrapper kept a branch that
+    // only ever saw positive input. "The reading was of the right content" does
+    // not imply "every branch of that content was executed" — that needs
+    // per-branch negatives, not better fingerprints.
+    const { paths, codes } = await loadSrcTree(new URL('../src/', import.meta.url))
+    const reader = 'readOriginFromFs'
+
+    // A real source file that genuinely does NOT declare the method.
+    const noDecl = codes.find((c) => methodBody(c, reader) === undefined)
+    expect(noDecl === undefined, 'expected some src file without ' + reader).toBe(false)
+    expect(spanIsExact(noDecl!, reader)).toBe(false)
+
+    // And a name that exists nowhere at all — the branch must not care WHY the
+    // method is missing.
+    const owning = codes.find((c) => methodBody(c, reader) !== undefined)!
+    expect(spanIsExact(owning, 'thisMethodDoesNotExistAnywhere')).toBe(false)
+
+    // Positive control in the same test, so a wrapper that simply always
+    // returns false cannot satisfy the two negatives above.
+    expect(spanIsExact(owning, reader)).toBe(true)
+  })
 })
