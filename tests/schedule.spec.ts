@@ -406,6 +406,17 @@ describe('s2s schedule service', () => {
     const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
     const out = await status.execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('schedule replay: 0 persisted job(s) failed to load')
+    // ★★ REVERSE DIRECTION (cross-review found this missing, M-A):
+    // the criterion above only proves "the line IS there when mounted". It does
+    // NOT prove the NOT MOUNTED line stays absent — and a mutation that prints
+    // BOTH lines (a self-contradictory pair: "0 failed" AND "NOT MOUNTED")
+    // left the whole suite 23/23 GREEN. Measured, not hypothetical.
+    //
+    // A criterion that can only confirm presence cannot detect a diagnostic that
+    // over-reports. Both directions are needed:
+    //     mounted      ⇒ mounted line present AND not-mounted line ABSENT
+    //     not mounted  ⇒ not-mounted line present AND mounted lines ABSENT
+    expect(out.text).not.toContain('schedule replay: NOT MOUNTED')
   })
 
   it('★ a FAILED mount-time replay reports UNKNOWN instead of throwing (defensive branch)', async () => {
