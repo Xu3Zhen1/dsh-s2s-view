@@ -317,11 +317,38 @@ describe('s2s discovery L4 title read across log formats', () => {
     // 1. POSITIVE: the real span is exact.
     expect(isExactSpan(exact, reader)).toBe(true)
 
-    // 2. NEGATIVE — over-reach to end of file (trailing members included).
-    const overreach = owning.slice(at)
-    if (overreach !== exact) {
-      expect(isExactSpan(overreach, reader)).toBe(false)
-    }
+    // 2. NEGATIVE — over-reach: starts at the declaration and continues past the
+    //    method's end, built from the PARSER's span endpoints so it cannot
+    //    coincide with the exact span.
+    //
+    //    ★★ This was previously written as
+    //         const overreach = owning.slice(at)
+    //         if (overreach !== exact) { expect(...).toBe(false) }
+    //       i.e. a CONDITIONAL negative control. Cross-review proved the defect
+    //       is LIVE, not hypothetical: forcing `overreach === exact` (the shape
+    //       you get if the method becomes the last member of its file) produced
+    //       "1 passed | 10 skipped" — the assertion silently vanished and the
+    //       suite stayed green. Its validity therefore depended on an unrelated
+    //       code-layout fact (that another method happens to follow this one).
+    //       A control that can be skipped is not a control.
+    //
+    //    ★ Note the difference from a tautology, because it looks similar:
+    //         if (a !== b) { expect(...) }      ← OLD: when a === b the whole
+    //                                             assertion VANISHES, test green
+    //         expect(a !== b).toBe(true)        ← NEW: when a === b this
+    //                                             assertion itself goes RED
+    //      The new form asserts the PRECONDITION, so it is only inert while the
+    //      precondition holds — and when it stops holding it fails loudly with a
+    //      message that says the negative control is no longer valid. That is
+    //      the opposite of a tautology: it is a tripwire whose "always true"
+    //      holds only in the good world. (Cross-review measured it: weakening
+    //      the guard to `expect(true).toBe(true)` leaves 1 passed | 10 skipped,
+    //      i.e. the guard is what stops the skip.)
+    const exactEnd = at + exact.length
+    const overreach = owning.slice(at, exactEnd + 200)
+    expect(overreach !== exact).toBe(true) // guard the guard: fails loudly if layout changes
+    expect(overreach.length).toBeGreaterThan(exact.length)
+    expect(isExactSpan(overreach, reader)).toBe(false)
     // 3. NEGATIVE — truncated by one character.
     expect(isExactSpan(exact.slice(0, exact.length - 1), reader)).toBe(false)
     // 4. NEGATIVE — missing the declaration entirely.
