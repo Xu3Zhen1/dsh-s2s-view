@@ -193,3 +193,89 @@ describe('toolsPlugin applies and forwards scheduleConfigured (segments 2+3)', (
     expect(text).not.toContain('schedule replay: MOUNT FAILED')
   })
 })
+
+// ★★★★★ THE DEFAULT PATH — the safety property the comment PROMISES but nothing pinned.
+//
+// src/tools.ts says, right above the assignment:
+//
+//     // Passed by the parent plugin (see index.ts); absent means "assume not
+//     // configured", which is the safe reading — it can only under-claim a fault,
+//     // never invent one.
+//     const scheduleConfigured = config?.scheduleConfigured === true
+//
+// Cross-review found that NOTHING tested that. Two facts, both measured:
+//   · tests mounting toolsPlugin WITHOUT a config:            0
+//   · tests passing `scheduleConfigured: undefined`:          0
+//
+// and the mutant that flips the safety property — `=== true` → `!== false` —
+// left the suite 487/487 GREEN. Under that mutant, `undefined` (the absent
+// config, and also the whole point of the comment) evaluates to TRUE, so a host
+// that never configured a schedule would be told "MOUNT FAILED … a FAULT", i.e.
+// a fabricated fault, which is exactly what the comment says can never happen.
+//
+// Why it is worth a test even though the live plugin always passes an explicit
+// boolean: `config` is an OPTIONAL parameter of an exported `apply`, so any
+// caller mounting toolsPlugin directly hits this path, and the comment's promise
+// is a claim about the code, not about one caller.
+describe('toolsPlugin default (absent config) must under-claim, never invent a fault', () => {
+  async function textWithNoConfig(): Promise<string> {
+    const ctx = new Context()
+    const registered: any[] = []
+    ctx.provide('tools', { register: (d: any) => { registered.push(d); return () => {} } } as never)
+    ctx.provide('agents', { get: () => undefined, resume: vi.fn() } as never)
+    ctx.provide('sessions', { list: () => [] } as never)
+    ctx.provide('sessionQuery', { listSessions: async () => [], readTitle: async () => undefined } as never)
+    ctx.provide('s2sBroker', { deliver: vi.fn(), history: vi.fn(() => []) } as never)
+    ctx.provide('s2sDiscovery', {
+      list: vi.fn(async () => []),
+      resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [], totalCandidates: 1 })),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn(() => 'eligible' as const),
+    } as never)
+    const toolsPlugin = await import('../src/tools.ts')
+    // NO config argument at all — the exact case the comment describes as "absent".
+    await ctx.plugin(toolsPlugin)
+    expect(ctx.get('s2sSchedule')).toBeUndefined()
+    const status = registered.find((d) => d.name === 's2s_status')
+    expect(status === undefined, 's2s_status was never registered').toBe(false)
+    const out = await status.execute({}, { agent: { id: 'sess-default' } })
+    await ctx.fiber.dispose()
+    return out.text
+  }
+
+  it('absent config ⇒ NOT CONFIGURED (benign), never MOUNT FAILED (a fabricated fault)', async () => {
+    const text = await textWithNoConfig()
+    // The positive reading: absent means unconfigured.
+    expect(text).toContain('schedule replay: NOT CONFIGURED')
+    // THE ACTUAL PROPERTY: it must not invent a fault.
+    // This is what fails under `=== true` → `!== false`.
+    expect(text).not.toContain('schedule replay: MOUNT FAILED')
+  })
+
+  it('absent config is NOT treated as configured (explicit undefined, not just omission)', async () => {
+    // `undefined` can arrive explicitly too (a caller forwarding an optional
+    // value), which is a different source location from omitting the argument.
+    const ctx = new Context()
+    const registered: any[] = []
+    ctx.provide('tools', { register: (d: any) => { registered.push(d); return () => {} } } as never)
+    ctx.provide('agents', { get: () => undefined, resume: vi.fn() } as never)
+    ctx.provide('sessions', { list: () => [] } as never)
+    ctx.provide('sessionQuery', { listSessions: async () => [], readTitle: async () => undefined } as never)
+    ctx.provide('s2sBroker', { deliver: vi.fn(), history: vi.fn(() => []) } as never)
+    ctx.provide('s2sDiscovery', {
+      list: vi.fn(async () => []),
+      resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [], totalCandidates: 1 })),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn(() => 'eligible' as const),
+    } as never)
+    const toolsPlugin = await import('../src/tools.ts')
+    await ctx.plugin(toolsPlugin, { scheduleConfigured: undefined })
+    const status = registered.find((d) => d.name === 's2s_status')
+    const out = await status.execute({}, { agent: { id: 'sess-undef' } })
+    await ctx.fiber.dispose()
+    expect(out.text).toContain('schedule replay: NOT CONFIGURED')
+    expect(out.text).not.toContain('schedule replay: MOUNT FAILED')
+  })
+})
