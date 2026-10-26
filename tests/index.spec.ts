@@ -131,3 +131,65 @@ describe('s2s_status wiring: config.schedule -> the value handed to toolsPlugin'
     expect(got).toBe(false)
   })
 })
+
+// ★★★★★ SEGMENT 2+3: toolsPlugin's OWN handling of the config.
+//
+// The tests above pin segment 1 only — that index.ts hands the right value to
+// toolsPlugin. Cross-review then showed segments 2 and 3 were still unguarded:
+//
+//   (2) tools.ts apply() reads config.scheduleConfigured  → const scheduleConfigured
+//   (3) tools.ts apply() forwards it → buildTools({ scheduleConfigured })
+//
+// Two mutations, both leaving the suite 485/485 GREEN:
+//     `const scheduleConfigured = false`        (apply ignores the config)
+//     dropping `scheduleConfigured: scheduleConfigured,` from buildTools call
+//
+// So spy-on-the-argument covers hop 1 and leaves hops 2-3 blind. The honest
+// test mounts toolsPlugin DIRECTLY (it exports name/inject/apply, so it is a
+// legitimate cordis plugin) with an explicit config, and reads the text. Both
+// hops must be correct for the expected line to appear:
+//     config true  + no service  ⇒ MOUNT FAILED   (a fault)
+//     config false + no service  ⇒ NOT CONFIGURED (benign)
+// Neither assertion can be satisfied by a broken hop 2 or 3.
+describe('toolsPlugin applies and forwards scheduleConfigured (segments 2+3)', () => {
+  async function statusText(config: { scheduleConfigured?: boolean }): Promise<string> {
+    const ctx = new Context()
+    const registered: any[] = []
+    ctx.provide('tools', { register: (d: any) => { registered.push(d); return () => {} } } as never)
+    ctx.provide('agents', { get: () => undefined, resume: vi.fn() } as never)
+    ctx.provide('sessions', { list: () => [] } as never)
+    ctx.provide('sessionQuery', { listSessions: async () => [], readTitle: async () => undefined } as never)
+    ctx.provide('s2sBroker', { deliver: vi.fn(), history: vi.fn(() => []) } as never)
+    ctx.provide('s2sDiscovery', {
+      list: vi.fn(async () => []),
+      resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [], totalCandidates: 1 })),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn(() => 'eligible' as const),
+    } as never)
+    const toolsPlugin = await import('../src/tools.ts')
+    await ctx.plugin(toolsPlugin, config)
+    // No schedule service is mounted in this context, so the FAULT/benign split
+    // is decided ENTIRELY by the forwarded flag.
+    expect(ctx.get('s2sSchedule')).toBeUndefined()
+    const status = registered.find((d) => d.name === 's2s_status')
+    expect(status === undefined, 's2s_status was never registered').toBe(false)
+    const out = await status.execute({}, { agent: { id: 'sess-seg' } })
+    await ctx.fiber.dispose()
+    return out.text
+  }
+
+  it('apply forwards scheduleConfigured = true ⇒ MOUNT FAILED', async () => {
+    const text = await statusText({ scheduleConfigured: true })
+    expect(text).toContain('schedule replay: MOUNT FAILED')
+    // The inverse reading must be absent — this is what fails if apply drops or
+    // falsifies the flag on its way to buildTools.
+    expect(text).not.toContain('schedule replay: NOT CONFIGURED')
+  })
+
+  it('apply forwards scheduleConfigured = false ⇒ NOT CONFIGURED', async () => {
+    const text = await statusText({ scheduleConfigured: false })
+    expect(text).toContain('schedule replay: NOT CONFIGURED')
+    expect(text).not.toContain('schedule replay: MOUNT FAILED')
+  })
+})
