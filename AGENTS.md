@@ -138,9 +138,13 @@ too — do not write that a role was handed over until the new holder has writte
 ## 7. Multiple lines share one working tree — claim a file before you mutate it
 
 This repository is worked by several concurrent sessions (implementation, git, cross-review)
-in the **same** checkout. Three separate incidents (2026-10-26) showed what that costs: a
-mutation injected for verification was still in the tree when another line ran its gate, and
-twice the leftover string was one `git add -A` away from being committed as if it were the fix.
+in the **same** checkout. On 2026-10-26 this cost us repeatedly: a mutation injected for
+verification was left in the tree while another line ran its gate; at least twice a leftover
+string sat one `git add -A` away from being committed as if it were the fix (once already
+staged); and a temporary probe file was picked up by the test runner and inflated the suite
+count. **No single incident count is asserted here on purpose** — "how many" depends on the
+unit (leftover artefacts / affected trees / at-risk commits) and the three bases do not
+agree. The enumerated list with per-item evidence lives in the handoff page.
 
 **`git checkout -- <file>` and `git restore <file>` are WRITE operations, not recovery.** They
 overwrite whatever is there without asking. One line "restoring" a file silently erased another
