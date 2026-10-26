@@ -98,3 +98,37 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
 - **Report counts with their scope, timestamp, and definition.** Live data
   drifts; the same probe reads 209 then 215. Prefer claims that hold regardless
   of when you measure.
+
+---
+
+## 6. Session identity is NOT inherited — read it, then claim it
+
+This workspace is a multi-session effort (implementation line, git line, review line, plan
+owner, successors). A new session inherits **none of that**: the role file sits outside the
+auto-loaded instruction chain, so nothing brings it in.
+
+- **Automatic (and the only automatic part)**: the Team identity line
+  (`You are the Team Lead named "lead".`), injected from *live Team membership*. If the
+  session is not a live Team member, that section is simply absent — and nothing reports it.
+  It says *what the harness thinks you are*, never *which line of this project you hold*.
+- **Not automatic**: which line you are, your write scope, and who currently holds a role.
+  Those live in `..\handoff\接手页-<date>.md` (take the newest) and the whiteboard under
+  `%USERPROFILE%\.dsh\memory\workspaces\--G--dsh-s2s-view--\handoff\PLAN.md`.
+- **So, before the first edit of every session**: read the newest handoff page, then the
+  whiteboard, then claim an identity. Do not infer your role from the prompt's wording.
+
+**Claiming is a written act, not a greeting.** Append to the handoff page:
+
+```
+本角色自 <YYYY-MM-DD HH:mm> 起由 <8-hex id> 持有；旧 id <old-id> 停止出裁定。
+```
+
+- Sessions are addressed by an 8-hex id prefix. A role-table row naming an old id is **not**
+  evidence that the old session is still the holder — it is usually stale text.
+- **A stale pointer fails silently**: delivering to an old id still returns a success receipt.
+  Verify against the receipt's actual title / target state, not against "it looked sent".
+- If you cannot find a row for your own id anywhere, that is the defect, not a formality —
+  an unregistered holder reads as *passing* checks that never mention it. Register, then work.
+
+Cross-line rules for this file's §1: I1 (never claim more than happened) applies to identity
+too — do not write that a role was handed over until the new holder has written its own claim.
