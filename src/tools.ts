@@ -795,6 +795,26 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               : 'schedule replay: ' + errs.length + ' persisted job(s) FAILED to load — those prompts will NOT fire'
                 + ' (process-scoped record; first 20 shown):')
             for (const e of errs.slice(0, 20)) lines.push('  ' + e)
+          } else {
+            // ★ G9 (measured on the live host, 2026-10-26 after a restart):
+            // when the schedule sub-plugin is not mounted there is no service to
+            // ask, and this whole block used to print NOTHING. The consequence is
+            // exactly the confusion G9 forbids: a reader cannot tell
+            //
+            //     "the operator never configured a schedule block"   (benign)
+            //   from
+            //     "the schedule service failed to mount / this diagnostic broke"
+            //                                                      (a real fault)
+            //
+            // `s2s_schedule` does say "not configured" in this state, but a
+            // status report must stand on its own — the whole point of the trace
+            // added above is that the plugin logger is not persisted, so the
+            // status line is the only retrievable half. Staying silent built the
+            // very "legal empty vs broken feature" pair we are trying to remove.
+            lines.push('schedule replay: NOT MOUNTED — no `s2sSchedule` service in this context, so there is'
+              + ' no replay to report. Either no `schedule` config block is present (benign) or the'
+              + ' sub-plugin failed to mount (a fault); this line alone cannot distinguish them.'
+              + ' `s2s_schedule` reports "not configured" in the benign case.')
           }
         }
 

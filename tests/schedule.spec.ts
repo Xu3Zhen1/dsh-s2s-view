@@ -444,4 +444,51 @@ describe('s2s schedule service', () => {
     expect(out.text).toContain('replay itself FAILED')
     expect(out.text).toContain('synthetic replay failure')
   })
+
+  it('★ an UNMOUNTED schedule reports NOT MOUNTED instead of staying silent (G9, live defect)', async () => {
+    // ★★ MEASURED ON THE LIVE HOST, 2026-10-26 after a restart. `s2s_status`
+    // printed no `schedule replay:` line at all, because the whole block was
+    // guarded by `if (scheduleSvc !== undefined)` with no else. The profile has
+    // no `schedule` config block, so `s2s_schedule` answered "not configured"
+    // while the status report said nothing.
+    //
+    // That is precisely the G9 pair we keep removing: from the status text alone
+    // a reader cannot tell
+    //      "no schedule block was configured"        (benign)
+    //   from
+    //      "the service failed to mount / report broke"  (a fault)
+    // Both render identically as an ABSENT line. A missing line is the worst
+    // possible signal because it also matches "this version predates the line".
+    //
+    // The fix prints an explicit NOT MOUNTED line naming both possibilities, so
+    // the absence becomes informative. This test pins that.
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    // Deliberately mount NO schedule service.
+    expect(ctx.get('s2sSchedule')).toBeUndefined()
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+      discovery: {
+        list: vi.fn(async () => []),
+        resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        targetPolicyVerdict: vi.fn(() => undefined),
+        classifyTarget: vi.fn(() => 'eligible' as const),
+      },
+    } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    // The line must be PRESENT and must name both readings.
+    expect(out.text).toContain('schedule replay: NOT MOUNTED')
+    expect(out.text).toContain('benign')
+    expect(out.text).toContain('failed to mount')
+    // It must not be mistaken for either of the mounted-state reports.
+    expect(out.text).not.toContain('schedule replay: 0 persisted job(s) failed')
+    expect(out.text).not.toContain('schedule replay: UNKNOWN')
+    // And the rest of the status must still work (a diagnostic must never break
+    // the tool that carries it).
+    expect(out.text).toContain('ledger:')
+  })
 })
