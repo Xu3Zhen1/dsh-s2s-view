@@ -115,6 +115,21 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   both searched for a phrase that wrapped across `L150`/`L151`, both got 0, both
   nearly reported a real change as missing. The rule already existed in a skill;
   what failed is that a casual one-off search does not consult a skill.)
+- **"The reading was right, the question was wrong" has four distinct causes,
+  and they need four different guards.** Do not lump them into "unclear scope":
+  - *Scope* — the conclusion depends on an undeclared needle, range, case or
+    unit. Guard: state the scope, and report every plausible scope side by side.
+  - *Baseline* — every reading is correct but compared against the wrong
+    interval or the wrong starting state. Guard: name the baseline, not just the
+    reading.
+  - *Time* — a single sample treated as a standing fact. Guard: say "as of", and
+    say whether it can be re-sampled.
+  - *Object* — the number is right but about something other than the thing
+    asked (an mtime that shows last-write, not content read; a stale reason kept
+    after the fact changed). Guard: name what the probe actually measures.
+  Declaring scope fixes the first and nothing else. Collapsing all four into one
+  root is how you end up believing you have guarded ②③④ after only reading a
+  rule about ①.
 
 ---
 
