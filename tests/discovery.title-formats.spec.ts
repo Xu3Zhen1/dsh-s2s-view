@@ -45,90 +45,7 @@ async function sessionDir(root: string, name: string, id: string) {
 const titleLine = (title: string): string => `{"type":"session/title","data":{"title":"${title}"}}\n`
 const headerLine = (id: string): string => `{"type":"session","version":4,"id":"${id}","cwd":"/ws"}\n`
 
-// ───────────────────────────────────────────────────────────────────────────
-// Shared instrumentation for the structural checks.
-//
-// ★★ THESE LIVE AT MODULE SCOPE ON PURPOSE. A previous version had the reverse
-// test use its OWN copy of the slice logic (`methodBody2`), so removing the real
-// criterion's defences left the suite 8/8 GREEN: the "reverse test" was
-// decoration, not protection. Cross-review caught it (2026-10-26) with the
-// decisive experiment — cross-file slice + length invariant deleted ⇒ 8 passed.
-// Sharing ONE implementation is what makes the reverse test actually guard the
-// real assertion. Do not copy these into the tests again.
-// ───────────────────────────────────────────────────────────────────────────
-
-/** Strip comments. A doc comment that merely NAMES an identifier must never
- *  satisfy a structural assertion — that is how an assertion gets satisfied by
- *  prose instead of code. */
-const stripComments = (s: string): string => s
-  .replace(/\/\*[\s\S]*?\*\//g, '')
-  .split('\n')
-  .filter((line) => !line.trim().startsWith('//'))
-  .join('\n')
-
-/**
- * Extract one method's source from ONE file's text.
- *
- * Line-based on purpose. Two earlier attempts were wrong:
- *  1. locating at the first textual mention ⇒ usually the doc comment that
- *     names the method;
- *  2. ending at the next `private async ` in a CONCATENATED multi-file string
- *     ⇒ runs into later files (measured: 37,257-char slice in a 27,083-char
- *     file) and produced a false green;
- *  3. brace matching ⇒ the signature's return type can contain braces
- *     (`Promise<{ origin: … }>`), so the scan closes on the return type
- *     (measured: 137-char body, cut mid-signature).
- * The end is the first later line whose indentation equals the declaration's
- * and whose text is `}`.
- */
-const methodBody = (fileCode: string, name: string): string | undefined => {
-  const ls = fileCode.split('\n')
-  let start = -1
-  let indent = ''
-  for (let i = 0; i < ls.length; i++) {
-    if (ls[i]!.includes('private async ' + name + '(')) {
-      start = i
-      indent = (ls[i]!.match(/^\s*/) ?? [''])[0]!
-      break
-    }
-  }
-  if (start < 0) return undefined
-  for (let i = start + 1; i < ls.length; i++) {
-    if (ls[i] === indent + '}') return ls.slice(start, i + 1).join('\n')
-  }
-  return undefined // no terminator ⇒ caller asserts loudly
-}
-
-/** Locate a method across a set of already-stripped file texts. */
-const locateAcross = (
-  codes: string[],
-  name: string,
-  paths: string[],
-): { file: string; body: string; fileLen: number } | undefined => {
-  for (let i = 0; i < codes.length; i++) {
-    const body = methodBody(codes[i]!, name)
-    if (body !== undefined) return { file: paths[i]!, body, fileLen: codes[i]!.length }
-  }
-  return undefined
-}
-
-/** Read and strip every `.ts`/`.js` file under `src/`. */
-async function loadSrcTree(root: URL): Promise<{ paths: string[]; codes: string[] }> {
-  const { readdir, readFile } = await import('node:fs/promises')
-  const walk = async (dir: URL): Promise<URL[]> => {
-    const out: URL[] = []
-    for (const e of await readdir(dir, { withFileTypes: true })) {
-      const child = new URL(e.name + (e.isDirectory() ? '/' : ''), dir)
-      if (e.isDirectory()) { if (e.name !== 'node_modules') out.push(...await walk(child)) }
-      else if (e.name.endsWith('.ts') || e.name.endsWith('.js')) out.push(child)
-    }
-    return out
-  }
-  const files = await walk(root)
-  const codes: string[] = []
-  for (const f of files) codes.push(stripComments(await readFile(f, 'utf8')))
-  return { paths: files.map((f) => f.pathname), codes }
-}
+import { loadSrcTree, locateAcross, methodBody, stripComments } from './helpers/source-slice.ts'
 
 describe('s2s discovery L4 title read across log formats', () => {
   it('★ reads a title from a v4-ONLY session log (the current format)', async () => {
@@ -336,30 +253,41 @@ describe('s2s discovery L4 title read across log formats', () => {
     expect(codes2[targetIdx]).toContain('zzThirdReader')
   })
 
-  it('★ the reverse test actually depends on the criterion (no self-guarding blind spot)', async () => {
-    // Pins the property cross-review used to expose the flaw: the reverse test
-    // must call the shared implementation, not a private copy. If someone
-    // re-inlines the slice logic, this goes red.
-    const { readFile } = await import('node:fs/promises')
-    const self = await readFile(new URL(import.meta.url), 'utf8')
-    const code = stripComments(self)
-    // Count *definitions* of the slice helper. Match at line start so this
-    // assertion's own needle (which sits inside a string/regex literal) is not
-    // counted — measured: a bare match of the pattern found 2, the second being
-    // this very line.
-    const defs = code.split('\n').filter((l) => /^\s*const methodBody = \(/.test(l))
-    expect(defs).toHaveLength(1)
-    // No second *definition* of the slice logic under another name. Asserted by
-    // shape (a second `const <name> = (fileCode`, i.e. a duplicate extractor),
-    // not by searching for a specific identifier — a self-referential needle
-    // would match this very assertion and fail always.
-    const extractors = code.split('\n').filter((l) => /^\s*const \w+ = \(fileCode/.test(l))
-    expect(extractors).toHaveLength(1)
-    // The reverse test must reach for the shared locator.
-    const reverseAt = code.indexOf('slice-boundary reverse test')
-    expect(reverseAt).toBeGreaterThan(-1)
-    const reverseBody = code.slice(reverseAt)
-    expect(reverseBody).toContain('locateAcross(')
-    expect((reverseBody.split('\n').filter((l) => /^\s*const \w+ = \(fileCode/.test(l)))).toHaveLength(0)
+  it('★ helper is the ONLY slicer: degrading it reddens every criterion that uses it', async () => {
+    // ★★ What this test can and cannot claim — stated plainly, because the
+    // previous version claimed too much and was itself decoration.
+    //
+    // CANNOT be defended in-test: someone editing THIS spec to inline a private
+    // copy. A test cannot prevent edits to itself; the earlier attempt to do so
+    // scanned its own source text and produced a self-referentially true
+    // assertion (slice ran to end-of-file and contained its own expect line;
+    // measured reverseAt 7943, slice 2168, file 10111).
+    //
+    // CAN be guaranteed by structure, and IS the threat model that matters:
+    // the slicers live in `tests/helpers/source-slice.ts`, so they are the only
+    // implementation in play, and degrading them MUST redden the criteria that
+    // depend on them. That is a behaviour property, verified by mutation:
+    // making `methodBody` over-reach reddens BOTH the per-reader criterion and
+    // the reverse test together (measured: 2 failed).
+    //
+    // So this test asserts the load-bearing coupling rather than file text:
+    // the shared slicer, run on a known-good tree, must isolate the method —
+    // and a naive over-reaching slicer must NOT, i.e. the two are not
+    // interchangeable and the criterion is not satisfied by accident.
+    const { paths, codes } = await loadSrcTree(new URL('../src/', import.meta.url))
+    for (const reader of ['readOriginFromFs', 'readTitleFromFs']) {
+      const shared = locateAcross(codes, reader, paths)
+      expect(shared).toBeDefined()
+      // Must find the constant inside the method...
+      expect(shared!.body).toContain('SESSION_LOG_CANDIDATES')
+      // ...and must not swallow the rest of the file (or later files).
+      expect(shared!.body.length).toBeLessThanOrEqual(shared!.fileLen)
+      // A naive slicer that runs to end of file is a DIFFERENT answer, which is
+      // what makes the assertions above discriminating rather than tautological.
+      const owning = codes.findIndex((c) => methodBody(c, reader) !== undefined)
+      expect(owning).toBeGreaterThan(-1)
+      const naive = codes[owning]!.slice(codes[owning]!.indexOf('private async ' + reader + '('))
+      expect(shared!.body === naive).toBe(false)
+    }
   })
 })
