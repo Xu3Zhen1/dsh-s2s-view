@@ -407,4 +407,41 @@ describe('s2s schedule service', () => {
     const out = await status.execute({}, { agent: { id: 'sess-a' } })
     expect(out.text).toContain('schedule replay: 0 persisted job(s) failed to load')
   })
+
+  it('★ a FAILED mount-time replay reports UNKNOWN instead of throwing (defensive branch)', async () => {
+    // Cross-review caught this branch as UNTESTED and effectively unreachable:
+    // `load()` swallows its own errors into `loadErrors`, so `ready` almost
+    // never rejects. Two honest options were open — delete the branch, or pin
+    // it with a test. Deleting would mean that if `load()` ever starts
+    // rejecting, `s2s_status` dies rather than reporting. So the branch stays,
+    // and this test pins its wording AND the "never throw" property by
+    // injecting a rejecting `ready` (readonly is compile-time only).
+    const { buildTools } = await import('../src/tools.ts')
+    const ctx = new Context()
+    ctx.provide('agents', { get: () => undefined } as never)
+    await ctx.plugin(S2sScheduleService, { dir: await mkdtemp(join(tmpdir(), 's2s-sched-')), timerIntervalMs: 0 })
+    const svc = ctx.get('s2sSchedule') as S2sScheduleService
+    // Force the defensive path: a replay that rejects.
+    Object.defineProperty(svc, 'ready', {
+      value: Promise.reject(new Error('synthetic replay failure')),
+      configurable: true,
+    })
+    const defs = buildTools({
+      ctx,
+      broker: { deliver: vi.fn(), history: vi.fn(() => []) },
+      discovery: {
+        list: vi.fn(async () => []),
+        resolve: vi.fn(async () => ({ kind: 'not-found', name: 'x', candidates: [] }) as any),
+        archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+        targetPolicyVerdict: vi.fn(() => undefined),
+        classifyTarget: vi.fn(() => 'eligible' as const),
+      },
+    } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as { execute: (a: any, e: any) => Promise<{ text: string }> }
+    // Must NOT throw, and must say the report is unknown rather than "0 failed".
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('schedule replay: UNKNOWN')
+    expect(out.text).toContain('replay itself FAILED')
+    expect(out.text).toContain('synthetic replay failure')
+  })
 })
