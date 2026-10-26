@@ -752,8 +752,8 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
                 continue
               }
               if (resolved.kind === 'not-found') {
-                lines.push('queue: ' + id + ' = UNKNOWN — no session answers to this id'
-                  + ' (corpus of ' + String(resolved.totalCandidates ?? 0) + ' sessions).'
+                lines.push('queue: ' + id + ' = UNKNOWN — searched '
+                  + String(resolved.totalCandidates ?? 0) + ' sessions, this id matches none.'
                   + ' This is NOT "0 waiting": a non-existent id has no queue to read.')
                 continue
               }
