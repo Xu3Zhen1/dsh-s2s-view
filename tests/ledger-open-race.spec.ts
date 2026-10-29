@@ -144,4 +144,65 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     // The fix is about *when* we open, not *what* we open.
     expect(LEDGER_DOMAIN).toBe('s2s')
   })
+
+  it('★★★ the ledger registers a teardown hook that releases the domain', async () => {
+    // The measured defect (2026-10-29, real machine): after an earlier instance
+    // had opened the domain, the next attempt reported
+    //   `DomainError: domain 's2s' is already open`
+    // and the ledger stayed shut for the whole process — every write degraded to
+    // "untracked". `s2s.json` held 4.1 MB written the previous evening, so an
+    // earlier instance HAD opened it and never let go: `close()` was called from
+    // tests only, and the constructor's `ctx.effect` released the timer but not
+    // the domain.
+    //
+    // This test does not call `close()` by hand. It disposes the ledger's own
+    // plugin fiber (the same thing a reload does) and then asks a brand-new
+    // instance to claim the SAME domain name against the SAME backend.
+    const root = await mkdtemp(join(tmpdir(), 's2s-release-'))
+    dirs.push(root)
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+
+    // First instance: mount as a real plugin and dispose THAT fiber. Disposing
+    // the whole ctx would also remove the `storageDomain` provider, which is a
+    // different question from the defect.
+    const firstFiber = await ctx.plugin(S2sLedger)
+    const first = ctx.get('s2sLedger') as S2sLedger
+    await first.open()
+    expect(first.isOpen).toBe(true)
+    await firstFiber.dispose()
+    // The effect hook's teardown is async; cordis does not await it for us.
+    await vi.waitFor(() => { expect(first.isOpen).toBe(false) }, { timeout: 2000 })
+
+    // A reload: same domain name, same facility. Before the fix this threw
+    // `domain 's2s' is already open`; now the teardown gave it back.
+    const second = new S2sLedger(ctx)
+    await second.open()
+    expect(second.isOpen).toBe(true)
+    // Usable, not merely "open" in the bookkeeping sense.
+    await second.record({ msgId: 'm-after-reload', from: 'alice', to: 'sess-1', text: 'post-reload' })
+    const rows = await second.query()
+    expect(rows.some((r) => r.msgId === 'm-after-reload')).toBe(true)
+    disposers.push(async () => { await second.close(); await ctx.fiber.dispose() })
+  })
+
+  it('★★ disposing a plugin that never opened must not throw', async () => {
+    // Teardown has to tolerate the common shape: the host never provided
+    // `storageDomain`, so `open()` never ran. A release hook that assumes an
+    // open domain would turn every such shutdown into an error.
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+    const ledger = new S2sLedger(ctx)
+    expect(ledger.isOpen).toBe(false)
+    await expect(ctx.fiber.dispose()).resolves.toBeUndefined()
+    expect(ledger.isOpen).toBe(false)
+  })
 })

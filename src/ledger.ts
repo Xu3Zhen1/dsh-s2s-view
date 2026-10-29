@@ -253,6 +253,39 @@ export class S2sLedger extends Service {
       this.timer.unref?.()
     }
     this.ctx.effect(() => () => { if (this.timer !== undefined) clearInterval(this.timer) }, 's2sLedger.timer')
+    // ★ Release the storage domain when this plugin instance goes away.
+    //
+    // Without this the domain handle outlives the plugin: the store keeps the
+    // name `s2s` registered for the process, so a later mount of this same
+    // plugin — a reload, or a re-composition — gets
+    // `domain 's2s' is already open` and the ledger stays shut for the whole
+    // process. Measured 2026-10-29 on this machine: `fired=1 openCalled=true
+    // openOk=false openError=DomainError: domain 's2s' is already open`, while
+    // `s2s.json` held 4.1 MB written at 20:47 the previous evening — i.e. an
+    // earlier instance had opened it and never let go.
+    //
+    // `close()` is intentionally tolerant (it no-ops when never opened and when
+    // the open is still in flight we wait for it first), because disposing a
+    // plugin that failed to open must not throw during teardown.
+    this.ctx.effect(() => () => this.releaseDomain(), 's2sLedger.domain')
+  }
+
+  /**
+   * Best-effort teardown for the storage domain.
+   *
+   * Awaited by the effect hook above so the store actually sees the close before
+   * a replacement instance tries to claim the same name. Failures are swallowed:
+   * teardown must not turn a shutdown into an error, and the next open will
+   * report the same condition it would have reported anyway.
+   */
+  private releaseDomain(): Promise<void> {
+    const self = this
+    // Join an in-flight open first, otherwise we would close `undefined` and the
+    // pending open would then register a domain nobody holds a reference to.
+    const pending = this.opening
+    return (pending === undefined ? Promise.resolve() : pending.catch(function() {}))
+      .then(function() { return self.close() })
+      .catch(function() {})
   }
 
   private readonly timerIntervalMs: number
