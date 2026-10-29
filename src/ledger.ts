@@ -20,7 +20,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { S2sError } from './error.ts'
 import { readSessionLog, type HistoryEntry } from './history.ts'
-import { recordUntrackedDelivery } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, recordUntrackedDelivery } from './ledger-diagnostics.ts'
 import {
   LEDGER_LIMITS,
   MESSAGES_TABLE,
@@ -274,18 +274,43 @@ export class S2sLedger extends Service {
    * Best-effort teardown for the storage domain.
    *
    * Awaited by the effect hook above so the store actually sees the close before
-   * a replacement instance tries to claim the same name. Failures are swallowed:
-   * teardown must not turn a shutdown into an error, and the next open will
-   * report the same condition it would have reported anyway.
+   * a replacement instance tries to claim the same name.
+   *
+   * **A failure here is recorded, not swallowed.** Cordis would surface it
+   * anyway: `_unload()` wraps every disposable in try/catch and calls
+   * `logger.error(reason)` (verified in `@deepseek-ai/cordis` lib/index.js).
+   * Adding a silent `.catch(() => {})` on top of that therefore *removes* an
+   * observable trace rather than preventing one — a G9 violation, because a
+   * failed release is precisely the condition that leaves the domain claimed and
+   * makes the next mount fail. So the error is kept in a readable field
+   * (`domainReleaseError`) and warned, while still not propagating: "teardown
+   * must not throw" and "teardown must not be silent" are two separate
+   * requirements, and this satisfies both.
    */
   private releaseDomain(): Promise<void> {
     const self = this
-    // Join an in-flight open first, otherwise we would close `undefined` and the
-    // pending open would then register a domain nobody holds a reference to.
+    // Join an in-flight open first.
+    //
+    // ★ PREVENTIVE, NOT PROVEN NECESSARY. Without the join we would close
+    // `undefined` and the pending open would then register a domain nobody holds
+    // a reference to. The reasoning is sound but has NO test behind it: the
+    // mutant that drops the join (`MUT-NOJOIN`) leaves the suite fully green,
+    // because every prior case disposes *after* `open()` has settled — at which
+    // point `this.opening` is already undefined, so this branch never runs.
+    // The concurrency case added alongside this comment exercises the branch; it
+    // does not prove the join is required for correctness. Do not cite this as a
+    // measured necessity.
     const pending = this.opening
     return (pending === undefined ? Promise.resolve() : pending.catch(function() {}))
       .then(function() { return self.close() })
-      .catch(function() {})
+      .catch(function(error: unknown) {
+        ledgerDiagnostics.domainReleaseError = String(error)
+        self.ctx.logger.warn(
+          's2s ledger: releasing the storage domain failed (' + String(error) + '); '
+          + 'the domain may stay claimed for this process, so a later mount can fail '
+          + "with `domain 's2s' is already open`.",
+        )
+      })
   }
 
   private readonly timerIntervalMs: number

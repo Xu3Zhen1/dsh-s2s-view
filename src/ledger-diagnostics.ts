@@ -72,6 +72,17 @@ export interface LedgerDiagnostics {
   /** Why `open()` rejected, or why it was never attempted, verbatim. */
   openError?: string
   /**
+   * Why releasing the storage domain on teardown failed, verbatim.
+   *
+   * Teardown must not throw, but it must not be silent either: a failed release
+   * is exactly what leaves the domain claimed for the rest of the process, so the
+   * next mount dies with `domain 's2s' is already open`. Without this field that
+   * failure is invisible — cordis would otherwise route the rejection to
+   * `logger.error`, and plugin logger output is not persisted anywhere, so it is
+   * unrecoverable after the fact.
+   */
+  domainReleaseError?: string
+  /**
    * When this process began, sampled from `process.uptime()` at module load.
    *
    * The cold-start criterion needs a clock that is independent of the plugin's

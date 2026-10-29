@@ -8,6 +8,7 @@ import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import * as sqliteStorage from '@deepseek-ai/dsh-storage-sqlite'
 import { apply as s2sApply } from '../src/index.ts'
 import { S2sLedger } from '../src/ledger.ts'
+import { ledgerDiagnostics } from '../src/ledger-diagnostics.ts'
 import { LEDGER_DOMAIN } from '../src/ledger-schema.ts'
 
 /**
@@ -204,5 +205,61 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     expect(ledger.isOpen).toBe(false)
     await expect(ctx.fiber.dispose()).resolves.toBeUndefined()
     expect(ledger.isOpen).toBe(false)
+  })
+
+  it('★★★ dispose DURING an in-flight open still releases the domain (the join branch)', async () => {
+    // Why this exists: the ★★★ test above disposes AFTER `await open()` settled,
+    // so `this.opening` is already undefined there and the "join the pending open
+    // first" branch in `releaseDomain` never executes. Measured: deleting that
+    // join (`MUT-NOJOIN`) leaves the whole suite green — i.e. the branch had no
+    // coverage at all, and the comment claiming the join is necessary was
+    // reasoning without evidence.
+    //
+    // This test does not prove the join is *required* for correctness either. It
+    // proves something narrower and checkable: disposing while an open is in
+    // flight does not wedge the domain, and the domain is free afterwards.
+    const root = await mkdtemp(join(tmpdir(), 's2s-inflight-'))
+    dirs.push(root)
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+
+    const fiber = await ctx.plugin(S2sLedger)
+    const ledger = ctx.get('s2sLedger') as S2sLedger
+    // Start the open and dispose WITHOUT awaiting the open first — this is the
+    // only shape in which `this.opening` is still set when teardown runs.
+    const opening = ledger.open()
+    const disposing = fiber.dispose()
+    await Promise.allSettled([opening, disposing])
+
+    // Whatever happened to the open, the name must be free for the next mount.
+    const second = new S2sLedger(ctx)
+    await second.open()
+    expect(second.isOpen).toBe(true)
+    disposers.push(async () => { await second.close(); await ctx.fiber.dispose() })
+  })
+
+  it('★ a failed domain release is RECORDED, not swallowed', async () => {
+    // The earlier version ended `releaseDomain` with `.catch(() => {})`. Cordis
+    // already routes a rejected disposable to `logger.error`, so that catch did
+    // not prevent an error — it deleted the only trace of one. A failed release
+    // is exactly what leaves the domain claimed, so it has to be readable.
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+    const ledger = new S2sLedger(ctx)
+    // Force close() to fail, then release: the error must land in the field.
+    const boom = new Error('ZZ_RELEASE_BOOM')
+    ;(ledger as unknown as { close: () => Promise<void> }).close = () => Promise.reject(boom)
+    ;(ledger as unknown as { domain: unknown }).domain = { close: () => Promise.reject(boom) }
+    const release = (ledger as unknown as { releaseDomain: () => Promise<void> }).releaseDomain()
+    await expect(release).resolves.toBeUndefined()
+    expect(ledgerDiagnostics.domainReleaseError).toContain('ZZ_RELEASE_BOOM')
   })
 })
