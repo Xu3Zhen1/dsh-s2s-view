@@ -131,11 +131,17 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   root is how you end up believing you have guarded ②③④ after only reading a
   rule about ①.
 - **A familiar error string is a search key, not a fresh mystery.** Before you
-  start hypothesising about a symptom, grep this repo — `plan/开发计划书-初稿.md`,
-  the handoff pages, `AGENTS.md` — for the exact message. The same text often has
-  prior form, and the prior write-up usually already says which branches were
-  eliminated and why. Re-deriving them costs the investigation and produces the
-  same dead ends.
+  start hypothesising about a symptom, search the **whole workspace** for the
+  exact message — `plan/**` (**including the 回执/复核/送审/裁定 files**),
+  `docs/**`, the handoff pages, `AGENTS.md`. The same text often has prior form,
+  and the prior write-up usually already says which branches were eliminated and
+  why. Re-deriving them costs the investigation and produces the same dead ends.
+  **Where the records actually live: the `回执`/`复核` files, not the plan.**
+  Measured 2026-10-29 on the string `already open`: `plan/回执-*.md` = **1 hit**,
+  `plan/开发计划书-初稿.md` (190 KB) = **0**. The plan records *conclusions*; the
+  receipts record *investigations*, including what was ruled out. Searching only
+  the plan returns 0 and reads as "no prior form" — which is the failure this
+  rule exists to prevent, inverted.
   Two traps in the other direction, both measured here:
   - **Same string, different mechanism.** `already open` appears in this project
     for two unrelated things: `S2sLifecycle` avoiding a double *wake* of one
@@ -145,13 +151,17 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
     mechanism before reusing the diagnosis.
   - **Prior form is not coverage.** A search that finds nothing is also
     information: the ledger-domain release had `already open` / `close()` /
-    释放 / teardown / 卸载 all at **0** occurrences in a 190 KB plan, so the
+    释放 / teardown / 卸载 all at **0** occurrences in the 190 KB plan, so that
     defect was genuinely new rather than an unexecuted plan item. Say which of
-    the two you found.
+    the two you found — but only after searching the receipt files too.
   (2026-10-29: the exact string `domain 's2s' is already open` had already been
-  written up for `30798cf` — a concurrent-open race fixed with a shared in-flight
-  promise. It was not consulted, so a dozen tool calls went into ruling out
-  multiple-instance mounts, which that write-up had already ruled out.)
+  written up in `plan/回执-审查会话-30798cf重启验收判据.md` L77 — a concurrent-open
+  race fixed with a shared in-flight promise. It was not consulted, so a dozen
+  tool calls went into ruling out multiple-instance mounts, which that write-up
+  had already ruled out. The first version of *this very rule* then cited the
+  190 KB plan as the place to look; a reviewer checked and found 0 hits there.
+  A rule about not repeating past investigations had mis-stated where the past
+  investigation was written down.)
 
 ---
 
