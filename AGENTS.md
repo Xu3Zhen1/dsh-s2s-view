@@ -130,6 +130,28 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   Declaring scope fixes the first and nothing else. Collapsing all four into one
   root is how you end up believing you have guarded ②③④ after only reading a
   rule about ①.
+- **A familiar error string is a search key, not a fresh mystery.** Before you
+  start hypothesising about a symptom, grep this repo — `plan/开发计划书-初稿.md`,
+  the handoff pages, `AGENTS.md` — for the exact message. The same text often has
+  prior form, and the prior write-up usually already says which branches were
+  eliminated and why. Re-deriving them costs the investigation and produces the
+  same dead ends.
+  Two traps in the other direction, both measured here:
+  - **Same string, different mechanism.** `already open` appears in this project
+    for two unrelated things: `S2sLifecycle` avoiding a double *wake* of one
+    session (`'resumed'` vs `'already-live'`, already tested), and the storage
+    domain rejecting a second *open* of `s2s` (this one had no teardown and was
+    only fixed in `88f0bd7`). Matching words is not matching causes — read the
+    mechanism before reusing the diagnosis.
+  - **Prior form is not coverage.** A search that finds nothing is also
+    information: the ledger-domain release had `already open` / `close()` /
+    释放 / teardown / 卸载 all at **0** occurrences in a 190 KB plan, so the
+    defect was genuinely new rather than an unexecuted plan item. Say which of
+    the two you found.
+  (2026-10-29: the exact string `domain 's2s' is already open` had already been
+  written up for `30798cf` — a concurrent-open race fixed with a shared in-flight
+  promise. It was not consulted, so a dozen tool calls went into ruling out
+  multiple-instance mounts, which that write-up had already ruled out.)
 
 ---
 
