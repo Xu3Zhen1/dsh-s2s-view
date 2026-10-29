@@ -115,6 +115,24 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   both searched for a phrase that wrapped across `L150`/`L151`, both got 0, both
   nearly reported a real change as missing. The rule already existed in a skill;
   what failed is that a casual one-off search does not consult a skill.)
+- **A hit is not an attribution: after a merged search, re-search each needle on
+  its own.** `a|b` returning a line tells you *something* matched, not *which
+  something*. Before citing a hit as evidence for a particular term, run that
+  term alone over the same scope. This is adjacent to the rule above but
+  distinct: that one is about **scope** (where you looked), this is about
+  **attribution** (what matched).
+  Measured 2026-10-29, `docs/ledger-backup-and-schema-upgrades.md`:
+  ```
+  Select-String -Pattern '30798cf|already open'   → 1 hit, L20
+  same line, each needle tested separately        → '30798cf' True
+                                                    'already open' False
+  ```
+  That hit was reported as "docs/ contains `already open`" and sent a reviewer
+  chasing a file that has zero occurrences of it. Both lines of this session then
+  made the mirror-image error: one side assumed *where* a prior write-up lived
+  without checking, the other assumed *which* needle a hit belonged to without
+  checking. Same root — **the evidence existed, but its link to the conclusion
+  was never verified.**
 - **"The reading was right, the question was wrong" has four distinct causes,
   and they need four different guards.** Do not lump them into "unclear scope":
   - *Scope* — the conclusion depends on an undeclared needle, range, case or
