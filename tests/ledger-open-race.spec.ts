@@ -327,4 +327,48 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     )
     disposers.push(async () => { await ctx.fiber.dispose() })
   })
+
+  it('★★ mountedInstances is a RUNTIME count — two live instances show as 2, and teardown brings it back', async () => {
+    // The completeness check is `acquired - released == mountedInstances`, so the
+    // right-hand side has to be observable at runtime. It must NOT be taken from
+    // the config file: a reload or re-composition produces a second live instance
+    // while the config still lists one mount, and that overlap is exactly when a
+    // release is most likely to be skipped. This case pins the runtime property —
+    // the count follows live objects, not configuration.
+    const base = ledgerDiagnostics.mountedInstances ?? 0
+
+    const ctxA = new Context()
+    ctxA.logger.warn = vi.fn() as never
+    stubHost(ctxA)
+    const first = new S2sLedger(ctxA)
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base + 1)
+
+    // A second instance on its OWN context — this is the reload / re-composition
+    // overlap: two live instances exist while the config file still lists one
+    // mount. A config-derived count would read 1 here and the check would pass
+    // while a domain is actually still held. (Two instances on ONE context is not
+    // the real shape: cordis rejects duplicate service registration, so the
+    // overlap always comes from separate contexts.)
+    const ctxB = new Context()
+    ctxB.logger.warn = vi.fn() as never
+    stubHost(ctxB)
+    const secondLive = new S2sLedger(ctxB)
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base + 2)
+
+    // Disposing one context brings the count down by exactly one, leaving the
+    // other instance still visible — that is what "live" has to mean.
+    await ctxB.fiber.dispose()
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base + 1)
+
+    await ctxA.fiber.dispose()
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base)
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBeGreaterThanOrEqual(0)
+    void first
+    void secondLive
+
+    // A double dispose must not drive it negative — the floor is part of the
+    // contract, because a negative denominator would make the check pass silently.
+    await ctxA.fiber.dispose()
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base)
+  })
 })

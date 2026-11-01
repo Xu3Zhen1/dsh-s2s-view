@@ -109,6 +109,20 @@ export interface LedgerDiagnostics {
    */
   domainAcquiredCount?: number
   /**
+   * How many `S2sLedger` instances are alive in this process right now.
+   *
+   * This is the denominator `domainAcquiredCount - domainReleasedCount` is checked
+   * against, and it must be a *runtime* measurement rather than a config count.
+   * The config file listing one mount does not prevent a reload or re-composition
+   * from producing a second live instance, and that overlap is exactly when a
+   * release is most likely to be skipped — so a config-derived denominator would
+   * fail the check in the one situation it exists for.
+   *
+   * Incremented on construction, decremented in the teardown effect, floored at 0
+   * so a double dispose cannot drive it negative.
+   */
+  mountedInstances?: number
+  /**
    * When this process began, sampled from `process.uptime()` at module load.
    *
    * The cold-start criterion needs a clock that is independent of the plugin's

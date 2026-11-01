@@ -253,6 +253,21 @@ export class S2sLedger extends Service {
       this.timer.unref?.()
     }
     this.ctx.effect(() => () => { if (this.timer !== undefined) clearInterval(this.timer) }, 's2sLedger.timer')
+    // ★ Count live instances from the runtime, not from config.
+    //
+    // The incompleteness check is `acquired - released == live instances`, so the
+    // right-hand side has to be observable, and it has to be a *runtime* fact. The
+    // config file reporting one mount is not enough: a reload or a re-composition
+    // creates a second live instance while the config still lists one, and that is
+    // exactly the moment a release is most likely to be skipped. Substituting a
+    // config value there would make the check fail precisely when it matters.
+    //
+    // Declared here (construction) and decremented in the same effect that releases
+    // the domain, so increment and decrement are symmetric on the teardown path.
+    ledgerDiagnostics.mountedInstances = (ledgerDiagnostics.mountedInstances ?? 0) + 1
+    this.ctx.effect(() => () => {
+      ledgerDiagnostics.mountedInstances = Math.max(0, (ledgerDiagnostics.mountedInstances ?? 0) - 1)
+    }, 's2sLedger.instanceCount')
     // ★ Release the storage domain when this plugin instance goes away.
     //
     // Without this the domain handle outlives the plugin: the store keeps the

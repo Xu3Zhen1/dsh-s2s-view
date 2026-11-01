@@ -148,6 +148,54 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   Declaring scope fixes the first and nothing else. Collapsing all four into one
   root is how you end up believing you have guarded ②③④ after only reading a
   rule about ①.
+- **Every observable field needs a stated value→fact table, or it cannot be read.**
+  This is the same gap as the four causes above, but at the *design* end rather
+  than the reading end: a guard that says "absence of X is healthy" is not
+  readable unless it also says which facts produce absence. Measured four times
+  in one session, and it was a different field each time:
+  ```
+  domainReleaseError unset   ⇒ "released cleanly" OR "teardown never ran"
+                               — absence alone cannot tell them apart
+  domainReleased >= 1        ⇒ "happened at least once" but never "nothing skipped";
+                               no reference value existed to compare against
+  "N - M is normally 0 or 1" ⇒ an empirical range, not a criterion: 1 could be
+                               "one instance still holds the domain" or "one
+                               release was skipped and the balance hid it"
+  s2s.json mtime stale       ⇒ read as "the ledger is not writing"; it was a
+                               batched flush, and the sample predated the write
+  ```
+  The guard, in two parts: **① when you add a counter or a diagnostic field, say
+  what each of its values means — including the boring value.** A counter with no
+  "should be N, because …" is a number, not a criterion. **② when a check can
+  only prove "something happened" and not "nothing was missed", say so** — that
+  is the difference between "the release ran once" and "every unload released",
+  and only the latter licenses a completeness claim. Two-sided counters exist for
+  exactly this: one side alone always leaves the denominator unstated.
+  Corollary that keeps biting: **a freshly started process with `released = 0`
+  is not evidence that release never runs** — nothing has been unloaded yet.
+  Same shape as "absent ≠ not executed", one level up.
+
+  **③ A criterion is only as readable as its least-readable term.** If a judgment
+  compares two quantities, both have to come from the same surface. A term that
+  must be reconstructed by hand — from a config file, or from memory — turns a
+  machine-checkable criterion back into a human guess.
+  Measured 2026-11-01: the completeness rule was written as
+  `acquired - released == live instances`, but nothing reported the live instance
+  count, so the right-hand side had to be read out of `cordis.patch.yml`. That is
+  wrong in the one case the rule exists for: on a reload or re-composition the
+  config still lists one mount while two instances are alive, so a config-derived
+  denominator keeps the check green exactly when a domain is still held. Fixed by
+  making the count a runtime field (`mountedInstances`).
+  So: **when a criterion needs a quantity, ask whether that quantity is on the
+  same surface as the rest of the evidence.** If not, either expose it or say
+  plainly which part of the judgment is human-supplied.
+
+  Two limits of paired counters, worth stating so nobody reads more into them:
+  a net difference is a **conservation check, not a pairing proof** — 5 acquired,
+  3 released, 2 live passes even if one release acted on the wrong domain
+  (cross-instance mismatch); proving pairing needs each release to carry the
+  identity of the acquisition it answers. And a count proves *occurrence*, not
+  *correctness* — `released > 0` never says the release did the right thing.
 - **A familiar error string is a search key, not a fresh mystery.** Before you
   start hypothesising about a symptom, search the **whole workspace** for the
   exact message — `plan/**` (**including the 回执/复核/送审/裁定 files**),
