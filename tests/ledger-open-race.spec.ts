@@ -282,4 +282,49 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     await (neverOpened as unknown as { releaseDomain: () => Promise<void> }).releaseDomain()
     expect(ledgerDiagnostics.domainReleasedCount ?? 0).toBe(before + 1)
   })
+
+  it('★★ a release counter alone cannot prove completeness — the acquired/released PAIR can', async () => {
+    // Why the pair exists: `domainReleasedCount` has no reference value. Nothing
+    // says how many unloads a process *should* see, so `released >= 1` only proves
+    // "at least once" and never "nothing was skipped". Counting acquisitions gives
+    // the missing denominator: `acquired - released` is the number of domains still
+    // open, so a positive remainder that no live instance accounts for means a
+    // teardown skipped the release path.
+    //
+    // This case pins the invariant directly, so a future edit that moves one
+    // increment without the other goes red here.
+    const acquired0 = ledgerDiagnostics.domainAcquiredCount ?? 0
+    const released0 = ledgerDiagnostics.domainReleasedCount ?? 0
+
+    // A real open on a real facility: acquired must advance by exactly one.
+    const root = await mkdtemp(join(tmpdir(), 's2s-pair-'))
+    dirs.push(root)
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+
+    const first = new S2sLedger(ctx)
+    await first.open()
+    expect(ledgerDiagnostics.domainAcquiredCount ?? 0).toBe(acquired0 + 1)
+    // Still open ⇒ not yet released: the pair must stay unbalanced by exactly one.
+    expect((ledgerDiagnostics.domainAcquiredCount ?? 0) - (ledgerDiagnostics.domainReleasedCount ?? 0)).toBe(
+      acquired0 - released0 + 1,
+    )
+
+    // Releasing through the teardown path ⇒ the pair rebalances. That equality is
+    // the completeness property: every acquisition is matched by a release.
+    // Note it must go through `releaseDomain`, not `close()`: `close()` only closes
+    // the domain handle, while the counter tracks the *teardown path*. Asserting
+    // against `close()` would be measuring a different thing than the counter does.
+    await (first as unknown as { releaseDomain: () => Promise<void> }).releaseDomain()
+    expect((ledgerDiagnostics.domainAcquiredCount ?? 0) - (ledgerDiagnostics.domainReleasedCount ?? 0)).toBe(
+      acquired0 - released0,
+    )
+    disposers.push(async () => { await ctx.fiber.dispose() })
+  })
 })

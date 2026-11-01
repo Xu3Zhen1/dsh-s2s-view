@@ -96,6 +96,19 @@ export interface LedgerDiagnostics {
    */
   domainReleasedCount?: number
   /**
+   * How many times `open()` successfully acquired a storage domain.
+   *
+   * The pair with `domainReleasedCount` is what makes completeness checkable.
+   * A release counter on its own cannot be validated: no reference value exists
+   * for "how many unloads should this process have seen", so `released >= 1`
+   * only establishes "at least once", never "never skipped". With both sides
+   * counted, `acquired - released` equals the number of domains still open, so a
+   * positive remainder with no live instance accounting for it is evidence that a
+   * teardown did not release. Incremented only after `facility.open()` resolves,
+   * so a failed open does not inflate it.
+   */
+  domainAcquiredCount?: number
+  /**
    * When this process began, sampled from `process.uptime()` at module load.
    *
    * The cold-start criterion needs a clock that is independent of the plugin's

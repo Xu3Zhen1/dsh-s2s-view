@@ -943,6 +943,7 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             + (d.openError === undefined ? '' : ' openError=' + d.openError)
             + (d.domainReleaseError === undefined ? '' : ' domainReleaseError=' + d.domainReleaseError)
             + ' domainReleased=' + String(d.domainReleasedCount ?? 0)
+            + ' domainAcquired=' + String(d.domainAcquiredCount ?? 0)
             + '  |  live probes: ctx.get(storageDomain)=' + probe('storageDomain')
             + ' ctx.get(storage)=' + probe('storage')
             + ' storage.domain=' + hubProbe)

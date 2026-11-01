@@ -610,6 +610,14 @@ export class S2sLedger extends Service {
           )
         }
         self.domain = await facility.open(ledgerDomain)
+        // Paired with `domainReleasedCount`. A release counter alone proves only
+        // "a release happened", never "no release was missed" — it cannot be read
+        // against any expected value, because nothing states how many unloads a
+        // process should see. Counting acquisitions too makes the pair checkable:
+        // in steady state `acquired - released` is the number of domains still
+        // open, so a value above the number of live instances means a teardown
+        // skipped the release path.
+        ledgerDiagnostics.domainAcquiredCount = (ledgerDiagnostics.domainAcquiredCount ?? 0) + 1
       })()
       // Cleared either way: a failed open must not wedge every later attempt.
       void this.opening.catch(function() {}).finally(function() { self.opening = undefined })
