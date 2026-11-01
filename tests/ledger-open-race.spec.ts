@@ -371,4 +371,37 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     await ctxA.fiber.dispose()
     expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(base)
   })
+
+  it('★★ the floor at zero is ENFORCED, not just documented', async () => {
+    // Why this case exists, separately: removing `Math.max(0, …)` left the whole
+    // suite green (measured 2026-11-01, 12/12 passed under MUT-NOFLOOR). The
+    // previous case could not catch it — it disposes matched pairs, so the counter
+    // never goes below its own starting value. A floor that nothing exercises is a
+    // comment, not a contract, and the failure it guards is silent by construction:
+    // a negative denominator makes `acquired - released == mountedInstances`
+    // compare against a number that can never be reached, so the check stops
+    // reporting anything at all.
+    //
+    // Force the unmatched case: start from a known baseline, then drive a teardown
+    // when nothing is mounted.
+    const base = ledgerDiagnostics.mountedInstances ?? 0
+    expect(base).toBeGreaterThanOrEqual(0)
+
+    ledgerDiagnostics.mountedInstances = 0
+    // An extra teardown with no instance to match it is exactly the shape that
+    // would go negative without the floor.
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx)
+    const orphan = new S2sLedger(ctx)
+    // Undo the construction's own increment so the teardown below is unmatched.
+    ledgerDiagnostics.mountedInstances = 0
+    await ctx.fiber.dispose()
+
+    expect(ledgerDiagnostics.mountedInstances).toBe(0)
+    expect(ledgerDiagnostics.mountedInstances ?? 0).not.toBe(-1)
+    void orphan
+
+    ledgerDiagnostics.mountedInstances = base
+  })
 })
