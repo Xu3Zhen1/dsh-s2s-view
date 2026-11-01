@@ -301,8 +301,19 @@ export class S2sLedger extends Service {
     // does not prove the join is required for correctness. Do not cite this as a
     // measured necessity.
     const pending = this.opening
+    const hadDomain = this.domain !== undefined || pending !== undefined
     return (pending === undefined ? Promise.resolve() : pending.catch(function() {}))
       .then(function() { return self.close() })
+      .then(function() {
+        // Success needs a trace too, not just failure. Without this the absence of
+        // `domainReleaseError` cannot distinguish "released successfully" from
+        // "teardown never reached the release path at all" — both leave the field
+        // unset. Recording the attempt makes the two separable when reading
+        // `s2s_status`; the value is how many releases this process performed.
+        if (hadDomain) {
+          ledgerDiagnostics.domainReleasedCount = (ledgerDiagnostics.domainReleasedCount ?? 0) + 1
+        }
+      })
       .catch(function(error: unknown) {
         ledgerDiagnostics.domainReleaseError = String(error)
         self.ctx.logger.warn(

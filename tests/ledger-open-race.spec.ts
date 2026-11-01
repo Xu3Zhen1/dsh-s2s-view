@@ -262,4 +262,24 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     await expect(release).resolves.toBeUndefined()
     expect(ledgerDiagnostics.domainReleaseError).toContain('ZZ_RELEASE_BOOM')
   })
+
+  it('★★ a successful release is COUNTED, so "no error" is not mistaken for "did not run"', async () => {
+    // `domainReleaseError` being unset has two possible causes: the release ran
+    // and succeeded, or teardown never had a domain to release. Reading the
+    // absence of an error as "the release worked" is unsound unless something
+    // distinguishes them. The counter is that something.
+    const before = ledgerDiagnostics.domainReleasedCount ?? 0
+
+    // (a) A ledger that opened a real domain: releasing must bump the counter.
+    const withDomain = new S2sLedger(new Context())
+    ;(withDomain as unknown as { domain: unknown }).domain = { close: () => Promise.resolve() }
+    await (withDomain as unknown as { releaseDomain: () => Promise<void> }).releaseDomain()
+    expect(ledgerDiagnostics.domainReleasedCount ?? 0).toBe(before + 1)
+
+    // (b) A ledger that never opened: nothing to release, so the counter must NOT
+    // move — otherwise the number would stop distinguishing the two causes.
+    const neverOpened = new S2sLedger(new Context())
+    await (neverOpened as unknown as { releaseDomain: () => Promise<void> }).releaseDomain()
+    expect(ledgerDiagnostics.domainReleasedCount ?? 0).toBe(before + 1)
+  })
 })

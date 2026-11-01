@@ -83,6 +83,19 @@ export interface LedgerDiagnostics {
    */
   domainReleaseError?: string
   /**
+   * How many times teardown actually released a storage domain in this process.
+   *
+   * A failure trace alone cannot be read correctly: `domainReleaseError` being
+   * unset means *either* "released cleanly" *or* "teardown never had a domain to
+   * release" — the two are indistinguishable from that field alone, so the
+   * absence of an error cannot support the claim "the release ran". This counter
+   * makes the pair separable: `count > 0` proves the path executed, `count === 0`
+   * proves it never did. Only incremented when a domain (or an in-flight open)
+   * actually existed, so a plugin that never opened stays at 0 rather than
+   * inflating the number.
+   */
+  domainReleasedCount?: number
+  /**
    * When this process began, sampled from `process.uptime()` at module load.
    *
    * The cold-start criterion needs a clock that is independent of the plugin's
