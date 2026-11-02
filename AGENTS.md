@@ -122,6 +122,19 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   it. Normalise whitespace over the whole file before concluding, and state the
   scope you used — **including which revision**, because a needle quoted from an
   uncommitted change reads 0 against `HEAD` and non-zero against the tree.
+  **Name the case sensitivity too, and hold it constant.** The two scopes people
+  reach for differ there by default: `Select-String` matches case-insensitively
+  while a bare `[regex]::Matches` does not. So a needle differing only in case
+  reads 1 line-wise and 0 normalised — a pair that looks exactly like a line break
+  if case is left implicit. Measured 2026-11-02: a check reported as "normalised 0,
+  line-wise 1" was read as an anomaly, and the cause was capitalisation, not
+  wrapping. Two scopes that differ in more than one dimension cannot isolate
+  either cause, so a "double-scope" comparison is only meaningful once every axis
+  except the one under test is pinned.
+  When the check covers several needles, **list them**. "The other three were
+  fine" names nothing, and it reads as a statement about all the rest when it is
+  only a statement about that list — the same finite-sample-as-completeness-claim
+  failure recorded above, arriving in the reporting instead of the measuring.
   **Two different causes produce that `0`, and they need different responses.**
   Either the needle wraps (normalise and it appears), or **the needle is
   misremembered** (normalise and it still reads 0, while the region holds a
