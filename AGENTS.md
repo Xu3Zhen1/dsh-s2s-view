@@ -111,9 +111,25 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   `awk` — matches per line, so a needle that spans a line break always returns
   0. That `0` looks exactly like a confirmed absence and invites you to act on
   it. Normalise whitespace over the whole file before concluding, and state the
-  scope you used. (2026-10-26: two lines, two sessions, twenty minutes apart —
-  both searched for a phrase that wrapped across `L150`/`L151`, both got 0, both
-  nearly reported a real change as missing. The rule already existed in a skill;
+  scope you used — **including which revision**, because a needle quoted from an
+  uncommitted change reads 0 against `HEAD` and non-zero against the tree.
+  **Two different causes produce that `0`, and they need different responses.**
+  Either the needle wraps (normalise and it appears), or **the needle is
+  misremembered** (normalise and it still reads 0, while the region holds a
+  similar-but-different phrase) — so a zero *after* normalising is not yet
+  evidence of absence; read the region first.
+  And a third trap that shows up only once you write the example down: **quoting a
+  needle verbatim into the document makes that needle permanently self-matching.**
+  A rule that cites "the string I searched for" can never be re-checked with that
+  string again — the hit is the citation. Measured 2026-11-02 on this file: the
+  needle quoted in the first draft of this paragraph read 0 against the revision
+  before it and non-zero against the tree holding it, *solely because the
+  paragraph repeats it*. So quote a needle if you must, but record which revision
+  each reading came from, and re-check against a revision that predates the
+  example — otherwise the example destroys its own evidence.
+  (2026-10-26: two lines, two sessions, twenty minutes apart — both searched for
+  a phrase that wrapped across `L150`/`L151`, both got 0, both nearly reported a
+  real change as missing. The rule already existed in a skill;
   what failed is that a casual one-off search does not consult a skill.)
 - **A hit is not an attribution: after a merged search, re-search each needle on
   its own.** `a|b` returning a line tells you *something* matched, not *which
@@ -196,6 +212,30 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   (cross-instance mismatch); proving pairing needs each release to carry the
   identity of the acquisition it answers. And a count proves *occurrence*, not
   *correctness* — `released > 0` never says the release did the right thing.
+
+  **④ A value that cannot be produced inside its observation window is not a
+  sample to wait for — it is an unreadable field.** Say which window, explicitly.
+  Measured 2026-11-02: `domainReleasedCount` advances only when a plugin instance
+  is unloaded, and `ledgerDiagnostics` is a module-level singleton. Inside one
+  host process the only unload is at host exit — where the increment does happen,
+  but the process ends before anything can read it, and the next start begins at
+  zero. So `released > 0` needs a mid-process re-composition, which cannot be
+  triggered from outside. "Wait for a reload" is not a plan; the evidence's
+  acquisition condition is not ours to arrange.
+  **The window boundary must be named**, or "cannot be produced" and "has not
+  arrived yet" stay indistinguishable — and `"from now on"` is not a window: under
+  it, `cannot be produced` degrades into `might still arrive`, which is exactly
+  what this rule exists to prevent. A field like this is still worth keeping (it
+  is live the moment a re-composition happens, and it caught the real defect
+  before), but the claim resting on it must be withdrawn rather than deferred:
+  say "not obtainable here", not "not obtained yet".
+  And "cannot be produced" must be **mechanical**, not merely *not yet observed*.
+  The test: can you name the event that would produce it, and is that event inside
+  our control? Here it can be named (`a mid-process re-composition`) and it is
+  not (`nothing we run triggers one`), so the conclusion is mechanical. If you
+  cannot name the missing event — "it hasn't shown up in the logs yet" — that is a
+  thin sample, not an impossibility, and calling it one is how this rule gets
+  used as an excuse to stop looking.
 - **A familiar error string is a search key, not a fresh mystery.** Before you
   start hypothesising about a symptom, search the **whole workspace** for the
   exact message — `plan/**` (**including the 回执/复核/送审/裁定 files**),
