@@ -121,12 +121,15 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   And a third trap that shows up only once you write the example down: **quoting a
   needle verbatim into the document makes that needle permanently self-matching.**
   A rule that cites "the string I searched for" can never be re-checked with that
-  string again — the hit is the citation. Measured 2026-11-02 on this file: the
-  needle quoted in the first draft of this paragraph read 0 against the revision
-  before it and non-zero against the tree holding it, *solely because the
-  paragraph repeats it*. So quote a needle if you must, but record which revision
-  each reading came from, and re-check against a revision that predates the
-  example — otherwise the example destroys its own evidence.
+  string again — the hit is the citation. The measured case is spelled out here
+  **on purpose**, because deleting the needle would delete the evidence: a needle
+  typed wrongly as `that is how this rule gets …` read 0 against the revision
+  before this paragraph existed, and reads 1 against any tree that quotes it —
+  including this one, where the hit is this sentence. The self-match is expected
+  and is the point; an unexplained one is what misleads. So quote a needle if you
+  must, but say which revision each reading came from, label the self-match, and
+  re-check against a revision that predates the example — otherwise the example
+  destroys its own evidence.
   (2026-10-26: two lines, two sessions, twenty minutes apart — both searched for
   a phrase that wrapped across `L150`/`L151`, both got 0, both nearly reported a
   real change as missing. The rule already existed in a skill;
