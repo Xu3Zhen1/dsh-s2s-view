@@ -171,6 +171,13 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     ctx.storage.mount('domain', facility)
     ctx.provide('storageDomain', facility as never)
 
+    // Baselines for the counters. They are module-level and other cases have
+    // already moved them, so every assertion below is expressed as an increment —
+    // comparing absolutes would measure accumulated history, not this case.
+    const acquiredBefore = ledgerDiagnostics.domainAcquiredCount ?? 0
+    const releasedBefore = ledgerDiagnostics.domainReleasedCount ?? 0
+    const mountedBefore = ledgerDiagnostics.mountedInstances ?? 0
+
     // First instance: mount as a real plugin and dispose THAT fiber. Disposing
     // the whole ctx would also remove the `storageDomain` provider, which is a
     // different question from the defect.
@@ -181,6 +188,23 @@ describe('ledger open waits for the storage chain (measured race)', () => {
     await firstFiber.dispose()
     // The effect hook's teardown is async; cordis does not await it for us.
     await vi.waitFor(() => { expect(first.isOpen).toBe(false) }, { timeout: 2000 })
+
+    // ★ The counters must move with the teardown, not just the domain handle.
+    //
+    // This is the offline half of the completeness evidence, and it is the only
+    // half available: `ledgerDiagnostics` is process-scoped, and the host mounts
+    // plugins once at startup, so on a real machine `released` can only advance if
+    // a re-composition happens mid-process — an event that cannot be forced from
+    // outside. Offline the reload *is* performed, so the increment is checkable
+    // here and nowhere else.
+    expect(ledgerDiagnostics.domainReleasedCount ?? 0).toBe(releasedBefore + 1)
+    // Net zero against the baseline: this case created exactly one instance and
+    // disposed it. (It is not `mountedBefore - 1` — that would double-count the
+    // instance's own creation.)
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(mountedBefore)
+    // A release that was skipped would show up as an unchanged `released` while
+    // `mounted` dropped — i.e. as `acquired - released` exceeding the live count.
+    expect(ledgerDiagnostics.domainAcquiredCount ?? 0).toBe(acquiredBefore + 1)
 
     // A reload: same domain name, same facility. Before the fix this threw
     // `domain 's2s' is already open`; now the teardown gave it back.
