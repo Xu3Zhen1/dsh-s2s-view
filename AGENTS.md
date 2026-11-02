@@ -131,6 +131,14 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   wrapping. Two scopes that differ in more than one dimension cannot isolate
   either cause, so a "double-scope" comparison is only meaningful once every axis
   except the one under test is pinned.
+  **And "it has always agreed" is not evidence that it isolates one cause.** A
+  comparison varying two axes can return the right answer for a long time because
+  some other invariant is covering for it — here, the case-sensitive scope
+  succeeding proves the case matched, so its `B=0` can only be wrapping. That
+  invariant held, so every past reading was sound; it fails silently the first
+  time the invariant does not hold (`A=0`), and the reader gets no signal. So
+  saying "state the axes you vary" is not enough on its own: also say **which
+  invariant you are relying on**, because that is what has been doing the work.
   When the check covers several needles, **list them**. "The other three were
   fine" names nothing, and it reads as a statement about all the rest when it is
   only a statement about that list — the same finite-sample-as-completeness-claim
