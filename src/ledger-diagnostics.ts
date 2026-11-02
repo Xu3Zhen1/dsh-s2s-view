@@ -98,25 +98,43 @@ export interface LedgerDiagnostics {
   /**
    * How many times `open()` successfully acquired a storage domain.
    *
-   * The pair with `domainReleasedCount` is what makes completeness checkable.
-   * A release counter on its own cannot be validated: no reference value exists
-   * for "how many unloads should this process have seen", so `released >= 1`
-   * only establishes "at least once", never "never skipped". With both sides
-   * counted, `acquired - released` equals the number of domains still open, so a
-   * positive remainder with no live instance accounting for it is evidence that a
-   * teardown did not release. Incremented only after `facility.open()` resolves,
-   * so a failed open does not inflate it.
+   * The pair with `domainReleasedCount` narrows the search. `acquired - released`
+   * is the number of domains currently held, and that remainder cannot exceed the
+   * number of live instances — so:
+   *
+   *     acquired - released >  mountedInstances  ⇒ a release was definitely skipped
+   *     acquired - released <= mountedInstances  ⇒ consistent, but NOT a proof
+   *
+   * Only the inequality is sound. An earlier version of this comment claimed
+   * equality (`remainder == mountedInstances`), which is false whenever a live
+   * instance holds no domain — `mountedInstances` counts construction while this
+   * counter increments only after `facility.open()` resolves, and `open()` is
+   * called later by the mount path and may fail. See `mountedInstances`.
+   *
+   * What it still cannot do: prove pairing. 5 acquired, 3 released, 2 live passes
+   * even if one release acted on the wrong domain. And `released > 0` proves
+   * occurrence, never correctness.
+   *
+   * Incremented only after `facility.open()` resolves, so a failed open does not
+   * inflate it.
    */
   domainAcquiredCount?: number
   /**
    * How many `S2sLedger` instances are alive in this process right now.
    *
-   * This is the denominator `domainAcquiredCount - domainReleasedCount` is checked
-   * against, and it must be a *runtime* measurement rather than a config count.
-   * The config file listing one mount does not prevent a reload or re-composition
-   * from producing a second live instance, and that overlap is exactly when a
-   * release is most likely to be skipped — so a config-derived denominator would
-   * fail the check in the one situation it exists for.
+   * ★ This is NOT the denominator for the release-completeness check, and an
+   * earlier comment here claimed it was. The two counters do not share a start:
+   * `mountedInstances` is incremented in the constructor while `domainAcquiredCount`
+   * is incremented only after `facility.open()` resolves, and `open()` is called
+   * separately by the mount path (`index.ts`) and can fail (`facility` undefined
+   * throws). So a live instance may hold no domain at all, and
+   * `acquired - released == mountedInstances` is simply false in that state.
+   *
+   * It is a runtime measurement rather than a config count, which is still worth
+   * having — the config lists one mount while a reload can leave two instances
+   * alive. But it bounds the remainder from above, it does not equal it: see the
+   * one-directional rule in `releaseDomainCount`'s companion comment and in
+   * `AGENTS.md` §5.
    *
    * Incremented on construction, decremented in the teardown effect, floored at 0
    * so a double dispose cannot drive it negative.

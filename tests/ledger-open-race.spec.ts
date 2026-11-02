@@ -404,4 +404,53 @@ describe('ledger open waits for the storage chain (measured race)', () => {
 
     ledgerDiagnostics.mountedInstances = base
   })
+
+  it('★★★ equality is the WRONG criterion: a live instance holding no domain breaks it', async () => {
+    // The completeness rule was briefly written as
+    //     acquired - released == mountedInstances
+    // That is false in a perfectly healthy state, and this case constructs exactly
+    // that state so the mistake cannot come back.
+    //
+    // Why it is false: the two quantities do not share a start. `mountedInstances`
+    // increments in the constructor; `domainAcquiredCount` increments only after
+    // `facility.open()` resolves. `open()` is invoked separately by the mount path
+    // (index.ts) and throws when `facility` is undefined — so a live instance can
+    // hold no domain, and the remainder is then smaller than the instance count.
+    //
+    // Only the inequality survives: the remainder can never EXCEED the live
+    // instance count, because every held domain belongs to some live instance.
+    const acquired0 = ledgerDiagnostics.domainAcquiredCount ?? 0
+    const released0 = ledgerDiagnostics.domainReleasedCount ?? 0
+    const before = ledgerDiagnostics.mountedInstances ?? 0
+
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    stubHost(ctx) // no storageDomain ⇒ open() will throw, instance stays alive
+    const neverOpens = new S2sLedger(ctx)
+
+    // The instance is alive...
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(before + 1)
+    // ...but holds nothing: it never opened a domain.
+    expect(ledgerDiagnostics.domainAcquiredCount ?? 0).toBe(acquired0)
+
+    const remainder = (ledgerDiagnostics.domainAcquiredCount ?? 0) - (ledgerDiagnostics.domainReleasedCount ?? 0)
+    const live = ledgerDiagnostics.mountedInstances ?? 0
+    // Express the contradiction as an INCREMENT, not an absolute: earlier cases in
+    // this file leave acquired/released at non-zero values, so comparing the raw
+    // remainder against `live` would be testing the accumulated history rather than
+    // the state this case constructs.
+    const grewInstances = live - before // 1
+    const grewAcquired = (ledgerDiagnostics.domainAcquiredCount ?? 0) - acquired0 // 0
+
+    // The INEQUALITY holds (this is the sound rule)...
+    expect(remainder).toBeLessThanOrEqual(live)
+    // ...while EQUALITY would need one acquisition per new instance, and here these
+    // two increments differ — the defect the equality rule hides.
+    expect(grewAcquired).not.toBe(grewInstances)
+    void neverOpens
+    void released0
+
+    await ctx.fiber.dispose()
+    expect(ledgerDiagnostics.mountedInstances ?? 0).toBe(before)
+  })
 })
