@@ -299,7 +299,7 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   *passing*, which is the false negative this rule exists to prevent. Executing
   alone is not enough either — you may have picked an input that fails by accident.
   So: **"should fail" is not an existence claim, it is an execution result.**
-  Two corollaries. *A blank spreadsheet of passing rows is not a discriminating
+  Two corollaries. *A table whose every row passes is not a discriminating
   table*: a table needs at least two columns whose conclusions are expected to
   differ, declared before the run — and if it has only one column and that column
   is all green, the result is **undecidable**, not passing. In particular you
