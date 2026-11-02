@@ -97,7 +97,16 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   thing. Compare against a freshly created object of the same kind.
 - **Report counts with their scope, timestamp, and definition.** Live data
   drifts; the same probe reads 209 then 215. Prefer claims that hold regardless
-  of when you measure.
+  of when you measure. **The same applies to format claims: name where the
+  standard comes from.** A line-width or style-conformance report means nothing
+  without a stated rule; if the rule lives in a config file or a linter, cite it —
+  and if there is none, then "I wrapped at 80 columns" is a preference, not a
+  finding. Measured 2026-11-02: "no over-long lines" was reported for this file
+  against an invented 80-column threshold. The repo has no `.editorconfig`, no
+  prettier or markdownlint config and no lint script, and the file itself runs to
+  135 columns in places. The threshold needed a source before the claim carried
+  any weight — and the "fix" that followed was decoration against a rule that did
+  not exist.
 - **When the plausible counting bases disagree, do not pick one — say so.** A
   count is only meaningful against a definition. If "how many" comes out as 6 by
   leftover artefacts, 5 by affected working trees and 2 by at-risk commits, the
@@ -215,6 +224,14 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   (cross-instance mismatch); proving pairing needs each release to carry the
   identity of the acquisition it answers. And a count proves *occurrence*, not
   *correctness* — `released > 0` never says the release did the right thing.
+
+  The same gap has a periodic form: **"it fired N times in a row" is not "it fires
+  reliably".** Every additional interval you assert costs one more sample, so any
+  claim of periodicity must state how many intervals were observed. Measured
+  2026-11-02: the hourly sweep was finally seen to fire (first tick at
+  `procStart + 3601.4s`, `reconciled=8`) — enough to say "it fired at least once",
+  not "it fires hourly". The two families are the same failure — **a finite sample
+  carrying a completeness claim** — and the fix is the same: publish the count.
 
   **④ A value that cannot be produced inside its observation window is not a
   sample to wait for — it is an unreadable field.** Say which window, explicitly.
