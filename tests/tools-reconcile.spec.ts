@@ -430,4 +430,31 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     expect(out.text).not.toContain('Next pass due at')
     await ctx.fiber.dispose()
   })
+
+  it('★★ a published due time must not move when you look at it again', async () => {
+    // The field answers "when is the next pass?", so reading it must not change
+    // the answer. It was derived from `Date.now()` until a pass had run, so every
+    // sample pushed the due time forward — and it disagreed with the timer:
+    // measured on the real machine 2026-11-02, the armed-at + 1h tick fired at
+    // 07:06:57 while a reading taken at 06:20:49 predicted 07:20:49, off by
+    // 13.9 minutes on a 60-minute interval. A reader who trusted that value would
+    // sample at the wrong moment and could conclude the sweep never fired.
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-11-02T06:00:00.000Z'))
+      const ctx = new Context()
+      const ledger = new S2sLedger(ctx, { timerIntervalMs: 3600000 })
+
+      // Derived from the arming instant, not from the question.
+      const first = ledger.sweepStatus.nextSweepAt
+      expect(first).toBe(Date.parse('2026-11-02T07:00:00.000Z'))
+
+      // Ask again 20 minutes later. The timer did not re-arm; the answer stands.
+      vi.setSystemTime(new Date('2026-11-02T06:20:00.000Z'))
+      expect(ledger.sweepStatus.nextSweepAt).toBe(first)
+      await ctx.fiber.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

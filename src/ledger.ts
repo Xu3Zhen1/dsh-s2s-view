@@ -245,6 +245,7 @@ export class S2sLedger extends Service {
     super(ctx, 's2sLedger')
     this.timerIntervalMs = config.timerIntervalMs ?? LEDGER_LIMITS.sweepIntervalMs
     if (this.timerIntervalMs > 0) {
+      this.armedAt = Date.now()
       this.timer = setInterval(() => {
         void this.tick().catch((error: unknown) => {
           this.ctx.logger.warn('s2s ledger: sweep failed: ' + String(error))
@@ -342,6 +343,20 @@ export class S2sLedger extends Service {
   private readonly timerIntervalMs: number
 
   /**
+   * When the sweep timer was armed. The timer's first tick is one full interval
+   * after THIS instant, so it is the only honest base for a "next pass" estimate
+   * before any pass has happened.
+   *
+   * ★ It used to be `Date.now()` — the moment the reader asked. That made the
+   * reported due time drift forward every time the status was sampled, and it
+   * disagreed with the timer: measured 2026-11-02, the armed-at + 1h tick fired
+   * at 07:06:57 while the reading taken at 06:20:49 predicted 07:20:49, off by
+   * 13.9 minutes for a 60-minute interval. A field that answers "when is it due?"
+   * must not depend on when you asked.
+   */
+  private armedAt?: number
+
+  /**
    * The automatic sweep's interval and last outcome, for self-report (T9/T24).
    *
    * Exposed as a read-only view so `s2s_status` can state whether a sweep is
@@ -367,8 +382,9 @@ export class S2sLedger extends Service {
   } {
     const last = this.lastSweep
     // Due time is derived from the last pass when there was one, otherwise from
-    // now: the timer's first tick is one full interval after construction.
-    const base = last === undefined ? Date.now() : last.at
+    // the moment the timer was armed — never from `Date.now()`. Reading the
+    // status must not move the thing it reports.
+    const base = last === undefined ? (this.armedAt ?? Date.now()) : last.at
     return {
       armed: this.timer !== undefined,
       intervalMs: this.timerIntervalMs,
