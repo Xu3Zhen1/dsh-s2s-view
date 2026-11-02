@@ -277,6 +277,46 @@ pnpm run build   # tsc -p tsconfig.json && tsdown && node scripts/build-history-
   cannot name the missing event — "it hasn't shown up in the logs yet" — that is a
   thin sample, not an impossibility, and calling it one is how this rule gets
   used as an excuse to stop looking.
+- **"Absence" carries two opposite facts, and every rule in this section has
+  now failed by forgetting it once.** A check that reports "all green / no errors /
+  zero hits / all passed" has said nothing until you say what would have made it
+  red. The same `none` means either *the bad thing did not happen* or *the check
+  never ran*, and those need opposite responses:
+  ```
+  tests all green      ⇒ passing, or nothing was actually exercised
+  no errors in the log ⇒ clean, or the logger was never wired
+  scan returns 0       ⇒ absent, or the scan surface missed it
+  every row passes     ⇒ the table discriminates, or the subject is simply right
+  ```
+  This is the same shape as the field-level case above (`domainReleaseError` unset
+  ⇒ released cleanly OR teardown never ran), one level up: it is a property of
+  *judgements*, not of fields.
+  **The proof is two steps and both are required:**
+  **① construct** an input, *inside the check's own subject area*, that must fail;
+  **② execute** it and confirm the check actually reports failure.
+  Constructing alone is not enough — a check that ignores its input and returns
+  success forever satisfies "such an input exists" and would still be judged
+  *passing*, which is the false negative this rule exists to prevent. Executing
+  alone is not enough either — you may have picked an input that fails by accident.
+  So: **"should fail" is not an existence claim, it is an execution result.**
+  Two corollaries. *A blank spreadsheet of passing rows is not a discriminating
+  table*: a table needs at least two columns whose conclusions are expected to
+  differ, declared before the run — and if it has only one column and that column
+  is all green, the result is **undecidable**, not passing. In particular you
+  cannot fix this by adding an unrelated "surely fails" column; measured 2026-11-02,
+  no such column exists, because every transform carries an axis of its own.
+  *And the rule must pass its own test*: a rule that forbids this failure mode can
+  commit it in its own judging procedure. It did here — twice. The first version
+  of this rule said "if all rows pass, the table has no discriminating power",
+  which reads *the subject is correct* as *the table is broken*. Its own test
+  procedure then said "you can decide it if a must-fail input can be named", which
+  reads *nothing failed* as *the input was covered*. Both are the same error,
+  arriving through the rule instead of through the measurement, and neither would
+  be found by re-reading the wording: the fix is behavioural. **Every rule of this
+  kind ships with two instances declared up front — one that must pass and one
+  that must not — and only when the second is actually judged failing does the
+  first become readable.** Do not look for a list of dangerous words; there is no
+  complete list, exactly as with the numeric-token case below.
 - **A familiar error string is a search key, not a fresh mystery.** Before you
   start hypothesising about a symptom, search the **whole workspace** for the
   exact message — `plan/**` (**including the 回执/复核/送审/裁定 files**),
