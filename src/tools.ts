@@ -990,6 +990,16 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               ? 'attached'
               : 'NOT-ATTACHED' + (d.toolCallSamplerError === undefined ? '' : '(' + d.toolCallSamplerError + ')')))
           lines.push('handshake-coldstart: ' + order)
+          // T13 / I2. Two-sided on purpose: `reset 0` cannot distinguish "nothing
+          // was interrupted" from "the self-check never ran", so the failure field
+          // and the not-yet-run case are printed separately instead of collapsing
+          // into the same zero.
+          lines.push('startup-self-check: ' + (d.interruptedResetError !== undefined
+            ? 'FAILED (' + d.interruptedResetError + ') — rows stuck in `delivering` will NOT be retried'
+            : d.interruptedReset === undefined
+              ? 'NOT RUN YET (the ledger has not opened)'
+              : 'reset ' + d.interruptedReset + ' row(s) `delivering` -> `queued` '
+                + '(requeued=0 by design: the retry half of the state machine is not wired yet)'))
 
           // The series. Each row answers "can we see the ledger here, and if not,
           // does the implementation exist anyway, and what state is its fiber in".

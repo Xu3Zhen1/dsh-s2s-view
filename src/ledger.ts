@@ -791,6 +791,96 @@ export class S2sLedger extends Service {
   }
 
   /**
+   * CAS `queued` → `delivering`, the persistent intermediate state of §12.3.
+   *
+   * Why this is written to the store and not kept in memory: the point of the state
+   * is to survive a crash. If the process dies between the CAS and the target log
+   * gaining the message, the row is left on disk as `delivering` and
+   * {@link recoverInterrupted} puts it back in `queued`. An in-memory flag would die
+   * with the process and leave nothing to recover — which is the only reason T13
+   * has any work to do.
+   *
+   * Returns whether this call won the transition. A caller that loses must not
+   * deliver: that is §12.3's duplicate-delivery guard, and it is why this is a
+   * compare-and-set rather than an assignment.
+   *
+   * ★ Without this method the enum's `delivering` member had no inbound write
+   * anywhere in `src/`, so T13's subject — a row stuck mid-delivery — could not
+   * exist. A recovery pass for an unreachable state reports a green result while
+   * exercising nothing (§5, and the plan's own §12.3 note that a state with no
+   * inbound edge is a dead state).
+   */
+  async markDelivering(msgId: string): Promise<boolean> {
+    const domain = this.opened()
+    const table = domain.table(MESSAGES_TABLE)
+    let won = false
+    await this.serialize(async () => {
+      const row = table.get(msgId)
+      // A missing row means the caller delivered without recording. Not ours to
+      // invent — same reasoning as `markInboxed`: a fabricated row would hide the
+      // caller's bug instead of surfacing it.
+      if (row === undefined) return
+      // Only a `queued` row may start an attempt. A row already handed over, or a
+      // terminal one, must not be dragged backwards by a late caller.
+      if (row.status !== 'queued') return
+      won = await this.putIfUnchanged(row.revision ?? 0, {
+        ...row,
+        status: 'delivering',
+        attempts: (row.attempts ?? 0) + 1,
+        updatedAt: Date.now(),
+      })
+    })
+    return won
+  }
+
+  /**
+   * Startup self-check: the "repair interrupted state" half of I2 (T13).
+   *
+   * A row can only be sitting in `delivering` because the process died mid-attempt:
+   * every live path either completes it to `inboxed` or returns it to `queued`. This
+   * pass finds those rows and returns them to `queued` with an immediate
+   * `nextAttemptAt`, so the work is retried rather than lost.
+   *
+   * Terminal states are never revived. The selection is `status === 'delivering'`,
+   * and `'delivering'` is not a member of {@link TERMINAL_STATUSES}, so a terminal
+   * row cannot be selected at all. That disjointness is asserted in
+   * `tests/ledger-recovery.spec.ts` rather than re-checked here, because a guard on
+   * an already-excluded status can never fire and would read as protection it is
+   * not providing.
+   *
+   * ★ `requeued` is 0 **by design, not by omission**. The plan gives this pass a
+   * second job — "re-judge the rows that never landed" — but that judgement reads
+   * `attempts` and `nextAttemptAt`, and the delivery path does not advance either
+   * one yet (nothing increments `attempts`, nothing compares `nextAttemptAt`
+   * against `now`). Re-judging rows whose fields never change would report a verdict
+   * on constants: a green result that exercises nothing. So the second job is left
+   * unwired and the gap is written down here, where it cannot be forgotten, instead
+   * of being simulated. When the retry half of §12.3 is wired, `requeued` acquires
+   * its input for free.
+   */
+  async recoverInterrupted(opts: { now?: number } = {}): Promise<{ reset: number; requeued: number }> {
+    const domain = this.opened()
+    const now = opts.now ?? Date.now()
+    const table = domain.table(MESSAGES_TABLE)
+    let reset = 0
+    // Snapshot first: the loop writes back rows in the table it is iterating.
+    for (const [, row] of [...table.entries()]) {
+      if (row.status !== 'delivering') continue
+      const recovered = await this.serialize(async () => this.putIfUnchanged(row.revision ?? 0, {
+        ...row,
+        status: 'queued',
+        // Immediate retry: the attempt that was in flight never completed, so
+        // there is no backoff to honour. Keeping the old stamp would park the row
+        // until a backoff elapsed for an attempt that never ran.
+        nextAttemptAt: now,
+        updatedAt: now,
+      }))
+      if (recovered) reset += 1
+    }
+    return { reset, requeued: 0 }
+  }
+
+  /**
    * Cancel a queued row with the reason visible on the row (T30).
    *
    * The post-budget target-policy re-check can refuse a delivery whose row was

@@ -72,6 +72,26 @@ export interface LedgerDiagnostics {
   /** Why `open()` rejected, or why it was never attempted, verbatim. */
   openError?: string
   /**
+   * How many rows the startup self-check returned from `delivering` to `queued`
+   * (T13 / I2).
+   *
+   * Non-zero means the previous process ended mid-attempt and that work was
+   * rescued. **A zero is not a healthy reading on its own**: it means either
+   * "nothing was interrupted" or "the self-check never ran". That ambiguity is
+   * why {@link interruptedResetError} and the probe row sit beside it — the same
+   * two-sided shape as `domainReleaseError` / `domainReleasedCount`.
+   */
+  interruptedReset?: number
+  /**
+   * Why the startup self-check could not run, verbatim.
+   *
+   * Same reasoning as `domainReleaseError`: plugin logger output is not persisted,
+   * so a self-check that throws and is only `warn`ed is invisible after the fact.
+   * A failed self-check is not cosmetic — it leaves rows stuck in `delivering`
+   * that no live path will ever retry.
+   */
+  interruptedResetError?: string
+  /**
    * Why releasing the storage domain on teardown failed, verbatim.
    *
    * Teardown must not throw, but it must not be silent either: a failed release

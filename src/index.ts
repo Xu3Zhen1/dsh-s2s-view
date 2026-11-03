@@ -158,10 +158,32 @@ export function apply(ctx: Context, config: Config = {}): void {
       ledgerDiagnostics.openCalled = true
       ledgerDiagnostics.openCalledAt = Date.now()
       recordProbe(ctx, domainCtx, 'open-called')
-      return result.value.open().then(function() {
+      const opened = result.value
+      return opened.open().then(function() {
         ledgerDiagnostics.openSucceeded = true
         ledgerDiagnostics.openSucceededAt = Date.now()
         recordProbe(ctx, domainCtx, 'open-succeeded')
+        // T13 / I2: a row sitting in `delivering` means the previous process died
+        // mid-attempt. Repair it here — right after the store opens, before any tool
+        // can enqueue more work — and never silently: a self-check that throws must
+        // leave a persisted trace (G9), because the alternative is rows that still
+        // look deliverable to the ledger and are never retried by anything.
+        return opened.recoverInterrupted().then(function(recovered) {
+          ledgerDiagnostics.interruptedReset = recovered.reset
+          if (recovered.reset > 0) {
+            domainCtx.logger.warn(
+              's2s: startup self-check returned ' + recovered.reset
+              + ' message(s) from `delivering` to `queued` (the previous process ended mid-attempt); '
+              + 'they are retryable again with an immediate next attempt.',
+            )
+          }
+        }).catch(function(error: unknown) {
+          ledgerDiagnostics.interruptedResetError = String(error)
+          domainCtx.logger.warn(
+            `s2s: the startup self-check could not run (${String(error)}); `
+            + 'messages stuck in `delivering` will not be retried until a start succeeds.',
+          )
+        })
       }).catch(function(error: unknown) {
         ledgerDiagnostics.openError = String(error)
         recordProbe(ctx, domainCtx, 'open-error')
