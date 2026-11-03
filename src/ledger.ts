@@ -955,8 +955,21 @@ export class S2sLedger extends Service {
    *
    * The pre-read decides the reason, but the DECISION is taken from the CAS: if the
    * status changes between the read and the CAS, the CAS loses and the answer is
-   * still `refuse` (`cas-lost`). So a stale read can mislabel a refusal but can never
-   * turn one into a delivery — the only direction that matters for safety.
+   * still `refuse` (`cas-lost`). So a stale read can mislabel a refusal, and cannot
+   * turn a deliberate refusal into a delivery.
+   *
+   * The one exception is the `untracked` branch, and it is deliberate: a row created
+   * between this read and the hand-over is NOT re-checked, because T6b puts delivery
+   * above bookkeeping. So there — and only there — a stale read can let a message
+   * through, including one that was recorded and cancelled inside that window.
+   * Closing it would need a second read immediately before the hand-over, which still
+   * leaves a window, costs a round trip on every send, and would re-open the T6b
+   * violation the first read exists to avoid. The exposure is bounded to msgIds this
+   * caller generated, which no other path records-and-cancels behind our back.
+   *
+   * Recorded this way on purpose: a comment that says "never" tells the next reader
+   * not to check the branch at all. An absolute qualifier has to be enumerable
+   * branch-by-branch, or it is an unverified universal claim wearing a fact's clothes.
    */
   async claimDelivery(msgId: string): Promise<DeliveryClaim> {
     const domain = this.opened()

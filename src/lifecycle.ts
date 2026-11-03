@@ -16,7 +16,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import { recordDrainRefusalOutcome } from './ledger-diagnostics.ts'
-import { noteLedger, type S2sLedger } from './ledger.ts'
+import { noteLedger, readLedger, type S2sLedger } from './ledger.ts'
 import { S2S_MESSAGE_SOURCE } from './source.ts'
 import { S2sMailbox, type MailboxEntry } from './mailbox.ts'
 
@@ -631,10 +631,41 @@ ${entry.text}`
         content: [{ type: 'text', text }],
         source: S2S_MESSAGE_SOURCE,
       })
-      if (agent.status === 'idle') {
-        agent.followup(userMessage)
-      } else {
-        agent.inject(userMessage)
+      // §12.3 gate on the dormant path, same rules as the live one: ask the ledger
+      // whether this attempt may hand the message over. `undefined` means the ledger
+      // could not answer — absent, unopened, or the call failed — and `readLedger`
+      // already left the trace; delivery then proceeds, because bookkeeping must
+      // never outrank delivery (T6b), which is exactly why this is not a hard gate.
+      const claim = await readLedger(ledger, 'claimDelivery', () => ledger!.claimDelivery(entry.msgId))
+      if (claim !== undefined && claim.decision === 'refuse') {
+        // Deliberately NOT re-enqueued. A message refused here is one the ledger says
+        // must never go out (cancelled / dead-lettered / already delivered / owned by
+        // another attempt); re-queueing it would loop forever on a cancelled row, and
+        // delivering it is the behavioural error this gate exists to prevent. So it is
+        // dropped — visibly, not silently (G9): the drain reports it and `s2s_status`
+        // reads the outcome back.
+        const dropped = 'dropped: ledger refused delivery (' + claim.reason + ')'
+        refused.push({ msgId: entry.msgId, code: 'S2S_LEDGER', message: 'the ledger refused delivery (' + claim.reason + ')', cancelOutcome: dropped })
+        recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: 'S2S_LEDGER', cancelOutcome: dropped, at: Date.now() })
+        this.ctx.logger.warn(`s2s lifecycle: message ${entry.msgId} to ${sessionId} ${dropped}`)
+        continue
+      }
+      try {
+        if (agent.status === 'idle') {
+          agent.followup(userMessage)
+        } else {
+          agent.inject(userMessage)
+        }
+      } catch (error) {
+        // The claim succeeded, so the row is now sitting in `delivering`. If the
+        // hand-over throws and the row is left there, it waits for the next process
+        // start to be repaired — "cannot be delivered now" silently becomes "retried
+        // only after a restart". Roll it back, then let the original error propagate.
+        await readLedger(ledger, 'markAttemptFailed', () => ledger!.markAttemptFailed(
+          entry.msgId,
+          'dormant hand-over threw: ' + (error instanceof Error ? error.message : String(error)),
+        ))
+        throw error
       }
       // Guarded, like the live path: bookkeeping never outranks delivery (an
       // unopened ledger must not abort the drain), and the loss stays loud (G9).
