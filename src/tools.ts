@@ -13,7 +13,7 @@ import type { S2sDiscoveryService, S2sResolveResult, S2sSessionInfo } from './di
 import { S2sLifecycleService, type S2sRefusedOutcome } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
-import { noteLedger, type S2sLedger } from './ledger.ts'
+import { noteLedger, readLedger, type S2sLedger } from './ledger.ts'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import { readHistory } from './history.ts'
@@ -445,6 +445,25 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               throw new S2sError(rerefusal.message + ' [cancel outcome: ' + cancelOutcome + ']', rerefusal.code)
             }
             if (resolved.state !== 'dormant') {
+              // §12.3 gate: the ledger decides whether this attempt may hand the message over,
+// and says WHY. A boolean here was a real defect — "the CAS returned false" was
+// read as "carry on and deliver", which would hand over a message the ledger had
+// already recorded as `cancelled`. Sending something explicitly cancelled is a
+// behavioural error, not a duplicate, so the reason has to be inspectable.
+// `undefined` means no ledger mounted (or the check failed): deliver anyway,
+// because bookkeeping must never outrank delivery (T6b) — `readLedger` has already
+// left the warning trace (G9).
+              const claim = await readLedger(ledger, 'claimDelivery', function() { return ledger!.claimDelivery(msgId) })
+              if (claim !== undefined && claim.decision === 'refuse') {
+                const why = claim.reason === 'terminal'
+                  ? 'The ledger had already judged this message (cancelled / dead-lettered), so sending it would carry out a decision that was deliberately not taken.'
+                  : claim.reason === 'delivered'
+                    ? 'It already reached the target, so sending again would create a second message.'
+                    : claim.reason === 'in-flight'
+                      ? 'Another attempt is in flight for it; sending would duplicate it.'
+                      : 'The claim was lost to a concurrent writer, so this attempt does not own the row.'
+                return { text: 'NOT delivered: the ledger refused to hand over "' + labelOf(resolved) + '" (' + claim.reason + '). ' + why + callerNote + (warn === undefined ? '' : '\n[s2s-budget] ' + warn) }
+              }
               const state = broker.deliver(resolved.sessionId, { from: from, text: args.text, msgId: msgId, ...(args.reply_to === undefined ? {} : { replyTo: args.reply_to }) })
               // `absent` means no live agent was there after all — the message was
               // handed to nobody, so the ledger must keep it `queued`. Marking it
@@ -452,6 +471,15 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               // which is exactly the overclaiming invariant I1 forbids.
               if (state !== 'absent') {
                 await noteLedger(ledger, 'markInboxed', function() { return ledger!.markInboxed(msgId, resolved.sessionId) })
+              } else {
+                // The attempt has to be undone, not just left unconfirmed: without
+                // this the row stays `delivering` until the next process start, so an
+                // undeliverable message would be retried only after a restart.
+                // `readLedger` rather than `noteLedger` because the rollback reports a
+                // boolean (did it apply?) and `noteLedger`'s signature would discard it.
+                await readLedger(ledger, 'markAttemptFailed', function() {
+                  return ledger!.markAttemptFailed(msgId, 'broker reported absent: the resolved session had no live agent, so the message reached nobody')
+                })
               }
               // T9: the wording must not outrun the fact. `broker.deliver` returning
               // a state means the message was handed to the live agent — it is NOT

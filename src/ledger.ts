@@ -83,6 +83,58 @@ export async function noteLedger(
   }
 }
 
+/**
+ * What a delivery gate decided, **with the reason**. A boolean is not enough here.
+ *
+ * The boolean version is what made a real mistake possible: "the CAS returned false"
+ * was read as "carry on and deliver", which would hand over a message that the
+ * ledger had already recorded as `cancelled` — sending something explicitly
+ * cancelled is a behavioural error, not a duplicate. The other false causes are
+ * milder but still wrong to deliver: `inboxed`/`landed` means it already arrived,
+ * and `delivering` means another attempt is in flight.
+ *
+ * So the gate reports why, and each reason has its own rule (see `claimDelivery`).
+ * `untracked` is the one case where delivery proceeds despite a refusal to record:
+ * bookkeeping must never outrank delivery (T6b).
+ */
+export type DeliveryClaim =
+  | { readonly decision: 'deliver'; readonly reason: 'claimed' | 'untracked' }
+  | { readonly decision: 'refuse'; readonly reason: 'in-flight' | 'delivered' | 'terminal' | 'not-queued' | 'cas-lost' }
+
+/**
+ * Same guard as {@link noteLedger}, but for a call whose RETURN VALUE the caller
+ * needs (the delivery gate's decision).
+ *
+ * `undefined` means "no ledger mounted, or the call failed" — deliberately not
+ * distinguished, for the same reason as `noteLedger`: the caller must decide what
+ * to do *without* that bookkeeping, and must never read missing bookkeeping as a
+ * prohibition. A gate that refused because the ledger was absent would let
+ * bookkeeping outrank delivery, which T6b forbids.
+ */
+export async function readLedger<T>(
+  ledger: S2sLedger | undefined,
+  operation: string,
+  run: () => Promise<T>,
+): Promise<T | undefined> {
+  if (ledger === undefined) return undefined
+  try {
+    return await run()
+  } catch (error: unknown) {
+    // The warning must not be able to break the caller. Measured: the first version
+    // called `ledger.warn()` unconditionally, and the test doubles here carry only
+    // the methods their scenario exercises — so a double without `claimDelivery`
+    // threw, and then the diagnostic itself threw `ledger.warn is not a function`,
+    // turning a degraded gate into a failed send. A diagnostic that can throw is not
+    // a diagnostic (G9), and "the ledger cannot answer the gate" must degrade to
+    // "no gate", i.e. deliver — bookkeeping never outranks delivery (T6b).
+    const warn = (ledger as { warn?: (operation: string, error: unknown) => void }).warn
+    if (typeof warn === 'function') {
+      try { warn.call(ledger, operation, error) } catch { /* never mask the original */ }
+    }
+    return undefined
+  }
+}
+
 /** What a caller supplies when recording an outgoing message. */export interface S2sLedgerRecordInput {
   /** Idempotency key; also the primary key. */
   msgId: string
@@ -791,6 +843,51 @@ export class S2sLedger extends Service {
   }
 
   /**
+   * Roll a FAILED delivery attempt back: `delivering` → `queued`.
+   *
+   * Why this exists: marking the attempt (`markDelivering`) without an undo turns
+   * every undeliverable message into one that is retried only after a process
+   * restart — it sits in `delivering` until `recoverInterrupted()` runs. `absent`
+   * is the ordinary case of that (the resolved session had no live agent), not an
+   * exotic one, so the rollback is load-bearing.
+   *
+   * The load-bearing-ness is measured, not asserted: `tools-ledger.spec.ts`'s
+   * "does NOT mark inboxed when the broker reports absent" asserts the row is still
+   * `queued` afterwards. That assertion was written before `delivering` existed and
+   * stays green only when this rollback runs — so the existing I1 contract guards
+   * the new transition instead of a test this batch wrote for itself.
+   *
+   * `attempts` is deliberately NOT decremented: the attempt really happened, and the
+   * retry half of the state machine (`maxRetries` exhaustion) will need an honest
+   * count. For the same reason `nextAttemptAt` becomes `now` rather than a backoff
+   * instant — nothing reads a future stamp yet, and writing one would be a value
+   * with no consumer (the retry half is a separate task).
+   */
+  async markAttemptFailed(msgId: string, reason: string): Promise<boolean> {
+    const domain = this.opened()
+    const table = domain.table(MESSAGES_TABLE)
+    const now = Date.now()
+    let rolledBack = false
+    await this.serialize(async () => {
+      const row = table.get(msgId)
+      if (row === undefined) return
+      // Only an in-flight attempt can fail. A terminal row must never be revived
+      // (`dead_letter` is a judgement, not a retry state), and a row that already
+      // reached `inboxed`/`landed` must keep that — a late failure report from a
+      // racing attempt cannot un-deliver a message that did land.
+      if (row.status !== 'delivering') return
+      rolledBack = await this.putIfUnchanged(row.revision ?? 0, {
+        ...row,
+        status: 'queued',
+        lastError: reason,
+        nextAttemptAt: now,
+        updatedAt: now,
+      })
+    })
+    return rolledBack
+  }
+
+  /**
    * CAS `queued` → `delivering`, the persistent intermediate state of §12.3.
    *
    * Why this is written to the store and not kept in memory: the point of the state
@@ -831,6 +928,47 @@ export class S2sLedger extends Service {
       })
     })
     return won
+  }
+
+  /**
+   * The **delivery gate**: decide whether this attempt may hand the message over,
+   * and claim it if so. `markDelivering` alone was not enough — its boolean cannot
+   * say *why* a refusal happened, and "refused ⇒ carry on" is the wrong default for
+   * three of the four refusal causes.
+   *
+   * Reason → rule (each is separately tested, see `ledger-recovery.spec.ts`):
+   * ```
+   * untracked   → DELIVER   the row was never recorded; bookkeeping must not
+   *                          outrank delivery (T6b), and the caller records the
+   *                          missing row as a diagnostic instead of inventing one
+   * claimed     → DELIVER   the CAS won; the row is now `delivering`
+   * in-flight   → REFUSE    another attempt holds the row; delivering here would
+   *                          be the duplicate §12.3 exists to prevent
+   * delivered   → REFUSE    inboxed/landed/consumed: it already arrived, and a
+   *                          second hand-over would create a second message
+   * terminal    → REFUSE    dead_letter/cancelled/legacy_unverifiable: handing over
+   *                          a message the ledger already judged is a behavioural
+   *                          error, not a duplicate — the worst of the false cases
+   * not-queued  → REFUSE    an unexpected status; refuse rather than guess
+   * cas-lost    → REFUSE    the CAS lost to a concurrent writer; we do not own the row
+   * ```
+   *
+   * The pre-read decides the reason, but the DECISION is taken from the CAS: if the
+   * status changes between the read and the CAS, the CAS loses and the answer is
+   * still `refuse` (`cas-lost`). So a stale read can mislabel a refusal but can never
+   * turn one into a delivery — the only direction that matters for safety.
+   */
+  async claimDelivery(msgId: string): Promise<DeliveryClaim> {
+    const domain = this.opened()
+    const table = domain.table(MESSAGES_TABLE)
+    const row = table.get(msgId)
+    if (row === undefined) return { decision: 'deliver', reason: 'untracked' }
+    if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) return { decision: 'refuse', reason: 'terminal' }
+    if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return { decision: 'refuse', reason: 'delivered' }
+    if (row.status === 'delivering') return { decision: 'refuse', reason: 'in-flight' }
+    if (row.status !== 'queued') return { decision: 'refuse', reason: 'not-queued' }
+    const won = await this.markDelivering(msgId)
+    return won ? { decision: 'deliver', reason: 'claimed' } : { decision: 'refuse', reason: 'cas-lost' }
   }
 
   /**

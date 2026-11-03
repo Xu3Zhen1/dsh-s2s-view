@@ -192,4 +192,158 @@ describe('T13 startup self-check', () => {
     // suite; when the retry half lands this assertion is what has to change.
     expect(result.requeued).toBe(0)
   })
+
+  it('★ a failed attempt rolls back to queued and records why, keeping the attempt count', async () => {
+    // `absent` is the ordinary failure (the resolved session had no live agent), so
+    // this is not an exotic path: without the rollback the row sits in `delivering`
+    // until the next start, i.e. an undeliverable message becomes one that is retried
+    // only after a restart.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'gone' })
+    expect(await ledger.markDelivering('m-1')).toBe(true)
+
+    expect(await ledger.markAttemptFailed('m-1', 'broker reported absent')).toBe(true)
+
+    const row = await ledger.get('m-1')
+    expect(row?.status).toBe('queued')
+    expect(row?.lastError).toBe('broker reported absent')
+    // The attempt really happened: decrementing would make `maxRetries` exhaustion
+    // (once that half is wired) under-count a message that keeps failing.
+    expect(row?.attempts).toBe(1)
+    // No backoff yet — the retry half is a separate task, and a future `nextAttemptAt`
+    // would be a value nothing reads.
+    expect(row?.nextAttemptAt).toBeTypeOf('number')
+  })
+
+  it('★ markAttemptFailed refuses anything that is not an in-flight attempt', async () => {
+    // Three distinct must-not-roll-back cases, each for a different reason:
+    //   queued     — nothing was in flight, so "failed" would be a fiction
+    //   inboxed    — the message WAS handed over; a late failure report from a racing
+    //                attempt must not un-deliver it
+    //   cancelled  — terminal; a judgement is never revived
+    // Constructed AND executed, not merely named: each row is driven into the state
+    // and then the call is required to report `false` and leave the status untouched.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-q', from: 'alice', to: 'sess-1', text: 'q' })
+    await ledger.record({ msgId: 'm-i', from: 'alice', to: 'sess-1', text: 'i' })
+    await ledger.markInboxed('m-i', 'sess-1')
+    await ledger.record({ msgId: 'm-c', from: 'alice', to: 'sess-1', text: 'c' })
+    await ledger.cancel('m-c', 'cancelled by the test')
+
+    expect(await ledger.markAttemptFailed('m-q', 'should not apply')).toBe(false)
+    expect(await ledger.markAttemptFailed('m-i', 'should not apply')).toBe(false)
+    expect(await ledger.markAttemptFailed('m-c', 'should not apply')).toBe(false)
+    expect(await ledger.markAttemptFailed('m-missing', 'should not apply')).toBe(false)
+
+    expect((await ledger.get('m-q'))?.status).toBe('queued')
+    expect((await ledger.get('m-q'))?.lastError).toBeNull()
+    expect((await ledger.get('m-i'))?.status).toBe('inboxed')
+    expect((await ledger.get('m-c'))?.status).toBe('cancelled')
+    // Nothing was invented for the missing id — the same rule `markInboxed` follows.
+    expect(await ledger.get('m-missing')).toBeUndefined()
+  })
+
+  it('★ the rollback survives a crash boundary: interrupted work is repaired, failed work is not', async () => {
+    // The two paths must be distinguishable after a restart, which is the whole point
+    // of `delivering` being persisted. A row that FAILED was rolled back by the live
+    // process (status `queued`); a row that was INTERRUPTED is still `delivering` and
+    // the self-check repairs it. If the rollback were missing, both would look the
+    // same and only the restart would distinguish them — too late to act on.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-failed', from: 'alice', to: 'sess-1', text: 'f' })
+    await ledger.markDelivering('m-failed')
+    await ledger.markAttemptFailed('m-failed', 'absent')
+
+    await ledger.record({ msgId: 'm-stuck', from: 'alice', to: 'sess-1', text: 's' })
+    await ledger.markDelivering('m-stuck')
+
+    expect(await ledger.markDelivering('m-stuck')).toBe(false) // already in flight
+
+    expect((await ledger.recoverInterrupted()).reset).toBe(1)
+    expect((await ledger.get('m-stuck'))?.status).toBe('queued')
+    expect((await ledger.get('m-failed'))?.status).toBe('queued')
+    // The recovered row is immediately retryable; the failed one already was.
+    expect((await ledger.get('m-failed'))?.lastError).toBe('absent')
+    expect((await ledger.get('m-stuck'))?.attempts).toBe(1)
+  })
+
+  it('★★ the delivery gate: every refusal reason is its own case, and its own rule', async () => {
+    // A boolean gate was a real defect: "false" was read as "carry on", which would
+    // hand over a message the ledger had recorded as `cancelled` — sending something
+    // explicitly cancelled is a behavioural error, not a duplicate. Each row below is
+    // driven into its state and then the gate is required to report that reason, so
+    // no two rows can pass by accident.
+    const { ledger } = await openLedger()
+
+    await ledger.record({ msgId: 'm-queued', from: 'alice', to: 'sess-1', text: 'q' })
+    expect(await ledger.claimDelivery('m-queued')).toEqual({ decision: 'deliver', reason: 'claimed' })
+    expect((await ledger.get('m-queued'))?.status).toBe('delivering')
+
+    // Missing row: deliver anyway (T6b), and do NOT invent one.
+    expect(await ledger.claimDelivery('m-missing')).toEqual({ decision: 'deliver', reason: 'untracked' })
+    expect(await ledger.get('m-missing')).toBeUndefined()
+
+    // Already handed over ⇒ delivering again would duplicate it.
+    expect(await ledger.claimDelivery('m-queued')).toEqual({ decision: 'refuse', reason: 'in-flight' })
+
+    await ledger.record({ msgId: 'm-inboxed', from: 'alice', to: 'sess-1', text: 'i' })
+    await ledger.markInboxed('m-inboxed', 'sess-1')
+    expect(await ledger.claimDelivery('m-inboxed')).toEqual({ decision: 'refuse', reason: 'delivered' })
+
+    await ledger.record({ msgId: 'm-cancelled', from: 'alice', to: 'sess-1', text: 'c' })
+    await ledger.cancel('m-cancelled', 'cancelled by the test')
+    expect(await ledger.claimDelivery('m-cancelled')).toEqual({ decision: 'refuse', reason: 'terminal' })
+  })
+
+  it('★ a refused claim leaves the row exactly as it was (no attempt was started)', async () => {
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-c', from: 'alice', to: 'sess-1', text: 'c' })
+    await ledger.cancel('m-c', 'cancelled by the test')
+    const before = await ledger.get('m-c')
+
+    await ledger.claimDelivery('m-c')
+
+    const after = await ledger.get('m-c')
+    expect(after?.status).toBe('cancelled')
+    // A refusal must not count as an attempt: `attempts` is the honest count the retry
+    // half will use, and bumping it for a delivery that never started would inflate it.
+    expect(after?.attempts).toBe(before?.attempts)
+    expect(after?.revision).toBe(before?.revision)
+  })
+
+  it('★ a late failure report cannot un-deliver a message that already landed', async () => {
+    // The rollback is whitelisted on `delivering`, and this is the case that makes
+    // the whitelist load-bearing rather than decorative: a racing attempt reports
+    // failure after the row was advanced to `inboxed`. Rolling back would erase a
+    // real delivery, so the call must report false and change nothing.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'late' })
+    expect(await ledger.markDelivering('m-1')).toBe(true)
+
+    await ledger.markInboxed('m-1', 'sess-1')
+    // The row now carries the resolved session; the rollback must not clear it.
+    const landed = await ledger.get('m-1')
+    expect(landed?.status).toBe('inboxed')
+
+    expect(await ledger.markAttemptFailed('m-1', 'late failure from a racing attempt')).toBe(false)
+
+    const after = await ledger.get('m-1')
+    expect(after?.status).toBe('inboxed')
+    expect(after?.resolvedSessionId).toBe(landed?.resolvedSessionId)
+    expect(after?.lastError).toBe(landed?.lastError)
+  })
+
+  it('★ the rollback advances `revision`, so its CAS protection is real', async () => {
+    // `putIfUnchanged` is only a guard if a successful write moves `revision`; if it
+    // did not, two concurrent rollbacks would both believe they won.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'r' })
+    await ledger.markDelivering('m-1')
+    const before = await ledger.get('m-1')
+
+    expect(await ledger.markAttemptFailed('m-1', 'nobody there')).toBe(true)
+
+    const after = await ledger.get('m-1')
+    expect(after?.revision).toBeGreaterThan(before?.revision ?? -1)
+  })
 })
