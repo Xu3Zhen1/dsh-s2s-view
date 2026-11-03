@@ -102,6 +102,19 @@ export type DeliveryClaim =
   | { readonly decision: 'refuse'; readonly reason: 'in-flight' | 'delivered' | 'terminal' | 'not-queued' | 'cas-lost' }
 
 /**
+ * What a failed-attempt report actually did — three outcomes, not two.
+ *
+ * `not-applicable` covers both "no such row" and "the row is not in `delivering`"
+ * (a terminal row, or one a racing attempt already advanced). Those are the same
+ * answer to the caller — this report changed nothing — so they share a name on
+ * purpose rather than pretending to distinguish what the caller cannot act on.
+ */
+export type AttemptFailureOutcome =
+  | { readonly outcome: 'rolled-back' }
+  | { readonly outcome: 'dead-lettered' }
+  | { readonly outcome: 'not-applicable' }
+
+/**
  * Same guard as {@link noteLedger}, but for a call whose RETURN VALUE the caller
  * needs (the delivery gate's decision).
  *
@@ -843,7 +856,7 @@ export class S2sLedger extends Service {
   }
 
   /**
-   * Roll a FAILED delivery attempt back: `delivering` → `queued`.
+   * Roll a FAILED delivery attempt back, or terminate it when the retries are spent.
    *
    * Why this exists: marking the attempt (`markDelivering`) without an undo turns
    * every undeliverable message into one that is retried only after a process
@@ -857,17 +870,29 @@ export class S2sLedger extends Service {
    * stays green only when this rollback runs — so the existing I1 contract guards
    * the new transition instead of a test this batch wrote for itself.
    *
-   * `attempts` is deliberately NOT decremented: the attempt really happened, and the
-   * retry half of the state machine (`maxRetries` exhaustion) will need an honest
-   * count. For the same reason `nextAttemptAt` becomes `now` rather than a backoff
-   * instant — nothing reads a future stamp yet, and writing one would be a value
-   * with no consumer (the retry half is a separate task).
+   * `attempts` is deliberately NOT decremented: the attempt really happened, and it
+   * is the honest count the exhaustion branch below reads. For the same reason
+   * `nextAttemptAt` becomes `now` rather than a backoff instant — nothing reads a
+   * future stamp yet, and writing one would be a value with no consumer. Backoff
+   * belongs with the dispatcher that reads it, which does not exist.
+   *
+   * `absent` COUNTS as an attempt on purpose. The plan groups "`deliver()` throws /
+   * returns absent" together as one failure kind, and if a message addressed to a
+   * session that has permanently gone did not count, it would re-queue forever with
+   * no terminal exit. Counting it is what gives an undeliverable message a way to
+   * stop — via the exhaustion branch below.
+   *
+   * Returns what actually happened rather than a boolean: three distinct outcomes
+   * exist (rolled back to `queued`, terminated as `dead_letter`, or nothing to do)
+   * and a boolean can express only two of them. This is the same lesson as
+   * `claimDelivery` — a two-valued return over a three-valued decision silently
+   * collapses one case into another.
    */
-  async markAttemptFailed(msgId: string, reason: string): Promise<boolean> {
+  async markAttemptFailed(msgId: string, reason: string): Promise<AttemptFailureOutcome> {
     const domain = this.opened()
     const table = domain.table(MESSAGES_TABLE)
     const now = Date.now()
-    let rolledBack = false
+    let outcome: AttemptFailureOutcome = { outcome: 'not-applicable' }
     await this.serialize(async () => {
       const row = table.get(msgId)
       if (row === undefined) return
@@ -876,15 +901,24 @@ export class S2sLedger extends Service {
       // reached `inboxed`/`landed` must keep that — a late failure report from a
       // racing attempt cannot un-deliver a message that did land.
       if (row.status !== 'delivering') return
-      rolledBack = await this.putIfUnchanged(row.revision ?? 0, {
+      // The retries are spent ⇒ the honest terminal state, not another requeue.
+      // Without this branch a message that can never be delivered cycles forever;
+      // `dead_letter` previously had exactly one inbound edge (`expireZombies`, for
+      // a landed-but-unreadable log) and this is the second, independent one.
+      const exhausted = (row.attempts ?? 0) >= (row.maxRetries ?? 0)
+      const wrote = await this.putIfUnchanged(row.revision ?? 0, {
         ...row,
-        status: 'queued',
-        lastError: reason,
+        status: exhausted ? 'dead_letter' : 'queued',
+        lastError: exhausted
+          ? reason + ' — giving up after ' + (row.attempts ?? 0) + ' attempt(s) (maxRetries '
+            + (row.maxRetries ?? 0) + ')'
+          : reason,
         nextAttemptAt: now,
         updatedAt: now,
       })
+      if (wrote) outcome = { outcome: exhausted ? 'dead-lettered' : 'rolled-back' }
     })
-    return rolledBack
+    return outcome
   }
 
   /**
@@ -999,15 +1033,24 @@ export class S2sLedger extends Service {
    * an already-excluded status can never fire and would read as protection it is
    * not providing.
    *
-   * ★ `requeued` is 0 **by design, not by omission**. The plan gives this pass a
-   * second job — "re-judge the rows that never landed" — but that judgement reads
-   * `attempts` and `nextAttemptAt`, and the delivery path does not advance either
-   * one yet (nothing increments `attempts`, nothing compares `nextAttemptAt`
-   * against `now`). Re-judging rows whose fields never change would report a verdict
-   * on constants: a green result that exercises nothing. So the second job is left
-   * unwired and the gap is written down here, where it cannot be forgotten, instead
-   * of being simulated. When the retry half of §12.3 is wired, `requeued` acquires
-   * its input for free.
+   * ★ `requeued` is 0 because the second job is unwired — and the NAME is wrong.
+   *
+   * The plan assigns this pass two jobs (`L1258`: "复位卡住的 delivering、重判未 landed")
+   * and is explicit about what the second one is (`L1497`): *"T13 的职责是重判未 landed
+   * 的行，它必须复用 T7 的 `reconcile()` 判据，因此 T7 是 T13 的硬前置"*. So the
+   * judgement is a **read of the target logs** — the same landed/unreadable decision
+   * `reconcile()` already makes — not anything about `attempts` or `nextAttemptAt`.
+   *
+   * An earlier revision of this comment claimed the second job needed the retry half
+   * to advance `attempts`/`nextAttemptAt`. That was wrong: it would have made the gap
+   * look dependent on a task the plan does not link it to. The real dependency is T7,
+   * which is already implemented — the missing piece is only the wiring, plus a bound
+   * on how many target logs a startup pass may read.
+   *
+   * Because the job is a reconciliation, the honest field name is `reconciled` (how
+   * many rows were judged), not `requeued` (which implies a state change the plan
+   * never asked for). The rename is deferred so this batch stays a single concern;
+   * until then the field is always 0 and means "not judged", never "judged and clean".
    */
   async recoverInterrupted(opts: { now?: number } = {}): Promise<{ reset: number; requeued: number }> {
     const domain = this.opened()

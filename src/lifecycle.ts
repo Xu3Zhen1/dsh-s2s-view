@@ -638,12 +638,31 @@ ${entry.text}`
       // never outrank delivery (T6b), which is exactly why this is not a hard gate.
       const claim = await readLedger(ledger, 'claimDelivery', () => ledger!.claimDelivery(entry.msgId))
       if (claim !== undefined && claim.decision === 'refuse') {
-        // Deliberately NOT re-enqueued. A message refused here is one the ledger says
-        // must never go out (cancelled / dead-lettered / already delivered / owned by
-        // another attempt); re-queueing it would loop forever on a cancelled row, and
-        // delivering it is the behavioural error this gate exists to prevent. So it is
-        // dropped — visibly, not silently (G9): the drain reports it and `s2s_status`
-        // reads the outcome back.
+        // Two kinds of refusal, and they need OPPOSITE handling.
+        //
+        // `in-flight` is TEMPORARY: another attempt currently owns the row. It will
+        // either succeed (the row becomes `inboxed`, so the next claim reports
+        // `delivered` and that is dropped) or fail (the row is rolled back to `queued`,
+        // so the next claim reports `claimed` and the message goes out). Either way the
+        // state advances, so the message is put BACK in the queue.
+        //
+        // The other four are PERMANENT — `terminal`, `delivered`, `not-queued`,
+        // `cas-lost` — that state will not change by itself, so re-queueing would
+        // repeat the same refusal on every drain. Those are dropped, visibly rather
+        // than silently (G9): the drain reports the refusal and `s2s_status` reads the
+        // outcome back.
+        //
+        // An earlier revision of this comment said re-queueing would "loop forever",
+        // full stop. That held for four of the five reasons and was false for
+        // `in-flight` — the exact absolute-quantifier mistake that the sibling comment
+        // on `claimDelivery` warns about, made in the batch that wrote the warning.
+        if (claim.reason === 'in-flight') {
+          const requeued = 'requeued: another attempt currently holds the row (temporary refusal)'
+          refused.push({ msgId: entry.msgId, code: 'S2S_LEDGER', message: requeued, cancelOutcome: requeued })
+          recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: 'S2S_LEDGER', cancelOutcome: requeued, at: Date.now() })
+          await this.mailbox.enqueue(sessionId, entry)
+          continue
+        }
         const dropped = 'dropped: ledger refused delivery (' + claim.reason + ')'
         refused.push({ msgId: entry.msgId, code: 'S2S_LEDGER', message: 'the ledger refused delivery (' + claim.reason + ')', cancelOutcome: dropped })
         recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: 'S2S_LEDGER', cancelOutcome: dropped, at: Date.now() })

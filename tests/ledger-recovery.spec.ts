@@ -202,7 +202,7 @@ describe('T13 startup self-check', () => {
     await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'gone' })
     expect(await ledger.markDelivering('m-1')).toBe(true)
 
-    expect(await ledger.markAttemptFailed('m-1', 'broker reported absent')).toBe(true)
+    expect(await ledger.markAttemptFailed('m-1', 'broker reported absent')).toEqual({ outcome: 'rolled-back' })
 
     const row = await ledger.get('m-1')
     expect(row?.status).toBe('queued')
@@ -215,6 +215,37 @@ describe('T13 startup self-check', () => {
     expect(row?.nextAttemptAt).toBeTypeOf('number')
   })
 
+  it('★★★ attempts are spent ⇒ dead_letter, not another requeue (the second inbound edge)', async () => {
+    // Before this branch existed, `dead_letter` had exactly one inbound edge
+    // (`expireZombies`, for a landed-but-unreadable log). A message addressed to a
+    // session that is permanently gone failed, rolled back, and was retried forever:
+    // no terminal exit. `maxRetries` was declared and never compared.
+    const { ctx, ledger } = await openLedger('exhaust')
+    await ledger.record({ msgId: 'm-x', from: 'a', to: 's', text: 'gone forever' })
+    const limit = (await ledger.get('m-x'))!.maxRetries
+
+    // `absent` counts as an attempt on purpose (plan §12.3 groups "throws / absent"
+    // together), so each cycle is claim → fail until the budget is gone.
+    for (let i = 0; i < limit; i += 1) {
+      expect((await ledger.claimDelivery('m-x')).decision).toBe('deliver')
+      const outcome = await ledger.markAttemptFailed('m-x', 'broker reported absent')
+      // Every attempt but the last returns the row to `queued`; the last one ends it.
+      expect(outcome).toEqual({ outcome: i + 1 === limit ? 'dead-lettered' : 'rolled-back' })
+    }
+
+    const dead = await ledger.get('m-x')
+    expect(dead?.status).toBe('dead_letter')
+    expect(dead?.attempts).toBe(limit)
+    expect(dead?.lastError).toContain('giving up after')
+    // Terminal means terminal: a fourth failure report changes nothing, and the row
+    // is not selectable for delivery again.
+    expect(await ledger.markAttemptFailed('m-x', 'late')).toEqual({ outcome: 'not-applicable' })
+    expect(await ledger.claimDelivery('m-x')).toEqual({ decision: 'refuse', reason: 'terminal' })
+    expect((await ledger.get('m-x'))?.status).toBe('dead_letter')
+
+    await ledger.close()
+    await ctx.fiber.dispose()
+  })
   it('★ markAttemptFailed refuses anything that is not an in-flight attempt', async () => {
     // Three distinct must-not-roll-back cases, each for a different reason:
     //   queued     — nothing was in flight, so "failed" would be a fiction
@@ -230,10 +261,10 @@ describe('T13 startup self-check', () => {
     await ledger.record({ msgId: 'm-c', from: 'alice', to: 'sess-1', text: 'c' })
     await ledger.cancel('m-c', 'cancelled by the test')
 
-    expect(await ledger.markAttemptFailed('m-q', 'should not apply')).toBe(false)
-    expect(await ledger.markAttemptFailed('m-i', 'should not apply')).toBe(false)
-    expect(await ledger.markAttemptFailed('m-c', 'should not apply')).toBe(false)
-    expect(await ledger.markAttemptFailed('m-missing', 'should not apply')).toBe(false)
+    expect(await ledger.markAttemptFailed('m-q', 'should not apply')).toEqual({ outcome: 'not-applicable' })
+    expect(await ledger.markAttemptFailed('m-i', 'should not apply')).toEqual({ outcome: 'not-applicable' })
+    expect(await ledger.markAttemptFailed('m-c', 'should not apply')).toEqual({ outcome: 'not-applicable' })
+    expect(await ledger.markAttemptFailed('m-missing', 'should not apply')).toEqual({ outcome: 'not-applicable' })
 
     expect((await ledger.get('m-q'))?.status).toBe('queued')
     expect((await ledger.get('m-q'))?.lastError).toBeNull()
@@ -325,7 +356,7 @@ describe('T13 startup self-check', () => {
     const landed = await ledger.get('m-1')
     expect(landed?.status).toBe('inboxed')
 
-    expect(await ledger.markAttemptFailed('m-1', 'late failure from a racing attempt')).toBe(false)
+    expect(await ledger.markAttemptFailed('m-1', 'late failure from a racing attempt')).toEqual({ outcome: 'not-applicable' })
 
     const after = await ledger.get('m-1')
     expect(after?.status).toBe('inboxed')
@@ -341,7 +372,7 @@ describe('T13 startup self-check', () => {
     await ledger.markDelivering('m-1')
     const before = await ledger.get('m-1')
 
-    expect(await ledger.markAttemptFailed('m-1', 'nobody there')).toBe(true)
+    expect(await ledger.markAttemptFailed('m-1', 'nobody there')).toEqual({ outcome: 'rolled-back' })
 
     const after = await ledger.get('m-1')
     expect(after?.revision).toBeGreaterThan(before?.revision ?? -1)
