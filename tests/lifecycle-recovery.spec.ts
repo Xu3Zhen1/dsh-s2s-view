@@ -161,4 +161,42 @@ describe('batch 43: the delivery gate on the dormant path', () => {
     expect(row?.lastError).toContain('dormant hand-over threw')
     expect(row?.lastError).toContain('hand-over exploded')
   })
+
+
+  it('★ an IN-FLIGHT refusal is re-queued, not dropped — it is the temporary one', async () => {
+    // Five refusal reasons split into two kinds needing OPPOSITE handling:
+    //   in-flight   TEMPORARY — another attempt owns the row right now
+    //   terminal / delivered / not-queued / cas-lost  PERMANENT — the state will not
+    //               change by itself, so re-queueing repeats the same refusal forever
+    // For in-flight the state does advance: the holder either succeeds (next claim says
+    // `delivered` => drop) or fails (row rolls back to `queued` => next claim says
+    // `claimed` => deliver). Dropping it would lose a message about to become
+    // deliverable.
+    //
+    // Names checked BEFORE writing this time: the harness exposes `goLive()`, and the
+    // service exposes `queuedCount()`. The previous attempt used `resume` and
+    // `pendingCount`, neither of which exists, and had to be withdrawn.
+    const h = await harness()
+    await h.ledger.record({ msgId: 'm-inflight', from: 'alice', to: 'sess-1', text: 'hold' })
+    expect(await h.lifecycle.queueForDormant({ sessionId: 'sess-1', from: 'alice', text: 'hold', msgId: 'm-inflight' })).toBe('queued')
+
+    // Put the row where another in-flight attempt would have left it.
+    expect(await h.ledger.claimDelivery('m-inflight')).toEqual({ decision: 'deliver', reason: 'claimed' })
+    expect((await h.ledger.get('m-inflight'))?.status).toBe('delivering')
+
+    await h.goLive()
+    const result = await h.lifecycle.drain('sess-1')
+
+    // Nothing handed over, and nothing counted as delivered...
+    expect(h.followups.length).toBe(0)
+    expect(result.delivered).toBe(0)
+    // ...but the message is STILL QUEUED. That is the whole difference from the
+    // permanent refusals: the drop path would have consumed it.
+    expect(await h.lifecycle.queuedCount('sess-1')).toBe(1)
+    // The row is untouched — re-queueing is the mailbox's business, not the ledger's.
+    expect((await h.ledger.get('m-inflight'))?.status).toBe('delivering')
+    // And the drain says why, instead of looking like a silent no-op.
+    expect(result.refused.map((r) => r.msgId)).toContain('m-inflight')
+    expect(result.refused.some((r) => r.cancelOutcome.includes('requeued'))).toBe(true)
+  })
 })

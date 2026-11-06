@@ -1018,16 +1018,33 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
               ? 'attached'
               : 'NOT-ATTACHED' + (d.toolCallSamplerError === undefined ? '' : '(' + d.toolCallSamplerError + ')')))
           lines.push('handshake-coldstart: ' + order)
-          // T13 / I2. Two-sided on purpose: `reset 0` cannot distinguish "nothing
-          // was interrupted" from "the self-check never ran", so the failure field
-          // and the not-yet-run case are printed separately instead of collapsing
-          // into the same zero.
+          // T13 / I2. TWICE two-sided, and the second way is easy to miss.
+          //
+          // First: `reset 0` alone cannot distinguish "nothing was interrupted" from
+          // "the self-check never ran", so the failure field and the not-yet-run case
+          // are printed separately instead of collapsing into the same zero.
+          //
+          // Second, and the reason this string is long: the line carries TWO zeros and
+          // they are not the same quantity. `reset` is a MEASUREMENT — no row was stuck
+          // this time, which is a real reading. The reconciliation count is an
+          // UNIMPLEMENTED FEATURE — it is zero because the job does not run, never
+          // because the job ran and found nothing. Reporting both as `0` without saying
+          // which is which is the absence-ambiguity this project keeps paying for.
+          //
+          // The plan (L1497) settles what that job is: T13 re-judges rows that never
+          // landed by REUSING T7's `reconcile()`, and T7 is its hard prerequisite. It
+          // has nothing to do with the retry half — an earlier revision of this comment
+          // claimed it did, and that was wrong.
           lines.push('startup-self-check: ' + (d.interruptedResetError !== undefined
             ? 'FAILED (' + d.interruptedResetError + ') — rows stuck in `delivering` will NOT be retried'
             : d.interruptedReset === undefined
               ? 'NOT RUN YET (the ledger has not opened)'
               : 'reset ' + d.interruptedReset + ' row(s) `delivering` -> `queued` '
-                + '(requeued=0 by design: the retry half of the state machine is not wired yet)'))
+                + '— the two zeros mean different things: `reset 0` is a MEASUREMENT '
+                + '(nothing was stuck this time); `requeued=0` is an UNIMPLEMENTED FEATURE '
+                + '(rows that never landed are not re-judged yet — that is NOT "judged and clean"). '
+                + 'That job reuses reconcile() per plan L1497 (T7 is its prerequisite), so the '
+                + 'field should really be named `reconciled`.'))
 
           // The series. Each row answers "can we see the ledger here, and if not,
           // does the implementation exist anyway, and what state is its fiber in".

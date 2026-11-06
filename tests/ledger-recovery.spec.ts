@@ -180,16 +180,25 @@ describe('T13 startup self-check', () => {
     expect((await ledger.get('m-i'))?.status).toBe('inboxed')
   })
 
-  it('`requeued` is pinned at 0 while the retry half is unwired (stated, not silent)', async () => {
+  it('`requeued` is pinned at 0 because the re-judge job is UNWIRED — not because it judged and found nothing', async () => {
     const { ledger } = await openLedger()
     await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'hello' })
     await ledger.markDelivering('m-1')
 
     const result = await ledger.recoverInterrupted()
-    // This is a placeholder contract, not a measurement: the plan's second startup
-    // job ("re-judge rows that never landed") reads `attempts` / `nextAttemptAt`,
-    // and nothing advances either yet. Asserting 0 keeps the gap visible in the
-    // suite; when the retry half lands this assertion is what has to change.
+    // The plan gives this pass two jobs (L1258) and says what the second one is
+    // (L1497): re-judge the rows that never landed, by REUSING T7's `reconcile()` —
+    // T7 is its hard prerequisite. Reading target logs is what makes that judgement;
+    // the row's own counters are not its input.
+    //
+    // The two zeros on the rendered line are different quantities, and this assertion
+    // covers the second one only: `reset` is a MEASUREMENT (no row was stuck), while
+    // `requeued` is an UNIMPLEMENTED FEATURE. Asserting 0 keeps the gap visible.
+    //
+    // This comment is also a tripwire: it deliberately does NOT paraphrase the old,
+    // disproved explanation, because a paraphrase without a "this was wrong" marker
+    // reads as a current claim. (An earlier revision of it did exactly that, and the
+    // wording survived a whole batch because the search needle was a different phrase.)
     expect(result.requeued).toBe(0)
   })
 
@@ -210,7 +219,7 @@ describe('T13 startup self-check', () => {
     // The attempt really happened: decrementing would make `maxRetries` exhaustion
     // (once that half is wired) under-count a message that keeps failing.
     expect(row?.attempts).toBe(1)
-    // No backoff yet — the retry half is a separate task, and a future `nextAttemptAt`
+    // No backoff yet — the dispatcher that would read it is a separate task, and a future `nextAttemptAt`
     // would be a value nothing reads.
     expect(row?.nextAttemptAt).toBeTypeOf('number')
   })
