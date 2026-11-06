@@ -35,6 +35,30 @@ import { describe, expect, it } from 'vitest'
  * meta-statement, which is a false alarm. A full implication — *every* occurrence
  * must be accompanied by a disclaiming marker — stays green for legitimate additions
  * and goes red for a re-assertion. The cost is stated below in the boundaries.
+ *
+ * ## The four boundaries — read these before trusting a green run
+ *
+ * This criterion covers **two known phrasings**, not "this class of mistake":
+ *
+ *   1. It does not check whether the reasoning is right. It checks that wording which
+ *      was already disproved has not come back unflagged. A file can pass this and
+ *      still be wrong in a way nobody has caught yet.
+ *   2. The `re-judge` × `attempts` check is same-line only. It catches the exact
+ *      wording that shipped on 2026-11-06 (verified against the revision before the
+ *      fix: `git show 88fa994~1:tests/ledger-recovery.spec.ts`). It does NOT catch
+ *      a line-wrapped variant, a synonym, or the same error expressed with a
+ *      different field name.
+ *   3. `lib/` is outside the scan surface on purpose: it is git-ignored (absent on a
+ *      clean checkout) and rewritten by every build. Scanning it would make this
+ *      wording check depend on build reproducibility — a property measured once, on
+ *      one machine, with one toolchain.
+ *   4. **The assertions cover two specific phrasings, not every phrasing of the
+ *      error.** The 2026-11-06 miss happened precisely because the wrong claim was
+ *      written as `reads attempts / nextAttemptAt` while the search looked for
+ *      `retry half`. Assertion ② now covers that second phrasing, but "both known
+ *      branches are clean" is not "there is no such error": a third phrasing would
+ *      pass here silently. Treat a green run as *no regression of the two known
+ *      forms*, never as *no wrong explanation exists*.
  */
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -55,6 +79,17 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url))
  */
 const SELF = 'tests/reasoning-hygiene.spec.ts'
 
+/**
+ * The exclusion rule, in one place so it can be exercised.
+ *
+ * It must be an **exact path comparison**. A prefix or substring test would silently
+ * skip every file sharing the stem (`reasoning-hygiene-extra.spec.ts`, …), and no
+ * assertion would notice — the criterion would keep passing while covering less.
+ */
+function isExcludedBy(rel: string): boolean {
+  return rel === SELF
+}
+
 /** Every `.ts` under `src/` and `tests/`, as repo-relative POSIX paths. */
 function sourceFiles(): string[] {
   const out: string[] = []
@@ -62,7 +97,7 @@ function sourceFiles(): string[] {
     for (const name of readdirSync(join(repoRoot, dir))) {
       const rel = dir + '/' + name
       if (statSync(join(repoRoot, rel)).isDirectory()) walk(rel)
-      else if (name.endsWith('.ts') && rel !== SELF) out.push(rel)
+      else if (name.endsWith('.ts') && !isExcludedBy(rel)) out.push(rel)
     }
   }
   walk('src')
@@ -148,5 +183,28 @@ describe('wording hygiene: disproved claims must stay flagged', () => {
       const synthetic: Hit = { file: 'synthetic', line: 1, text: `the retry half ${marker} something`, previous: '' }
       expect(isDisclaimed(synthetic), `marker "${marker}" never matches — typo in the exclusion list?`).toBe(true)
     }
+  })
+
+  it('★ the self-exclusion is an EXACT path match, not a prefix (a wide skip would hide other files)', () => {
+    // Excluding this file is the one dangerous move in here: written as a prefix or a
+    // substring test, it would silently skip `reasoning-hygiene-extra.spec.ts` and
+    // anything else sharing the stem, and no assertion would notice.
+    //
+    // A peer verified this by creating such a file and watching the criterion go red.
+    // That verification is kept as an assertion here — but it must exercise the REAL
+    // filter, not a copy of it. (A first draft of this case defined its own little
+    // `wouldBeSkipped` closure and asserted against that: a tautology that would pass
+    // no matter what `sourceFiles()` did.)
+    //
+    // `scanSurface()` is the production path; the synthetic names are fed through the
+    // same predicate the real walk uses.
+    const scanned = sourceFiles()
+    expect(scanned).not.toContain(SELF)
+    // The stem-sharing peers are NOT special-cased, so they must be in the surface.
+    for (const peer of ['tests/reasoning-hygiene-extra.spec.ts', 'tests/x-reasoning-hygiene.spec.ts']) {
+      expect(isExcludedBy(peer), `${peer} must not be excluded — the skip is an exact path`).toBe(false)
+    }
+    // And the filter itself must still recognise this file, or it excludes nothing.
+    expect(isExcludedBy(SELF)).toBe(true)
   })
 })
