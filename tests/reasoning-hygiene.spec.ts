@@ -207,4 +207,25 @@ describe('wording hygiene: disproved claims must stay flagged', () => {
     // And the filter itself must still recognise this file, or it excludes nothing.
     expect(isExcludedBy(SELF)).toBe(true)
   })
+
+  it('★ the surface is non-empty and CONTAINS real files — absence has two causes', () => {
+    // "Not in the list" has two very different causes: the file was EXCLUDED, or the
+    // walk never SAW it (wrong root, bad extension filter, a typo in the recursion).
+    // The case above only rules out the first. Without this one, a walk that silently
+    // returned nothing would satisfy every assertion in this file while checking
+    // nothing — and the "meta-statements not deleted" case would not catch it either,
+    // because that one asserts on hits inside files, not on the surface itself.
+    const scanned = sourceFiles()
+    expect(scanned.length).toBeGreaterThan(0)
+    // Known-present files on both halves of the declared surface.
+    expect(scanned).toContain('src/ledger.ts')
+    expect(scanned).toContain('src/tools.ts')
+    expect(scanned).toContain('tests/ledger-recovery.spec.ts')
+    // Nothing outside the declared roots, and nothing that is not TypeScript. A walk
+    // that leaked `lib/` would widen the surface without anyone deciding to.
+    for (const rel of scanned) {
+      expect(rel.startsWith('src/') || rel.startsWith('tests/'), `${rel} is outside the declared surface`).toBe(true)
+      expect(rel.endsWith('.ts'), `${rel} is not a .ts file`).toBe(true)
+    }
+  })
 })
