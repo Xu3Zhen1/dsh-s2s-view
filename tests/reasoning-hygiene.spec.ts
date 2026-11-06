@@ -59,6 +59,30 @@ import { describe, expect, it } from 'vitest'
  *      branches are clean" is not "there is no such error": a third phrasing would
  *      pass here silently. Treat a green run as *no regression of the two known
  *      forms*, never as *no wrong explanation exists*.
+ *
+ * ## The stopping point (2026-11-06) — we decided to stop adding assertions here
+ *
+ * Batches 46→48 grew this file from 0 to 6 cases (+152, +59, +21 lines). The marginal
+ * value fell fast: each new case guarded an ever-more-distant assumption rather than a
+ * mistake that had actually happened. The chain has no natural end — the next case
+ * would guard "case 6 was never executed", then "that guard was never executed".
+ *
+ * So it stops here. Adding a case requires **all three** of these to be false:
+ *
+ *   1. It guards a further hypothesis, not a concrete mistake that already happened.
+ *   2. It cannot be justified by an incident the criterion actually failed to catch.
+ *   3. The boundaries above are already written down and would not change.
+ *
+ * **Who may overturn this:** not "anyone with a new idea". The only acceptable
+ * justification is **a real incident this criterion was supposed to catch and did
+ * not** — then the missing case is evidence, not speculation. "I can think of one
+ * more failure mode" is explicitly not enough.
+ *
+ * **If you overturn it, edit this section in the same commit.** A stopping point that
+ * is bypassed without being updated is worse than none: the next reader sees six cases
+ * and this paragraph still claiming the list is closed, and cannot tell whether it was
+ * deliberately reopened or quietly ignored. Deciding *not* to add something leaves no
+ * trace in the diff — this section exists to be that trace.
  */
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
