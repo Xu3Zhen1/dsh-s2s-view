@@ -1135,12 +1135,18 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           // "the self-check never ran", so the failure field and the not-yet-run case
           // are printed separately instead of collapsing into the same zero.
           //
-          // Second, and the reason this string is long: the line carries TWO zeros and
-          // they are not the same quantity. `reset` is a MEASUREMENT — no row was stuck
-          // this time, which is a real reading. The reconciliation count is an
-          // UNIMPLEMENTED FEATURE — it is zero because the job does not run, never
-          // because the job ran and found nothing. Reporting both as `0` without saying
-          // which is which is the absence-ambiguity this project keeps paying for.
+          // Second: the line carries TWO counts and they measure different things.
+          // `reset` is how many rows were rescued out of `delivering`; `reconciledRows`
+          // is how many rows were re-judged against their target logs. The second name
+          // carries its unit because {@link S2sLedger.tick} reports a `reconciled` that
+          // counts SESSIONS — a bare `reconciled` here would be a second number of the
+          // same name that cannot be compared with the first, and nobody would notice.
+          //
+          // ★ `reconciledRows` counts rows JUDGED, not rows found landed. A row whose
+          // target log is unreadable is judged too (and stamped `unreadableSince`,
+          // starting the same 24 h deadline a periodic sweep starts), so a non-zero
+          // value here can still end in `dead_letter`. That is why the wording says
+          // "judged" and never "confirmed".
           //
           // The plan (L1497) settles what that job is: T13 re-judges rows that never
           // landed by REUSING T7's `reconcile()`, and T7 is its hard prerequisite. It
@@ -1151,11 +1157,15 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             : d.interruptedReset === undefined
               ? 'NOT RUN YET (the ledger has not opened)'
               : 'reset ' + d.interruptedReset + ' row(s) `delivering` -> `queued` '
-                + '— the two zeros mean different things: `reset 0` is a MEASUREMENT '
-                + '(nothing was stuck this time); `requeued=0` is an UNIMPLEMENTED FEATURE '
-                + '(rows that never landed are not re-judged yet — that is NOT "judged and clean"). '
-                + 'That job reuses reconcile() per plan L1497 (T7 is its prerequisite), so the '
-                + 'field should really be named `reconciled`.'))
+                + '— the two counts measure different things: `reset ' + d.interruptedReset
+                + '` count(s) rows rescued from `delivering` (a MEASUREMENT — nothing was '
+                + 'stuck this time); `reconciledRows '
+                + (d.interruptedReconciledRows === undefined
+                  ? 'UNDEFINED` means the second job has not reported at all'
+                  : d.interruptedReconciledRows + '` count(s) rows RE-JUDGED against their '
+                    + 'target logs. Judged is not confirmed: an unreadable log is judged '
+                    + 'too, and starts the same 24 h deadline a sweep would')
+                + '. That job reuses reconcile() per plan L1497 (T7 is its prerequisite).'))
 
           // The series. Each row answers "can we see the ledger here, and if not,
           // does the implementation exist anyway, and what state is its fiber in".

@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -57,6 +58,87 @@ async function openLedger() {
     await ctx.fiber.dispose()
   })
   return { ctx, ledger }
+}
+
+/**
+ * A ledger whose `sessionQuery` answers with a REGULARLY READABLE log.
+ *
+ * `logs` maps a session id to the `user/message` events its log contains, already
+ * in the shape `readSessionLog` parses (`msgId` + `seq` + `source.kind = 'dsh-s2s'`).
+ * A session missing from the map reads as an empty (but readable) log — the case
+ * where nothing has landed *yet*.
+ */
+async function openLedgerWithLog(logs: Record<string, Array<{ msgId: string; seq: number }>>) {
+  const root = await mkdtemp(join(tmpdir(), 's2s-t13-log-'))
+  dirs.push(root)
+  const ctx = new Context()
+  ctx.logger.warn = vi.fn() as never
+  await ctx.plugin(Storage)
+  await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+  const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+  ctx.storage.mount('domain', facility)
+  ctx.provide('storageDomain', facility as never)
+  ctx.provide('sessionQuery', {
+    async readSession(sessionId: string) {
+      const entries = logs[sessionId] ?? []
+      return {
+        events: entries.map((e) => ({
+          type: 'user/message',
+          seq: e.seq,
+          time: 0,
+          // The msgId lives in the s2s header on the FIRST line, not in `data`:
+          // `readSessionLog` parses `[s2s message] key=value …` and takes `msgId`
+          // from there. Building the stub with `data.msgId` would produce a log the
+          // real parser ignores, i.e. a test that passes by never landing anything.
+          data: {
+            source: { kind: 'dsh-s2s' },
+            content: [{ text: '[s2s message] msgId=' + e.msgId + ' from=alice to=sess\nbody' }],
+          },
+        })),
+      }
+    },
+  } as never)
+  const ledger = new S2sLedger(ctx, { timerIntervalMs: 0 })
+  await ledger.open()
+  disposers.push(async () => {
+    await ledger.close()
+    await ctx.fiber.dispose()
+  })
+  return { ctx, ledger }
+}
+
+/**
+ * A ledger that counts how many target logs the startup pass actually reads.
+ *
+ * The count is incremented inside `readSession`, so it measures real reads rather
+ * than the shape of the `slice()` expression. That distinction is the whole point:
+ * "the bound is written in the code" and "the bound holds" are different claims,
+ * and only the second one can fail.
+ */
+async function openLedgerCountingReads() {
+  const root = await mkdtemp(join(tmpdir(), 's2s-t13-count-'))
+  dirs.push(root)
+  const ctx = new Context()
+  ctx.logger.warn = vi.fn() as never
+  await ctx.plugin(Storage)
+  await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+  const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+  ctx.storage.mount('domain', facility)
+  ctx.provide('storageDomain', facility as never)
+  const readCount = { value: 0 }
+  ctx.provide('sessionQuery', {
+    async readSession() {
+      readCount.value += 1
+      return { events: [] }
+    },
+  } as never)
+  const ledger = new S2sLedger(ctx, { timerIntervalMs: 0 })
+  await ledger.open()
+  disposers.push(async () => {
+    await ledger.close()
+    await ctx.fiber.dispose()
+  })
+  return { ctx, ledger, readCount }
 }
 
 describe('T13 startup self-check', () => {
@@ -180,26 +262,115 @@ describe('T13 startup self-check', () => {
     expect((await ledger.get('m-i'))?.status).toBe('inboxed')
   })
 
-  it('`requeued` is pinned at 0 because the re-judge job is UNWIRED — not because it judged and found nothing', async () => {
+  it('★★ the second job is WIRED: rows handed over but not landed are re-judged', async () => {
+    // ★ This case found a real semantic while it was being written, and the finding
+    // is the reason it is shaped this way: `record()` alone does NOT make a row
+    // eligible for the re-judge, because a freshly recorded row has no
+    // `resolvedSessionId` — there is no target log to read, so there is nothing to
+    // judge. Eligibility requires an actual handover (`markInboxed`), which is also
+    // the only state in which "handed over but never confirmed landed" is true.
     const { ledger } = await openLedger()
     await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'hello' })
-    await ledger.markDelivering('m-1')
+    await ledger.markInboxed('m-1', 'sess-1')
 
     const result = await ledger.recoverInterrupted()
-    // The plan gives this pass two jobs (L1258) and says what the second one is
-    // (L1497): re-judge the rows that never landed, by REUSING T7's `reconcile()` —
-    // T7 is its hard prerequisite. Reading target logs is what makes that judgement;
-    // the row's own counters are not its input.
+    // `reset` and `reconciledRows` measure different things and both are real now:
+    // nothing was stuck in `delivering`, but the handover IS re-judged against the
+    // target log. Getting 0 here would mean the second job is still unwired.
+    expect(result.reset).toBe(0)
+    expect(result.reconciledRows).toBe(1)
+    // The name is not decoration: `tick()` reports `reconciled` in SESSIONS. This
+    // field counts ROWS, so it must not answer to the same word.
+    expect('reconciled' in result).toBe(false)
+    expect('reconciledRows' in result).toBe(true)
+  })
+
+  it('★★ a row already confirmed landed is NOT re-judged (the second job has a scope)', async () => {
+    // The guard that makes `reconciledRows` mean something: without it every pass
+    // would report every row forever, and the count would be a constant rather than
+    // a measurement. Driven through `reconcile()`'s own positive path — a mounted
+    // session query that returns a log containing the msgId — so this is the real
+    // landing decision, not a status poked into storage.
+    const { ledger } = await openLedgerWithLog({ 'sess-1': [{ msgId: 'm-land', seq: 7 }] })
+    await ledger.record({ msgId: 'm-land', from: 'alice', to: 'sess-1', text: 'hi' })
+    await ledger.markInboxed('m-land', 'sess-1')
+    expect((await ledger.reconcile('sess-1')).landed).toBe(1)
+    expect((await ledger.get('m-land'))?.status).toBe('landed')
+
+    const result = await ledger.recoverInterrupted()
+    // Landed rows are excluded from the re-judge, so nothing is examined.
+    expect(result.reconciledRows).toBe(0)
+    expect((await ledger.get('m-land'))?.status).toBe('landed')
+  })
+
+  it('★★ an UNREADABLE log still counts as judged — and starts the same deadline a sweep starts', async () => {
+    // The honest reading of `reconciledRows` is "rows judged", never "deliveries
+    // confirmed": a row whose log cannot be read is judged too. That is not a
+    // cosmetic distinction, because the judgement stamps `unreadableSince`, and
+    // `expireZombies` later turns that stamp into `dead_letter` after
+    // `landedDeadlineMs`. So a startup pass CAN begin a 24 h clock — the side effect
+    // this case exists to prove rather than to assume.
+    const { ledger } = await openLedger()
+    await ledger.record({ msgId: 'm-1', from: 'alice', to: 'sess-1', text: 'hello' })
+    await ledger.markInboxed('m-1', 'sess-1')
+
+    // No session-query mounted ⇒ the read fails.
+    const now = Date.now()
+    const result = await ledger.recoverInterrupted({ now })
+
+    expect(result.reconciledRows).toBe(1)
+    const row = await ledger.get('m-1')
+    // Judged-but-unreadable: still `inboxed` (nothing was landed) AND stamped.
+    expect(row?.status).toBe('inboxed')
+    expect(row?.unreadableSince).toBe(now)
+
+    // And the chain completes: the stamp is what the sweep acts on.
+    const expired = await ledger.expireZombies({ now: now + LEDGER_LIMITS.landedDeadlineMs + 1 })
+    expect(expired.expired).toBe(1)
+    expect((await ledger.get('m-1'))?.status).toBe('dead_letter')
+  })
+
+  it('★★ the rendered startup line says "judged", never "confirmed" (I1: never claim more than happened)', async () => {
+    // Found by mutation: replacing "RE-JUDGED" with "CONFIRMED" in the s2s_status
+    // wording left the whole suite green. That is the exact overclaim I1 forbids —
+    // `reconciledRows` counts rows LOOKED AT, and an unreadable log is one of them,
+    // so a row counted here can still end in `dead_letter` rather than `landed`.
+    // Saying "confirmed" would claim more than happened, to a human reading status.
     //
-    // The two zeros on the rendered line are different quantities, and this assertion
-    // covers the second one only: `reset` is a MEASUREMENT (no row was stuck), while
-    // `requeued` is an UNIMPLEMENTED FEATURE. Asserting 0 keeps the gap visible.
-    //
-    // This comment is also a tripwire: it deliberately does NOT paraphrase the old,
-    // disproved explanation, because a paraphrase without a "this was wrong" marker
-    // reads as a current claim. (An earlier revision of it did exactly that, and the
-    // wording survived a whole batch because the search needle was a different phrase.)
-    expect(result.requeued).toBe(0)
+    // The subject of this criterion is the wording in the renderer, so the source
+    // text IS the thing being tested (same shape as `reasoning-hygiene.spec.ts`).
+    // It is deliberately narrow: it pins the two words this batch introduced, and
+    // would not catch a third phrasing of the same overclaim.
+    const src = readFileSync(new URL('../src/tools.ts', import.meta.url), 'utf8')
+    const line = src.split('\n').find((l) => l.includes('rows RE-JUDGED against their'))
+    expect(line, 'the startup-self-check renderer lost its "RE-JUDGED" wording').toBeDefined()
+    // The over-claim must not appear on the same rendered fragment.
+    expect(line).not.toMatch(/CONFIRMED against their/i)
+    expect(src).not.toMatch(/rows CONFIRMED against their/i)
+    // And the honest qualifier has to survive alongside the count, or "judged" is
+    // asserted without the reason it is not "confirmed".
+    expect(src).toMatch(/Judged is not confirmed/i)
+  })
+
+
+  it('★ the startup pass is BOUNDED — at most maxSessionsPerRequest target logs are read', async () => {
+    // A startup pass blocks the process, so "how many logs may it read" has to be a
+    // number, not "however many rows are waiting". The bound is asserted by counting
+    // the reads the pass actually performed, not by trusting the slice expression:
+    // one target beyond the limit must go unread.
+    const extra = LEDGER_LIMITS.maxSessionsPerRequest + 2
+    const { ledger, readCount } = await openLedgerCountingReads()
+    for (let i = 0; i < extra; i += 1) {
+      await ledger.record({ msgId: 'm-' + i, from: 'alice', to: 'sess-' + i, text: 't' })
+      await ledger.markInboxed('m-' + i, 'sess-' + i)
+    }
+
+    const result = await ledger.recoverInterrupted()
+
+    expect(readCount.value).toBe(LEDGER_LIMITS.maxSessionsPerRequest)
+    // The count reports what was judged, so it must match the bounded reads —
+    // a bigger number would mean rows were judged without a log read.
+    expect(result.reconciledRows).toBeLessThanOrEqual(LEDGER_LIMITS.maxSessionsPerRequest)
   })
 
   it('★ a failed attempt rolls back to queued and records why, keeping the attempt count', async () => {

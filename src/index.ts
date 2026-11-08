@@ -179,11 +179,24 @@ export function apply(ctx: Context, config: Config = {}): void {
         // look deliverable to the ledger and are never retried by anything.
         return opened.recoverInterrupted().then(function(recovered) {
           ledgerDiagnostics.interruptedReset = recovered.reset
+          // The second job (re-judge rows handed over but never confirmed landed).
+          // Persisted, not only logged: the pass can start the same 24 h
+          // `landedDeadlineMs` clock that a periodic sweep does, so "it ran and
+          // judged N rows" has to outlive the process that saw it.
+          ledgerDiagnostics.interruptedReconciledRows = recovered.reconciledRows
           if (recovered.reset > 0) {
             domainCtx.logger.warn(
               's2s: startup self-check returned ' + recovered.reset
               + ' message(s) from `delivering` to `queued` (the previous process ended mid-attempt); '
               + 'they are retryable again with an immediate next attempt.',
+            )
+          }
+          if (recovered.reconciledRows > 0) {
+            // Rows judged, not rows confirmed: an unreadable log is judged too, so
+            // this line means "the startup pass looked at N rows", never "N landed".
+            domainCtx.logger.warn(
+              's2s: startup self-check re-judged ' + recovered.reconciledRows
+              + ' row(s) against their target logs (rows judged, not deliveries confirmed).',
             )
           }
         }).catch(function(error: unknown) {

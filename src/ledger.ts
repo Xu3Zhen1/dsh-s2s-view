@@ -1033,26 +1033,37 @@ export class S2sLedger extends Service {
    * an already-excluded status can never fire and would read as protection it is
    * not providing.
    *
-   * ★ `requeued` is 0 because the second job is unwired — and the NAME is wrong.
+   * ★ The second job IS wired now, and it returns `reconciledRows` — deliberately
+   * NOT `reconciled`. That name is already taken by {@link tick}, where it counts
+   * **sessions** (`reconciled += 1` per target). This pass counts **rows**
+   * (`+= result.examined`). Two fields called `reconciled` holding 3 and 47 would be
+   * compared by the next reader, and nothing would go red when they were wrong to
+   * compare them. The unit lives in the name instead of in a comment, for the same
+   * reason this project keeps rejecting comments as guards.
+   *
+   * The plan's field name was `requeued`, which promised a state change it never
+   * performed: it read as "requeued" while always being 0, so the zero was at least
+   * honest that nothing was implemented. A wrong name turning non-zero would have
+   * been read as a requeue count, so the rename lands with the wiring.
    *
    * The plan assigns this pass two jobs (`L1258`: "复位卡住的 delivering、重判未 landed")
    * and is explicit about what the second one is (`L1497`): *"T13 的职责是重判未 landed
    * 的行，它必须复用 T7 的 `reconcile()` 判据，因此 T7 是 T13 的硬前置"*. So the
    * judgement is a **read of the target logs** — the same landed/unreadable decision
-   * `reconcile()` already makes — not anything about `attempts` or `nextAttemptAt`.
+   * `reconcile()` already makes — not anything about the row's own counters.
    *
    * An earlier revision of this comment claimed the second job needed the retry half
-   * to advance `attempts`/`nextAttemptAt`. That was wrong: it would have made the gap
-   * look dependent on a task the plan does not link it to. The real dependency is T7,
-   * which is already implemented — the missing piece is only the wiring, plus a bound
-   * on how many target logs a startup pass may read.
+   * to advance counters. That was wrong: it would have made the gap look dependent on
+   * a task the plan does not link it to. The real dependency is T7, already implemented.
    *
-   * Because the job is a reconciliation, the honest field name is `reconciled` (how
-   * many rows were judged), not `requeued` (which implies a state change the plan
-   * never asked for). The rename is deferred so this batch stays a single concern;
-   * until then the field is always 0 and means "not judged", never "judged and clean".
+   * `reconciledRows` counts rows **judged**, not rows judged to have landed. A row
+   * whose log is unreadable is still judged (and stamped `unreadableSince`, which is
+   * what `expireZombies` later acts on), so it counts. Reading this number as
+   * "deliveries confirmed" would overstate it; the landing count lives in
+   * `reconcile()`'s result. That stamp is the one real side effect of judging here:
+   * an unreadable log at startup starts the same 24 h clock `tick()` starts.
    */
-  async recoverInterrupted(opts: { now?: number } = {}): Promise<{ reset: number; requeued: number }> {
+  async recoverInterrupted(opts: { now?: number } = {}): Promise<{ reset: number; reconciledRows: number }> {
     const domain = this.opened()
     const now = opts.now ?? Date.now()
     const table = domain.table(MESSAGES_TABLE)
@@ -1071,7 +1082,43 @@ export class S2sLedger extends Service {
       }))
       if (recovered) reset += 1
     }
-    return { reset, requeued: 0 }
+    // ── Job 2: re-judge rows that were handed over but never confirmed landed ──
+    //
+    // ★ This runs OUTSIDE the per-row `serialize()` above, and that placement is
+    // load-bearing rather than stylistic: `reconcile()` takes the same serialization
+    // chain, which is a tail promise. Wrapping the whole pass in one `serialize()`
+    // and calling `reconcile()` inside it would await a link chained behind the one
+    // we are currently inside — the pass would wait on itself and the startup
+    // self-check would hang instead of failing loudly.
+    //
+    // Enumerate the targets the same way `tick()` does (only sessions this ledger
+    // actually has a stake in, bounded by `maxSessionsPerRequest`) rather than
+    // reconciling every known session: a startup pass must not decode logs for
+    // sessions it holds no rows for.
+    const targets = new Set<string>()
+    for (const [, row] of [...table.entries()]) {
+      if ((TERMINAL_STATUSES as readonly string[]).includes(row.status)) continue
+      if (row.status === 'landed' || row.status === 'consumed') continue
+      if (row.resolvedSessionId === null || row.resolvedSessionId === undefined) continue
+      targets.add(row.resolvedSessionId)
+    }
+    let reconciledRows = 0
+    for (const sessionId of [...targets].slice(0, LEDGER_LIMITS.maxSessionsPerRequest)) {
+      try {
+        // `useCache: false` for the same reason `tick()` uses it: a startup pass is
+        // the re-examination of reality, not a repeat of a question asked moments
+        // ago, and a cached read would let a log that has just gone away still look
+        // readable. (At startup the cache is empty; this keeps the intent explicit
+        // so a later caller reusing this pass does not silently inherit a stale hit.)
+        const result = await this.reconcile(sessionId, { now, useCache: false })
+        reconciledRows += result.examined
+      } catch (error) {
+        // Per-target isolation: one unreadable log must not stop the remaining
+        // targets from being re-judged (the plan's per-row failure isolation rule).
+        this.warn('reconcile', error)
+      }
+    }
+    return { reset, reconciledRows }
   }
 
   /**

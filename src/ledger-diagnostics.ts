@@ -83,6 +83,30 @@ export interface LedgerDiagnostics {
    */
   interruptedReset?: number
   /**
+   * How many rows the startup self-check **re-judged** (T13's second job).
+   *
+   * The unit is rows, and that is why the name carries it: {@link tick} reports a
+   * field called `reconciled` that counts **sessions**, so a bare `reconciled` here
+   * would be a second number of the same name that cannot be compared with the
+   * first — and no check would go red when someone compared them anyway.
+   *
+   * **Every value, including the boring one:**
+   * - `undefined` — the self-check has not run (the ledger never opened), so this
+   *   is "no reading", not "clean".
+   * - `0` — the pass ran and judged nothing. Reachable and honest: no row was
+   *   waiting to be re-judged, e.g. every row was terminal or already landed.
+   * - `> 0` — that many rows were judged. This counts rows *examined*, **not** rows
+   *   found landed: a row whose target log could not be read was judged too, and
+   *   gets stamped `unreadableSince`, which starts the same 24 h `landedDeadlineMs`
+   *   clock {@link tick} starts. So a non-zero value here can end in `dead_letter`
+   *   rather than in `landed`, and reading it as "deliveries confirmed" overstates it.
+   *
+   * Paired with {@link interruptedResetError} for the same reason that field exists:
+   * a failed self-check leaves rows untouched, and without a persisted error the
+   * only trace would be a `warn` that is gone after the fact.
+   */
+  interruptedReconciledRows?: number
+  /**
    * Why the startup self-check could not run, verbatim.
    *
    * Same reasoning as `domainReleaseError`: plugin logger output is not persisted,
