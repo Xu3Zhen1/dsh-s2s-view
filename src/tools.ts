@@ -141,6 +141,15 @@ function renderLatestOf(result: S2sLatestOfResult, requested: string, anchorId: 
     return 'Cannot resolve latest_of: the lineage service is unavailable (' + result.reason + '). This is NOT "this session has no lineage" — the lineage question could not be answered in this process.'
   }
   // not-found: every branch names its reason.
+  //
+  // ★ Reachability note (measured on the real host, 2026-11-08): the
+  // `anchor-not-found` entry below is **service-layer only** — it never renders
+  // through `s2s_latest`. The tool resolves the anchor with `resolve()` FIRST and
+  // returns `displayResolve()` on a miss, so a missing anchor never reaches this
+  // function. The entry is kept because `resolveLatestOf()` is a public service
+  // method with its own tests, and because dropping it would make a service-level
+  // miss fall through to the generic sentence and lose the reason. If you ever
+  // change the tool to resolve the anchor itself, this becomes live again.
   const byReason: Record<string, string> = {
     'empty-name': 'No anchor given: supply a name or session_id. The lineage search needs a member to anchor on.',
     'anchor-not-found': 'No session titled "' + requested + '" exists, so no lineage could be anchored. Titles must match EXACTLY (this tool does not prefix-match an anchor — an approximation would search the WRONG lineage and report success).',
