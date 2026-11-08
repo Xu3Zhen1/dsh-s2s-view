@@ -382,6 +382,53 @@ describe('T9 wording honesty (I1) and sweep observability', () => {
     await ctx.fiber.dispose()
   })
 
+  it('★★ the sweep line publishes `pruned`, so retention is observable at all', async () => {
+    // ★ This case exists because the defect it catches actually shipped one step
+    // short: `tick()` computed `pruned` and wrote it into `lastSweep`, and the
+    // renderer printed `reconciled` and `expired` while never reading `pruned` —
+    // an implementation with zero call points, the project's most frequent defect
+    // (the same shape as `resolveLatestOf()` before `s2s_latest` existed).
+    //
+    // The check is NOT a bare "the word pruned appears": the number has to come
+    // from the tick this case drove. An earlier draft that only matched the
+    // substring would have passed against a hard-coded `pruned=0`, which is the
+    // false-green this project keeps paying for. So the assertion is on the
+    // VALUE, taken from a tick whose outcome the case controls.
+    const root = await mkdtemp(join(tmpdir(), 's2s-sweep-pruned-'))
+    dirs.push(root)
+    const ctx = new Context()
+    ctx.logger.warn = vi.fn() as never
+    await ctx.plugin(Storage)
+    await ctx.plugin(sqliteStorage, { path: join(root, 'storage.db') })
+    const facility = new DomainFacility(ctx, { backend: 'sqlite', routes: {} })
+    ctx.storage.mount('domain', facility)
+    ctx.provide('storageDomain', facility as never)
+    const ledger = new S2sLedger(ctx, { timerIntervalMs: 60_000 })
+    await ledger.open()
+    disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
+
+    const broker = { deliver: vi.fn(() => 'idle' as const), history: vi.fn(() => [] as any[]) }
+    const discovery = { list: vi.fn(async () => [] as any[]), resolve: vi.fn(async () => ({ kind: 'ok', sessionId: 'sess-1', title: 'a', state: 'live-idle', workspaceDir: 'ws' }) as any),
+      archivedFilterState: vi.fn(() => ({ state: 'available', ids: [] as string[] })),
+      targetPolicyVerdict: vi.fn(() => undefined),
+      classifyTarget: vi.fn((id: string, origin?: string) => (origin === 'subagent' ? 'subagent' : origin !== undefined ? 'unknown' : 'eligible')),}
+    const defs = buildTools({ ctx, broker, discovery, ledger } as any)
+    const status = defs.find((d) => d.name === 's2s_status') as unknown as Tool
+
+    // A row old enough to be pruned ⇒ the tick below really removes one, so the
+    // rendered number is 1 and a hard-coded 0 cannot satisfy it.
+    const now = Date.now()
+    await ledger.record({ msgId: 'm-stale', from: 'a', to: 's', text: 'stale', createdAt: now - 40 * 24 * 60 * 60 * 1000 })
+    const tick = await ledger.tick({ now })
+    expect(tick.pruned).toBe(1)
+
+    const out = await status.execute({}, { agent: { id: 'sess-a' } })
+    expect(out.text).toContain('pruned=1')
+    // The pair still has to be there: `reconciled` and `expired` are not replaced.
+    expect(out.text).toContain('reconciled=')
+    expect(out.text).toContain('expired=')
+  })
+
   it('★ publishes the sweep schedule, so "not due yet" is distinguishable from "not armed"', async () => {
     // Within a verification window the 1h interval means the callback cannot be
     // observed, and silence is exactly what an un-armed timer would also produce.

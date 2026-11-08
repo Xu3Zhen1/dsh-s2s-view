@@ -1032,6 +1032,17 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             const when = new Date(sw.last.at).toISOString()
             lines.push('sweep: armed every ' + Math.round(sw.intervalMs / 1000) + 's; last attempt ' + when
               + ' (' + ageS + 's ago), reconciled=' + sw.last.reconciled + ' expired=' + sw.last.expired
+              // ★ T22. `pruned` had NO consumer until this line existed: `tick()` computed
+              // it, wrote it into `lastSweep`, and nothing ever read it — the exact
+              // "implementation with zero call points" defect this project keeps hitting
+              // (the same shape as `s2s_latest` before it was routed to a tool). A number
+              // that is computed and never rendered is indistinguishable from one that is
+              // never computed, to anyone reading this output.
+              //
+              // The wording separates the two reasons a zero can appear, because they are
+              // different facts: `pruned 0` on a sweep that ran means "looked, found nothing
+              // to remove", which is a measurement. It never means "retention is not wired".
+              + ' pruned=' + sw.last.pruned
               + (sw.last.skipped
                 ? ' — SKIPPED: the ledger is not open, so the sweep ran but could do nothing. The timer is alive; its effect is not.'
                 : ' — executed against the store.')
