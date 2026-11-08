@@ -26,5 +26,32 @@ describe('s2s composition', () => {
     expect(registered.map(t => t.name)).toEqual(['s2s_digest', 's2s_peers', 's2s_sessions', 's2s_message', 's2s_resume', 's2s_status', 's2s_reconcile', 's2s_history', 's2s_schedule'])
     await ctx.fiber.dispose()
   })
+
+  /**
+   * T15: the lineage service must be mounted by `apply()`.
+   *
+   * ★ This is not a formality — it is the assertion for a defect observed in this
+   * very batch. `src/lineage.ts` type-checked, its 13 unit tests passed, and
+   * `pnpm run build` reported all green, yet `lib/index.js` contained **zero**
+   * occurrences of `s2sLineage`: nothing imported it, so `tsdown` tree-shook it
+   * away and the product stayed byte-identical to the previously deployed copy
+   * (`D993F02E…` / 222757 B before, `F9D94B09…` / 230368 B after mounting). A
+   * unit test against the class cannot catch that, because the class is fine —
+   * what is missing is the *mount*. So the criterion has to live here, where
+   * composition is the subject.
+   *
+   * The pair below is what makes it discriminating: mount ⇒ present, and the
+   * negative half proves the assertion reports absence rather than being true
+   * because everything is always present.
+   */
+  it('mounts the lineage service (T15) — and a bare Context does not have it', async () => {
+    const { ctx } = await harness()
+    expect(ctx.get('s2sLineage')).toBeDefined()
+    await ctx.fiber.dispose()
+
+    const bare = new Context()
+    expect(bare.get('s2sLineage')).toBeUndefined()
+    await bare.fiber.dispose()
+  })
 })
 

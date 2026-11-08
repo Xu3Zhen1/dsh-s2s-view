@@ -44,6 +44,16 @@ export interface S2sSessionInfo {
   readonly workspaceDir: string
   readonly state: 'live-idle' | 'live-busy' | 'dormant'
   readonly lastActivity?: number
+  /**
+   * The session's creation time, from the host header's `createdAt` (T16).
+   *
+   * This is the sort key for `latest_of`. It is `createdAt` and not
+   * `lastActivity` because `lastActivity` is declared above and **never
+   * assigned anywhere in this module** — it is a field with no producer, so
+   * ranking on it would silently order by `undefined`. `createdAt` is a required
+   * `number` on the host's `SessionHeader` and is already read on the FS path.
+   */
+  readonly createdAt?: number
   /** The session header's `origin`, when the listing could read it (T30). The
    *  host types this as `'subagent' | undefined`; FS fallback reads it from the
    *  real log header, never from the title cache. */
@@ -88,6 +98,61 @@ export type S2sTargetClass = 'eligible' | 'archived' | 'subagent' | 'unknown'
 export type S2sArchiveFilterState =
   | { readonly state: 'available'; readonly ids: readonly string[] }
   | { readonly state: 'unavailable'; readonly reason: 'registry-absent' | 'registry-read-failed' | 'archived-session-ids-not-an-array' }
+
+/**
+ * The `s2sLineage` service face used by {@link S2sDiscoveryService.resolveLatestOf}
+ * (T16). Reached structurally and through `ctx.get`, so a host/plugin build
+ * without it degrades to a named answer instead of a crash.
+ */
+interface S2sLineageLike {
+  resolve(sessionId: string): Promise<
+    | { readonly kind: 'resolved'; readonly memberIds: readonly string[]; readonly complete: boolean }
+    | { readonly kind: 'unavailable'; readonly reason: string }
+  >
+}
+
+/**
+ * Why a `latest_of` lookup produced no session.
+ *
+ * Every value names a distinct fact, because "not found" alone would merge four
+ * situations whose correct responses differ: fix the name, mount the service,
+ * fix the policy wiring, or accept that the lineage has no rankable member.
+ */
+export type S2sLatestOfMiss =
+  /** No name was supplied at all — a caller error, not a corpus fact. */
+  | 'empty-name'
+  /** No corpus session carries that exact title, so no lineage could be anchored. */
+  | 'anchor-not-found'
+  /** The lineage service is not mounted in this process. */
+  | 'lineage-service-absent'
+  /** The lineage service answered `unavailable`; its own reason is carried through. */
+  | 'lineage-unavailable'
+  /** The lineage was searched but no member could be ranked (see `unrankable`). */
+  | 'no-ranked-member'
+
+/** Result of {@link S2sDiscoveryService.resolveLatestOf} — a resolved member or a named miss. */
+export type S2sLatestOfResult =
+  | {
+    readonly kind: 'ok'
+    readonly sessionId: string
+    readonly title?: string
+    readonly state: S2sSessionInfo['state']
+    readonly workspaceDir: string
+    /** The ranking key that won, so the receipt can show why it won. */
+    readonly createdAt: number
+    /** False when the host could not trace the lineage to its root (T15's `complete`). */
+    readonly lineageComplete: boolean
+    /** How many eligible, rankable members competed. */
+    readonly candidateCount: number
+    readonly origin?: string
+    /** Members with no usable `createdAt` — present but unrankable, so never chosen. */
+    readonly unrankable?: readonly string[]
+    /** Lineage members absent from the corpus read — the two were read at different moments. */
+    readonly notInCorpus?: readonly string[]
+  }
+  | { readonly kind: 'not-found'; readonly name: string; readonly reason: S2sLatestOfMiss; readonly candidates: readonly S2sCandidate[]; readonly totalCandidates?: number; readonly lineageComplete?: boolean; readonly unrankable?: readonly string[]; readonly notInCorpus?: readonly string[] }
+  | { readonly kind: 'lineage-unavailable'; readonly name: string; readonly reason: S2sLatestOfMiss | string }
+  | { readonly kind: 'policy-unavailable'; readonly name: string; readonly reason: string }
 
 /** The workspaceRegistry shape s2s consumes, reached structurally. */
 interface WorkspaceRegistryLike {
@@ -556,6 +621,129 @@ export class S2sDiscoveryService extends Service {
   }
 
   /**
+   * T16 — `latest_of`: resolve the newest session in a lineage.
+   *
+   * ## Why this is a separate method, not a `resolve()` option
+   *
+   * The plan's hard constraint is **"do not change the default semantics"**: 539
+   * existing cases must keep passing. Adding a branch inside `resolve()` would put
+   * the new path in front of every existing caller — and the plan's own history
+   * (v1.1) is a record of what happens when a judge is widened to make room for a
+   * feature. A separate entry point cannot regress `resolve()` at all, and the
+   * claim "default unchanged" then becomes structural instead of a promise.
+   *
+   * ## What "latest" means here, and why not `lastActivity`
+   *
+   * Ranked by `createdAt` (the host header's required field). **Not**
+   * `lastActivity`: that field is declared on {@link S2sSessionInfo} and is never
+   * assigned anywhere in this module, so a ranking built on it would order by
+   * `undefined` and look fine. Sessions whose header carried no usable
+   * `createdAt` are **unrankable** — they are never chosen, and their count is
+   * reported, rather than being treated as `0` (which would make the oldest
+   * session win).
+   *
+   * ## Eligibility and the archived/subagent filter
+   *
+   * Only `eligible` members are candidates, reusing the same classifier as
+   * `resolve()` so an archived or subagent member can never win. If the archive
+   * filter is unavailable the caller's fail-closed rule applies: this returns
+   * `policy-unavailable` rather than guessing.
+   *
+   * ## Degradation is named (G9)
+   *
+   * Without the `s2sLineage` service there is no lineage to search, so the
+   * answer is `lineage-unavailable` with the reason — never an empty "no live
+   * members", which would read as "this lineage is empty".
+   *
+   * @param name - a session name/title whose lineage is the search space.
+   * @param options.current - exclude this session id from the result (the
+   *   "resolve to some OTHER member" case).
+   */
+  async resolveLatestOf(name: string | undefined, options: { readonly current?: string } = {}): Promise<S2sLatestOfResult> {
+    const filter = this.archivedFilterState()
+    if (filter.state !== 'available') {
+      // T30's fail-closed rule: an unavailable policy is not "no archived sessions".
+      return { kind: 'policy-unavailable', name: name ?? '', reason: filter.reason }
+    }
+    const archivedIds = filter.ids
+    const classify = (info: S2sSessionInfo): S2sTargetClass => this.classifyTarget(info.sessionId, info.origin, archivedIds, info.headerUnproven)
+
+    const needle = name?.trim().toLowerCase()
+    if (needle === undefined || needle.length === 0) return { kind: 'not-found', name: name ?? '', reason: 'empty-name', candidates: [] }
+    // Pin the non-empty spelling once: the misses below report it verbatim, and
+    // TS cannot carry the `needle` narrowing across to `name`.
+    const requested = name as string
+
+    // Anchor the lineage on a member we can already name. This deliberately does
+    // NOT try prefix matching: a `latest_of` that silently anchored on an
+    // approximation would search the wrong lineage and report success.
+    const infos = await this.collect()
+    const anchor = infos.find(info => info.title?.trim().toLowerCase() === needle)
+    if (anchor === undefined) {
+      return { kind: 'not-found', name: requested, reason: 'anchor-not-found', candidates: approxCandidates(infos, needle), totalCandidates: infos.length }
+    }
+
+    const lineage = this.ctx.get('s2sLineage') as S2sLineageLike | undefined
+    if (lineage === undefined || typeof lineage.resolve !== 'function') {
+      return { kind: 'lineage-unavailable', name: requested, reason: 'lineage-service-absent' }
+    }
+    const trace = await lineage.resolve(anchor.sessionId)
+    if (trace.kind !== 'resolved') {
+      // Carry the service's own reason through: "could not ask" and "asked and
+      // refused" must not arrive as the same word.
+      return { kind: 'lineage-unavailable', name: requested, reason: trace.reason }
+    }
+
+    const byId = new Map(infos.map(info => [normalizeId(info.sessionId), info]))
+    const members: S2sSessionInfo[] = []
+    const unrankable: string[] = []
+    const notInCorpus: string[] = []
+    for (const memberId of trace.memberIds) {
+      if (options.current !== undefined && normalizeId(memberId) === normalizeId(options.current)) continue
+      const info = byId.get(normalizeId(memberId))
+      if (info === undefined) {
+        // A lineage member absent from the current corpus is a real fact worth
+        // reporting: the corpus and the trace were read at different moments.
+        notInCorpus.push(memberId)
+        continue
+      }
+      if (classify(info) !== 'eligible') continue
+      if (info.createdAt === undefined) unrankable.push(info.sessionId)
+      else members.push(info)
+    }
+
+    if (members.length === 0) {
+      return {
+        kind: 'not-found',
+        name: requested,
+        reason: 'no-ranked-member',
+        candidates: [],
+        lineageComplete: trace.complete,
+        ...(unrankable.length === 0 ? {} : { unrankable }),
+        ...(notInCorpus.length === 0 ? {} : { notInCorpus }),
+      }
+    }
+
+    // Newest first. Ties break by id so the answer is stable across runs rather
+    // than depending on corpus enumeration order.
+    members.sort((a, b) => (b.createdAt! - a.createdAt!) || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0))
+    const chosen = members[0]!
+    return {
+      kind: 'ok',
+      sessionId: chosen.sessionId,
+      ...(chosen.title === undefined ? {} : { title: chosen.title }),
+      state: chosen.state,
+      workspaceDir: chosen.workspaceDir,
+      createdAt: chosen.createdAt!,
+      lineageComplete: trace.complete,
+      candidateCount: members.length,
+      ...(chosen.origin === undefined ? {} : { origin: chosen.origin }),
+      ...(unrankable.length === 0 ? {} : { unrankable }),
+      ...(notInCorpus.length === 0 ? {} : { notInCorpus }),
+    }
+  }
+
+  /**
    * Coalesce concurrent full scans: callers arriving while a scan is in flight
    * share it instead of re-enumerating. Cleared as soon as it settles, so a
    * later call always re-reads (titles stay fresh).
@@ -685,6 +873,7 @@ export class S2sDiscoveryService extends Service {
         ...(title === undefined ? {} : { title }),
         workspaceDir,
         state: this.stateOf(sessionId),
+        ...(identity.createdAt === undefined ? {} : { createdAt: identity.createdAt }),
         ...(identity.origin === undefined ? {} : { origin: identity.origin }),
         ...(identity.headerProven ? {} : { headerUnproven: true } as { headerUnproven: true }),
       }
@@ -712,7 +901,7 @@ export class S2sDiscoveryService extends Service {
    *   (undefined = ordinary session); `headerProven` false means no trusted
    *   session header was read and the identity is unknown.
    */
-  private async readOriginFromFs(sessionDir: string, expectedBareId: string): Promise<{ origin: string | undefined; headerProven: boolean }> {
+  private async readOriginFromFs(sessionDir: string, expectedBareId: string): Promise<{ origin: string | undefined; headerProven: boolean; createdAt?: number }> {
     const paths = SESSION_LOG_CANDIDATES.map((name) => join(sessionDir, name))
     for (const p of paths) {
       const read = await readFile(p).then(z => ({ z }), (error: unknown) => ({ error }))
@@ -727,12 +916,16 @@ export class S2sDiscoveryService extends Service {
         return { origin: undefined, headerProven: false }
       }
       const header = headerFromZstd(read.z, expectedBareId)
-      return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
+      return header.reading === 'unrecognized'
+        ? { origin: undefined, headerProven: false }
+        : { origin: header.reading.origin, headerProven: true, ...(header.createdAt === undefined ? {} : { createdAt: header.createdAt }) }
     }
     const plainRead = await readFile(join(sessionDir, SESSION_LOG_PLAIN), 'utf8').then(t => ({ t }), (error: unknown) => ({ error }))
     if ('t' in plainRead) {
       const header = headerFromJsonl(plainRead.t, expectedBareId)
-      return { origin: header.reading === 'unrecognized' ? undefined : header.reading.origin, headerProven: header.reading !== 'unrecognized' }
+      return header.reading === 'unrecognized'
+        ? { origin: undefined, headerProven: false }
+        : { origin: header.reading.origin, headerProven: true, ...(header.createdAt === undefined ? {} : { createdAt: header.createdAt }) }
     }
     const code = (plainRead.error as { code?: string } | undefined)?.code
     if (code !== 'ENOENT') {
@@ -804,11 +997,13 @@ export class S2sDiscoveryService extends Service {
 /** Build one row from a query record + its resolved title and live state. */
 function toInfo(record: SessionRecordLike, sessionId: string, title: string | undefined, state: S2sSessionInfo['state']): S2sSessionInfo {
   const rawOrigin = record.header.origin
+  const rawCreatedAt = (record.header as { createdAt?: unknown }).createdAt
   return {
     sessionId,
     ...(title === undefined ? {} : { title }),
     workspaceDir: record.header.cwd ?? '?',
     state,
+    ...(typeof rawCreatedAt === 'number' && Number.isFinite(rawCreatedAt) ? { createdAt: rawCreatedAt } : {}),
     ...(typeof rawOrigin === 'string' ? { origin: rawOrigin } : {}),
   }
 }
@@ -1017,6 +1212,23 @@ interface S2sSessionHeaderReading {
 }
 
 /**
+ * A verified header plus the creation time read from the same record (T16).
+ *
+ * `createdAt` is returned **beside** `reading`, not inside it, on purpose: the
+ * `reading` object is an accepted T30 contract that tests deep-compare for its
+ * exact shape (`{ origin, id }`), so widening it would silently change a frozen
+ * interface. A sibling field adds the new fact without touching that surface.
+ *
+ * `createdAt` undefined means "this header carried no usable creation time" — a
+ * real state (v3-era logs), and it must NOT be read as `0`, which would rank the
+ * oldest session as the newest.
+ */
+export interface S2sSessionHeaderExtract {
+  readonly reading: S2sSessionHeaderReading | 'unrecognized'
+  readonly createdAt?: number
+}
+
+/**
  * Extract and VERIFY the top-level session header from one frame of JSONL.
  *
  * Verification is decided by the FIRST NON-EMPTY record alone: it must be a
@@ -1031,16 +1243,19 @@ interface S2sSessionHeaderReading {
  * @returns the trusted reading, or `'unrecognized'` when the identity could not
  *   be proven from this frame.
  */
-export function headerFromJsonl(text: string, expectedBareId: string): { reading: S2sSessionHeaderReading | 'unrecognized' } {
+export function headerFromJsonl(text: string, expectedBareId: string): S2sSessionHeaderExtract {
   for (const line of text.split('\n')) {
     if (line.length === 0) continue
-    let event: { type?: unknown; id?: unknown; origin?: unknown }
+    let event: { type?: unknown; id?: unknown; origin?: unknown; createdAt?: unknown }
     try { event = JSON.parse(line) } catch { return { reading: 'unrecognized' } }
     if (event.type !== 'session') return { reading: 'unrecognized' }
     if (typeof event.id !== 'string' || normalizeId(event.id) !== expectedBareId) return { reading: 'unrecognized' }
-    if (event.origin === undefined) return { reading: { origin: undefined, id: event.id } }
+    // `createdAt` rides BESIDE `reading`, so the frozen `{origin, id}` shape stays
+    // byte-identical. An unusable value is omitted, never coerced to `0`.
+    const createdAt = typeof event.createdAt === 'number' && Number.isFinite(event.createdAt) ? { createdAt: event.createdAt } : {}
+    if (event.origin === undefined) return { reading: { origin: undefined, id: event.id }, ...createdAt }
     if (typeof event.origin !== 'string' || event.origin.length === 0) return { reading: 'unrecognized' }
-    return { reading: { origin: event.origin, id: event.id } }
+    return { reading: { origin: event.origin, id: event.id }, ...createdAt }
   }
   // Empty log: nothing proven.
   return { reading: 'unrecognized' }
@@ -1051,7 +1266,7 @@ export function headerFromJsonl(text: string, expectedBareId: string): { reading
  * decodable frame — later frames cannot revive a header the first one failed to
  * prove.
  */
-export function headerFromZstd(buf: Buffer, expectedBareId: string): { reading: S2sSessionHeaderReading | 'unrecognized' } {
+export function headerFromZstd(buf: Buffer, expectedBareId: string): S2sSessionHeaderExtract {
   let frames: ZstdFrame[]
   try {
     frames = scanZstdFrames(buf).frames
@@ -1063,7 +1278,7 @@ export function headerFromZstd(buf: Buffer, expectedBareId: string): { reading: 
   for (const frame of frames) {
     let text: string
     try { text = zstdDecompressSync(buf.subarray(frame.start, frame.end)).toString('utf8') } catch { continue }
-    return { reading: headerFromJsonl(text, expectedBareId).reading }
+    return headerFromJsonl(text, expectedBareId)
   }
   return { reading: 'unrecognized' }
 }

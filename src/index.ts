@@ -15,6 +15,7 @@ import { S2sBudget, type BudgetConfig } from './budget.ts'
 import { buildSemanticJudge } from './judge.ts'
 import { S2sScheduleService, type ScheduleConfig } from './schedule.ts'
 import { S2sLedger, type LedgerConfig } from './ledger.ts'
+import { S2sLineage } from './lineage.ts'
 import { LEDGER_READY_MAX_TURNS, ledgerDiagnostics, recordProbe, waitForLedger } from './ledger-diagnostics.ts'
 import * as toolsPlugin from './tools.ts'
 import * as digestPlugin from './digest.ts'
@@ -79,6 +80,14 @@ export function apply(ctx: Context, config: Config = {}): void {
     ctx.plugin(S2sScheduleService, config.schedule)
   }
   ctx.plugin(S2sLedger, config.ledger ?? {})
+  // T15/P3: lineage over the host's `sessionQuery.traceSession()`.
+  //
+  // Mounted unconditionally: the service degrades to `session-query-absent` on a
+  // host that lacks it, and G9 makes that degradation observable rather than
+  // silent. Mounting it is also what puts it in the bundle — `tsdown`'s entry is
+  // `lib/types/index.js` and a module nothing imports is tree-shaken away, which
+  // is how a "built and tested" file can be absent from `lib/index.js` entirely.
+  ctx.plugin(S2sLineage)
   // Wait for `storageDomain` to *appear* instead of racing it (measured defect).
   //
   // The host builds its storage chain asynchronously: `dsh-base` patches in
