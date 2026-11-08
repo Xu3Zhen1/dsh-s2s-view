@@ -1072,6 +1072,21 @@ export class S2sLedger extends Service {
    * deliver: that is §12.3's duplicate-delivery guard, and it is why this is a
    * compare-and-set rather than an assignment.
    *
+   * ★ **No test in this repository proves that guard works — do not read the green
+   * suite as covering it.** What the tests can produce is one instance calling
+   * `claimDelivery` twice: `serialize()` runs those in order and the `in-flight`
+   * pre-check refuses the second, so neither reaches the CAS race. The window this
+   * CAS actually protects is *two instances both reading `queued` before either
+   * writes*, and a single-process harness cannot construct it. Mutating the CAS away
+   * (`return true` regardless) leaves the suite green — verified 2026-11-09.
+   *
+   * That is an evidence boundary, not a verdict on the guard: the CAS is the only
+   * mechanism that covers cross-instance concurrency, and §12.3 requires it. But
+   * "the invariant holds in the tests" is currently guaranteed by the mailbox
+   * draining each entry destructively, not by this comparison — and a future reader
+   * who assumes otherwise will believe a duplicate-delivery regression would be
+   * caught here. It would not.
+   *
    * ★ Without this method the enum's `delivering` member had no inbound write
    * anywhere in `src/`, so T13's subject — a row stuck mid-delivery — could not
    * exist. A recovery pass for an unreachable state reports a green result while
