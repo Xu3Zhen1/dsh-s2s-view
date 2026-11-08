@@ -206,6 +206,9 @@ describe('T24 mechanism: zombie deadline via injected now', () => {
     disposers.push(async () => { await ledger.close(); await ctx.fiber.dispose() })
 
     const result = await ledger.tick({ now: Date.now() })
-    expect(result).toEqual({ reconciled: 0, expired: 0, examined: 0 })
+    // `pruned` joined the result with T22 (retention). Asserting the whole object
+    // keeps this case honest about the full shape rather than loosening it to
+    // "contains" — a new field must be a deliberate edit here, not a silent one.
+    expect(result).toEqual({ reconciled: 0, expired: 0, examined: 0, pruned: 0 })
   })
 })

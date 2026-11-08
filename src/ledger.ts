@@ -228,6 +228,30 @@ export interface ZombieSweepResult {
   readonly expired: number
 }
 
+/**
+ * What one `pruneRetention()` pass examined and destroyed (T22).
+ *
+ * `pruned` alone is a count, and on a ledger that is the only copy of its records
+ * a count is not an audit trail: it says how many rows vanished without saying
+ * which part of history they covered. So the age span of the removed batch is
+ * part of the result. It is absent for an empty candidate set, which is a
+ * different fact from "the span was zero".
+ */
+export interface RetentionPruneResult {
+  /** Rows eligible for pruning (`dead_letter` excluded — see the method). */
+  readonly examined: number
+  /** Rows that satisfied the age window or the row budget. */
+  readonly candidates: number
+  /** Rows actually deleted; `0` under `dryRun`, and always `<= candidates`. */
+  readonly pruned: number
+  /** True when nothing was deleted by design. */
+  readonly dryRun: boolean
+  /** `createdAt` of the oldest removed candidate; absent when none. */
+  readonly oldestCreatedAt?: number
+  /** `createdAt` of the newest removed candidate; absent when none. */
+  readonly newestCreatedAt?: number
+}
+
 /** Ledger configuration. */
 export interface LedgerConfig {
   /**
@@ -304,7 +328,7 @@ export class S2sLedger extends Service {
    * ran and had work to do" vs "the sweep ran but the ledger has no store, so it
    * could do nothing". Without that distinction an inert sweep looks healthy.
    */
-  private lastSweep: { at: number; reconciled: number; expired: number; skipped: boolean } | undefined
+  private lastSweep: { at: number; reconciled: number; expired: number; pruned: number; skipped: boolean } | undefined
 
   constructor(ctx: Context, config: LedgerConfig = {}) {
     super(ctx, 's2sLedger')
@@ -439,7 +463,7 @@ export class S2sLedger extends Service {
   get sweepStatus(): {
     armed: boolean
     intervalMs: number
-    last?: { at: number; reconciled: number; expired: number; skipped: boolean }
+    last?: { at: number; reconciled: number; expired: number; pruned: number; skipped: boolean }
     /** Epoch ms of the next due pass; absent when the sweep is disarmed. */
     nextSweepAt?: number
     /** How long a row may stay unreadable before it is declared a zombie. */
@@ -474,14 +498,14 @@ export class S2sLedger extends Service {
    * @param opts.now - injectable clock; tests pin it to cross deadlines.
    * @returns how many targets were reconciled and how many rows were expired.
    */
-  async tick(opts: { now?: number } = {}): Promise<{ reconciled: number; expired: number; examined: number }> {
+  async tick(opts: { now?: number } = {}): Promise<{ reconciled: number; expired: number; examined: number; pruned: number }> {
     const now = opts.now ?? Date.now()
     if (this.domain === undefined) {
       // Recorded even though nothing can be done: otherwise an open-less
       // deployment looks identical to one where the timer never fired, and the
       // difference is exactly what an operator needs to see (T9/T24).
-      this.lastSweep = { at: now, reconciled: 0, expired: 0, skipped: true }
-      return { reconciled: 0, expired: 0, examined: 0 }
+      this.lastSweep = { at: now, reconciled: 0, expired: 0, pruned: 0, skipped: true }
+      return { reconciled: 0, expired: 0, examined: 0, pruned: 0 }
     }
     // Which targets actually have a row worth advancing? Reconciling every known
     // session would decode logs for sessions this ledger has no stake in, and
@@ -514,8 +538,34 @@ export class S2sLedger extends Service {
       // that a delivery was abandoned rather than still in flight.
       this.ctx.logger.warn('s2s ledger: dead-lettered ' + sweep.expired + ' zombie row(s) whose target log stayed unreadable past the deadline')
     }
-    this.lastSweep = { at: now, reconciled, expired: sweep.expired, skipped: false }
-    return { reconciled, expired: sweep.expired, examined: sweep.examined }
+    // Retention last, deliberately: a row must get its chance to become
+    // `dead_letter` above before this pass may consider removing it. Pruning
+    // first would tidy away the very rows the sweep exists to judge, and — worse
+    // — could delete a row that was about to be preserved as `dead_letter`.
+    // `dead_letter` is excluded inside `pruneRetention` itself, so the ordering
+    // is about giving the judgement a chance, not about the protection.
+    let pruned = 0
+    try {
+      const retention = await this.pruneRetention({ now })
+      pruned = retention.pruned
+      if (pruned > 0) {
+        // Only when something was actually destroyed. A quieter rule would log
+        // "pruned 0" on every hourly pass and bury the pass where it mattered.
+        this.ctx.logger.warn(
+          's2s ledger: pruned ' + pruned + ' row(s) past the retention window ('
+          + LEDGER_LIMITS.retentionDays + 'd / ' + LEDGER_LIMITS.retentionRows + ' rows), '
+          + 'covering ' + new Date(retention.oldestCreatedAt ?? now).toISOString()
+          + ' .. ' + new Date(retention.newestCreatedAt ?? now).toISOString()
+          + '; dead_letter rows are never pruned.',
+        )
+      }
+    } catch (error) {
+      // Degrade, never throw: a failed prune must not break the sweep timer. The
+      // error is recorded through the same channel the reconcile failures use.
+      this.warn('retention', error)
+    }
+    this.lastSweep = { at: now, reconciled, expired: sweep.expired, pruned, skipped: false }
+    return { reconciled, expired: sweep.expired, examined: sweep.examined, pruned }
   }
 
   /**
@@ -1353,6 +1403,99 @@ export class S2sLedger extends Service {
         if (died) expired += 1
       }
       return { examined, expired }
+    })
+  }
+
+  /**
+   * Rolling retention: drop rows that are both older than `retentionDays` and
+   * beyond the newest `retentionRows` (T22, plan §13.1b / §13.6).
+   *
+   * ★ This is the only method in the ledger that **destroys** rows, and the plan
+   * is explicit that the ledger is the sole copy (`L1483`: "唯一副本，须备份策略").
+   * Everything below follows from that one fact:
+   *
+   * - **`dead_letter` is never pruned.** The plan states it directly (`L1489`:
+   *   "`dead_letter` 不自动清理（它们是待人工处置的证据）"). Those rows are the
+   *   record of a delivery someone still has to deal with; expiring them by age
+   *   would delete the reason they exist.
+   * - **Count before deleting.** The candidate set is computed first, reported in
+   *   full, and only then removed — so `pruned` is a number this pass can be held
+   *   to, not a claim made after the fact.
+   * - **Deletion is reported, never silent.** `delete()` resolves `false` when the
+   *   row was already gone (another writer removed it), which is not a failure and
+   *   must not be counted as one. `pruned` counts what actually disappeared.
+   * - **Both bounds apply, whichever bites first** (`L1489`: "取先到者"). A row is
+   *   dropped only if it is outside the row budget *and* past the age window, so a
+   *   burst of recent rows can never evict a day of history by itself.
+   *
+   * Ordering note: candidates are sorted oldest-first and the newest
+   * `retentionRows` are kept, so the row cap trims history in age order rather
+   * than by key order — a `msgId` sort would drop an arbitrary subset.
+   *
+   * @param opts.now - injectable clock; tests cross the window without waiting.
+   * @param opts.dryRun - compute and report the candidate set, delete nothing.
+   *   Used by callers that want the answer before the first real prune.
+   * @returns what was examined, what was pruned, and the age span of the removed
+   *   batch (the audit trail a bare count cannot provide).
+   */
+  async pruneRetention(
+    opts: { now?: number; dryRun?: boolean } = {},
+  ): Promise<RetentionPruneResult> {
+    const domain = this.opened()
+    const now = opts.now ?? Date.now()
+    const dryRun = opts.dryRun === true
+    return this.serialize(async () => {
+      const table = domain.table(MESSAGES_TABLE)
+      const cutoff = now - LEDGER_LIMITS.retentionDays * 24 * 60 * 60 * 1000
+      // Only prunable rows are candidates: `dead_letter` is excluded by name
+      // rather than by "is it terminal", because the plan protects exactly one
+      // terminal state and `cancelled` / `legacy_unverifiable` are not it.
+      const prunable = [...table.entries()]
+        .map(([msgId, row]) => ({ msgId, row }))
+        .filter(({ row }) => row.status !== 'dead_letter')
+        .sort((a, b) => a.row.createdAt - b.row.createdAt)
+      // The row budget keeps the NEWEST `retentionRows` among prunable rows; the
+      // age window then trims whatever is still older than the cutoff. Applying
+      // both is what "whichever hits first" means in practice.
+      const overBudget = Math.max(0, prunable.length - LEDGER_LIMITS.retentionRows)
+      const candidates = prunable.filter((entry, index) => index < overBudget || entry.row.createdAt < cutoff)
+      let pruned = 0
+      for (const { msgId, row } of candidates) {
+        if (dryRun) continue
+        // CAS-style guard: re-read at delete time so a row that changed status
+        // since the snapshot (say, landed or moved to `dead_letter` by a racing
+        // pass) is not destroyed on the strength of a stale read.
+        //
+        // ★ This second layer is DEFENCE IN DEPTH and cannot be made to fail on
+        // its own: the filter above already excludes `dead_letter`, so on the
+        // ordinary path no such row ever reaches this line, and a test that tries
+        // to put one here has to bypass that filter — which is the mutation
+        // itself. Measured 2026-11-08: removing only this re-check leaves the full
+        // suite green. (To re-derive: delete the `current.status === 'dead_letter'`
+        // clause below and run the whole suite; it stays green. That is why this
+        // branch has no direct case.) The layer is still worth keeping — it is the
+        // only thing standing between a status change that lands *between* snapshot
+        // and delete and an irreversible removal — but its existence is proved only
+        // indirectly, by the mutant that removes BOTH layers (that one does go red).
+        // Do not read a green run as evidence that this branch is exercised.
+        const current = table.get(msgId)
+        if (current === undefined || current.status === 'dead_letter') continue
+        if ((current.revision ?? 0) !== (row.revision ?? 0)) continue
+        const removed = await table.delete(msgId)
+        // `false` means it was already absent — another writer got there first.
+        // That is not this pass removing it, so it must not be counted (I1).
+        if (removed) pruned += 1
+      }
+      const oldest = candidates.length === 0 ? undefined : candidates[0]!.row.createdAt
+      const newest = candidates.length === 0 ? undefined : candidates[candidates.length - 1]!.row.createdAt
+      return {
+        examined: prunable.length,
+        candidates: candidates.length,
+        pruned,
+        dryRun,
+        ...(oldest === undefined ? {} : { oldestCreatedAt: oldest }),
+        ...(newest === undefined ? {} : { newestCreatedAt: newest }),
+      }
     })
   }
 

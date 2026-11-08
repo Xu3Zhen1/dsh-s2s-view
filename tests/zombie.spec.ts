@@ -243,7 +243,10 @@ describe('T24 automatic trigger (tick)', () => {
     ctx.logger.warn = vi.fn() as never
     const ledger = new S2sLedger(ctx, { timerIntervalMs: 0 }) // deliberately NOT opened
     const result = await ledger.tick()
-    expect(result).toEqual({ reconciled: 0, expired: 0, examined: 0 })
+    // `pruned` joined the result with T22 (retention). Asserting the whole object
+    // keeps this case honest about the full shape rather than loosening it to
+    // "contains" — a new field must be a deliberate edit here, not a silent one.
+    expect(result).toEqual({ reconciled: 0, expired: 0, examined: 0, pruned: 0 })
     await ctx.fiber.dispose()
   })
 
