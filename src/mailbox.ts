@@ -66,8 +66,27 @@ export class S2sMailbox {
     await rename(tmp, file)
   }
 
-  /** Take every entry (oldest first) and remove its file. */
-  async drain(sessionId: string): Promise<MailboxEntry[]> {
+  /**
+   * Take every entry (oldest first) and remove its file.
+   *
+   * `opts.keep` is the T19 hook: it is asked **before** an entry is removed, and
+   * returning `false` leaves the file exactly where it was — not read into the
+   * result, not deleted. That ordering is the whole point. The alternative design
+   * — take everything, then re-enqueue whatever is not due yet — has a crash window
+   * between `rm` and the rewrite: a process that dies there leaves the message with
+   * no file and a ledger row still `queued`, and `recoverInterrupted()` repairs only
+   * `delivering` rows, so nothing would ever look for it again. Deciding first
+   * closes the window instead of narrowing it, and also stops a backed-off entry
+   * from being rewritten to disk on every pass.
+   *
+   * A filter that **throws** is treated as "do not take". The caller owns the
+   * policy (the lifecycle's filter already falls back to delivering when the ledger
+   * cannot answer, per T6b); the mailbox must not invent a second policy on top.
+   */
+  async drain(
+    sessionId: string,
+    opts: { keep?: (entry: MailboxEntry) => boolean | Promise<boolean> } = {},
+  ): Promise<MailboxEntry[]> {
     const dir = this.dirFor(sessionId)
     const names = await readdir(dir).catch(() => [] as string[])
     const entries: MailboxEntry[] = []
@@ -75,7 +94,17 @@ export class S2sMailbox {
       if (!name.endsWith('.json')) continue
       const file = join(dir, name)
       try {
-        entries.push(JSON.parse(await readFile(file, 'utf8')) as MailboxEntry)
+        const entry = JSON.parse(await readFile(file, 'utf8')) as MailboxEntry
+        if (opts.keep !== undefined) {
+          let take = false
+          try {
+            take = await opts.keep(entry)
+          } catch {
+            take = false
+          }
+          if (!take) continue
+        }
+        entries.push(entry)
         await rm(file, { force: true })
       } catch (error) {
         // A corrupt or vanished entry must not block the rest of the drain,
@@ -115,6 +144,39 @@ export class S2sMailbox {
       }
     }
     return entries
+  }
+
+  /**
+   * Session ids that currently hold at least one queued entry (T19).
+   *
+   * This exists because the fallback pass needs a **target set**, and the ledger
+   * cannot supply one: queued rows carry `resolvedSessionId: null` — that field is
+   * written only by `markInboxed`, when the message is actually handed over — so
+   * "which session should be drained for this due row?" has no answer in the
+   * ledger. The mailbox is keyed by session id and is where undelivered work
+   * actually lives, so it is the one surface that can answer.
+   *
+   * Directory names are the session ids (`dirFor`), but they are re-validated here
+   * rather than trusted: a stray directory in the mailbox root must not be
+   * reported as a session and then handed to `agents.get`.
+   */
+  async sessionsWithEntries(): Promise<string[]> {
+    const names = await readdir(this.rootDir).catch(() => [] as string[])
+    const sessions: string[] = []
+    for (const name of names.sort()) {
+      if (!SESSION_ID_RE.test(name)) continue
+      const dir = join(this.rootDir, name)
+      try {
+        if (!(await stat(dir)).isDirectory()) continue
+        const files = await readdir(dir)
+        if (files.some(file => file.endsWith('.json'))) sessions.push(name)
+      } catch {
+        // An unreadable directory must not abort the enumeration; the next pass
+        // will try again and `drain` will surface the real error.
+        continue
+      }
+    }
+    return sessions
   }
 
   private dirFor(sessionId: string): string {

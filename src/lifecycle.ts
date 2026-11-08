@@ -17,6 +17,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import { recordDrainRefusalOutcome } from './ledger-diagnostics.ts'
 import { noteLedger, readLedger, type S2sLedger } from './ledger.ts'
+import { LEDGER_LIMITS } from './ledger-schema.ts'
 import { S2S_MESSAGE_SOURCE } from './source.ts'
 import { S2sMailbox, type MailboxEntry } from './mailbox.ts'
 
@@ -28,6 +29,12 @@ export interface LifecycleConfig {
   readonly autoResume?: 'allow' | 'deny'
   /** Mailbox root override; defaults to ~/.dsh/s2s/mailboxes. */
   readonly mailboxDir?: string
+  /**
+   * How often the fallback retry pass runs (T19). Defaults to
+   * `LEDGER_LIMITS.retryIntervalMs`; `0` disables the timer so a spec can drive
+   * `retryDue()` with a pinned clock instead of sleeping.
+   */
+  readonly retryIntervalMs?: number
 }
 
 /** A minimal resumed-agent handle (structural; avoids coupling to internals). */
@@ -166,6 +173,30 @@ export class S2sLifecycleService extends Service {
    */
   private readonly resumeReports = new Map<string, ResumeReport>()
   private readonly offCreated: () => void
+  /**
+   * The fallback retry timer (T19). Armed only when `retryIntervalMs > 0`;
+   * `unref()`'d so it never keeps the host process alive on its own.
+   *
+   * Why a timer at all: delivery used to advance only on `agent/created`. A
+   * message whose retry became due while its target stayed live had nothing to
+   * wake it — the backoff stamp was honoured, the retry simply never happened.
+   * That is the "permanently stalled" shape this batch removes, and a clock is
+   * what removes it.
+   */
+  private retryTimer?: ReturnType<typeof setInterval>
+  /**
+   * What the most recent fallback pass did, for `s2s_status` to read back.
+   *
+   * T24 already paid for this lesson once: a timer whose effect is unobservable
+   * cannot be distinguished from a timer that silently stopped. `skipped` here
+   * separates the two situations that a lone timestamp would merge — "the pass
+   * ran and there was nothing due" from "the pass ran but the ledger is not open,
+   * so due-ness cannot be decided at all". Without that split an inert pass looks
+   * healthy.
+   */
+  private retryStatus: { at: number; skipped?: 'ledger-closed'; sessions: number; drained: number; waited: number } | undefined
+  /** Entries skipped because their backoff had not elapsed (T18/T19 diagnostic). */
+  private backoffWaits = 0
 
   constructor(ctx: Context, config: LifecycleConfig = {}) {
     super(ctx, 's2sLifecycle')
@@ -179,6 +210,70 @@ export class S2sLifecycleService extends Service {
       })
     })
     this.ctx.effect(() => this.offCreated, 's2sLifecycle.listener')
+    // T19 fallback pass. A wake is no longer the only thing that can clear a
+    // queue: a message that is merely *backing off* needs something to look again
+    // once its delay elapses, and no event marks that moment.
+    const retryIntervalMs = config.retryIntervalMs ?? LEDGER_LIMITS.retryIntervalMs
+    if (retryIntervalMs > 0) {
+      this.retryTimer = setInterval(() => {
+        void this.retryDue().catch((error: unknown) => {
+          this.ctx.logger.warn('s2s lifecycle: retry pass failed: ' + String(error))
+        })
+      }, retryIntervalMs)
+      this.retryTimer.unref?.()
+    }
+    // Mirroring the ledger's sweep: dispose through `ctx.effect` so a teardown
+    // cannot leave an interval ticking against a disposed service.
+    this.ctx.effect(() => () => { if (this.retryTimer !== undefined) clearInterval(this.retryTimer) }, 's2sLifecycle.retryTimer')
+  }
+
+  /** Read back the last fallback pass for `s2s_status` (T19). */
+  getLastRetryStatus(): { at: number; skipped?: 'ledger-closed'; sessions: number; drained: number; waited: number } | undefined {
+    return this.retryStatus
+  }
+
+  /**
+   * One fallback retry pass (T19).
+   *
+   * Picks the sessions that actually hold queued entries and drains only those
+   * whose agent is live. It deliberately does **not** decide due-ness here: that
+   * judgment lives in the ledger (`nextAttemptAt`) and is applied by the mailbox
+   * filter, so there is one answer to "is it time yet" rather than two that can
+   * disagree.
+   *
+   * "Fallback" means it wakes **without an event**, not that it scans blindly. A
+   * blind pass would take every backed-off entry out of the mailbox every 30 s
+   * just to put it back — which both churns the disk and fills the refusal
+   * diagnostics with noise that hides real delivery failures.
+   */
+  async retryDue(now: number = Date.now()): Promise<{ sessions: number; drained: number }> {
+    const ledger = this.ctx.get('s2sLedger') as S2sLedger | undefined
+    // Ledger unavailable ⇒ due-ness is undecidable, so the pass must not act. It
+    // also must not look like "nothing was due": that is why `skipped` is a
+    // separate field rather than a zero.
+    if (ledger === undefined || !ledger.isOpen) {
+      this.retryStatus = { at: now, skipped: 'ledger-closed', sessions: 0, drained: 0, waited: this.backoffWaits }
+      return { sessions: 0, drained: 0 }
+    }
+    const sessions = await this.mailbox.sessionsWithEntries()
+    let drained = 0
+    for (const sessionId of sessions) {
+      // A dormant target cannot receive anything; it is not a failure, and waking
+      // it is `autoResume`'s decision, not the retry pass's.
+      if (this.ctx.agents.get(SessionId(sessionId)) === undefined) continue
+      try {
+        // Counted as "drained" only when a hand-over actually happened. Counting
+        // sessions *attempted* instead would report 1 for a pass that found every
+        // entry still backing off — the pass would look like it did work while
+        // delivering nothing, which is the same overclaim I1 forbids on the tool path.
+        const result = await this.drain(sessionId)
+        if (result.delivered > 0) drained += 1
+      } catch (error) {
+        this.ctx.logger.warn(`s2s lifecycle: retry drain failed for ${sessionId}: ${String(error)}`)
+      }
+    }
+    this.retryStatus = { at: now, sessions: sessions.length, drained, waited: this.backoffWaits }
+    return { sessions: sessions.length, drained }
   }
 
   /**
@@ -587,7 +682,27 @@ export class S2sLifecycleService extends Service {
     // meaning the live path gives it in `broker.deliver`'s non-`absent` branch
     // (`tools.ts`). Resolved once per drain; the ledger is optional.
     // (`ledger` was resolved at the top of this function — the T30 gate shares it.)
-    const entries = await this.mailbox.drain(sessionId)
+    // T19: decide BEFORE taking. `keep` is asked per entry, and a retry that is not
+    // due yet is left in the mailbox rather than taken and re-enqueued. That
+    // difference is not stylistic: `drain` deletes each file as it reads it, so
+    // "take then put back" has a crash window in which the message exists in
+    // neither place — and `recoverInterrupted()` repairs only `delivering` rows, so
+    // nothing would ever look for it again. That is the permanently-stalled shape
+    // this batch removes, and it would have recurred on every backoff interval.
+    //
+    // When the ledger cannot answer (absent, unopened, or the read failed),
+    // `readLedger` returns undefined and the entry is taken: bookkeeping must not
+    // outrank delivery (T6b), and `readLedger` has already left the trace (G9).
+    const dueAt = Date.now()
+    const entries = await this.mailbox.drain(sessionId, {
+      keep: async (candidate) => {
+        if (ledger === undefined || !ledger.isOpen) return true
+        const due = await readLedger(ledger, 'isDue', () => ledger!.isDue(candidate.msgId, dueAt))
+        if (due === undefined) return true
+        if (!due) this.backoffWaits += 1
+        return due
+      },
+    })
     let delivered = 0
     /**
      * T30: entries refused AT the handover. The lifecycle owns the cancel for
@@ -656,8 +771,17 @@ ${entry.text}`
         // full stop. That held for four of the five reasons and was false for
         // `in-flight` — the exact absolute-quantifier mistake that the sibling comment
         // on `claimDelivery` warns about, made in the batch that wrote the warning.
-        if (claim.reason === 'in-flight') {
-          const requeued = 'requeued: another attempt currently holds the row (temporary refusal)'
+        if (claim.reason === 'in-flight' || claim.reason === 'backoff') {
+          // `backoff` is temporary for the same reason `in-flight` is: it names a
+          // condition that ends by itself. It should not reach here at all — the
+          // mailbox filter already leaves a not-yet-due entry on disk — so this is a
+          // safety net for the window where the ledger's answer changes between the
+          // filter and the claim. Re-queuing is right there, and it does re-open the
+          // take/rewrite crash window, which is exactly why the filter, not this
+          // branch, is the primary path.
+          const requeued = claim.reason === 'in-flight'
+            ? 'requeued: another attempt currently holds the row (temporary refusal)'
+            : 'requeued: the retry backoff had not elapsed (temporary refusal)'
           refused.push({ msgId: entry.msgId, code: 'S2S_LEDGER', message: requeued, cancelOutcome: requeued })
           recordDrainRefusalOutcome({ sessionId, msgId: entry.msgId, code: 'S2S_LEDGER', cancelOutcome: requeued, at: Date.now() })
           await this.mailbox.enqueue(sessionId, entry)

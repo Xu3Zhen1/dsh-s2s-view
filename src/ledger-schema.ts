@@ -93,6 +93,34 @@ export const LEDGER_LIMITS = {
   textMaxChars: 8000,
   /** Clamp for a `nextAttemptAt` implausibly far in the future (clock jump guard). */
   nextAttemptAtClampMs: 24 * 60 * 60 * 1000,
+  /**
+   * Retry backoff, first step (T18). The delay after attempt *n* is
+   * `retryBackoffBaseMs * 2^(n-1)`, capped at {@link retryBackoffMaxMs}.
+   *
+   * Why exponential and not a constant: a message that fails because the target
+   * has no live agent fails identically on every retry until something changes.
+   * A constant delay retries at a fixed rate forever, which is the behaviour this
+   * replaces; doubling gives the change a chance to arrive before the next try.
+   */
+  retryBackoffBaseMs: 2_000,
+  /**
+   * Ceiling for one backoff step (T18). Without a ceiling the 20th attempt would
+   * schedule a retry 12 days out — far past the 24 h zombie deadline, so the row
+   * would be judged dead long before its own retry was due. The cap keeps a retry
+   * inside the window in which the row can still be rescued.
+   */
+  retryBackoffMaxMs: 60 * 1000,
+  /**
+   * How often the lifecycle looks for **due** retries (T19).
+   *
+   * This is a fallback, not a poll: it asks the ledger which queued rows have
+   * reached their `nextAttemptAt` and only then drains those sessions. "Fallback"
+   * means it wakes by itself instead of waiting for an `agent/created` event; it
+   * does not mean it rescans everything blindly. A blind rescan would pull each
+   * backed-off message every 30 s just to refuse it again, filling the refusal
+   * diagnostics with noise that hides real delivery failures.
+   */
+  retryIntervalMs: 30 * 1000,
 } as const
 
 /** Message status as a value type. */

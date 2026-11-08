@@ -390,9 +390,15 @@ describe('T13 startup self-check', () => {
     // The attempt really happened: decrementing would make `maxRetries` exhaustion
     // (once that half is wired) under-count a message that keeps failing.
     expect(row?.attempts).toBe(1)
-    // No backoff yet — the dispatcher that would read it is a separate task, and a future `nextAttemptAt`
-    // would be a value nothing reads.
+    // T18 changed what this means. It used to be `now` — an immediately re-claimable
+    // row — with the note "a future `nextAttemptAt` would be a value nothing reads".
+    // That is no longer true: `claimDelivery` refuses with `backoff` while the stamp
+    // is in the future. So the assertion is now the stronger one — the stamp must be
+    // AHEAD of the row's own creation, i.e. the rollback schedules a retry instead of
+    // making the row instantly eligible. `now` would pass a `toBeTypeOf('number')`
+    // check too, which is why the weaker assert could not see this change at all.
     expect(row?.nextAttemptAt).toBeTypeOf('number')
+    expect(row!.nextAttemptAt).toBeGreaterThan(row!.createdAt)
   })
 
   it('★★★ attempts are spent ⇒ dead_letter, not another requeue (the second inbound edge)', async () => {
@@ -406,8 +412,16 @@ describe('T13 startup self-check', () => {
 
     // `absent` counts as an attempt on purpose (plan §12.3 groups "throws / absent"
     // together), so each cycle is claim → fail until the budget is gone.
+    //
+    // ★ T18 made the plain `claimDelivery('m-x')` stop working here, and that is the
+    // behaviour change, not a broken test: after the first failure the row carries a
+    // future `nextAttemptAt`, so a clock-less claim correctly refuses with `backoff`.
+    // This loop is about EXHAUSTION, so it advances `now` past the backoff rather than
+    // pretending the delay is not there. The delay itself is asserted separately in
+    // `ledger-backoff.spec.ts`; folding a "claims immediately" assumption back in here
+    // would re-hide the very gate this batch adds.
     for (let i = 0; i < limit; i += 1) {
-      expect((await ledger.claimDelivery('m-x')).decision).toBe('deliver')
+      expect((await ledger.claimDelivery('m-x', { now: Date.now() + 10 * 60 * 1000 })).decision).toBe('deliver')
       const outcome = await ledger.markAttemptFailed('m-x', 'broker reported absent')
       // Every attempt but the last returns the row to `queued`; the last one ends it.
       expect(outcome).toEqual({ outcome: i + 1 === limit ? 'dead-lettered' : 'rolled-back' })

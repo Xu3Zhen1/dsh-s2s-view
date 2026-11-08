@@ -198,6 +198,11 @@ describe('ledger domain spec (T4)', () => {
       // T24: how often the ledger sweeps on its own. This is what makes
       // `landedDeadlineMs` reachable without a human calling a tool.
       sweepIntervalMs: 60 * 60 * 1000,
+      // T18: retry backoff, first step and ceiling.
+      retryBackoffBaseMs: 2000,
+      retryBackoffMaxMs: 60 * 1000,
+      // T19: how often the lifecycle looks for due retries.
+      retryIntervalMs: 30 * 1000,
     })
     // The invariant behind the shorter failure TTL, asserted rather than implied.
     expect(LEDGER_LIMITS.reconcileFailureTtlMs).toBeLessThan(LEDGER_LIMITS.reconcileTtlMs)
@@ -206,5 +211,16 @@ describe('ledger domain spec (T4)', () => {
     // interval at or above the deadline itself would let a zombie overrun it by
     // up to 100%, which is the "deadline in name only" failure this guards.
     expect(LEDGER_LIMITS.sweepIntervalMs).toBeLessThan(LEDGER_LIMITS.landedDeadlineMs / 10)
+    // T18: the backoff MUST have a ceiling, and the ceiling must keep a retry
+    // inside the window where the row can still be rescued. Unbounded, attempt 20
+    // schedules ~12 days out — past the 24 h zombie deadline, so the row is judged
+    // dead before its own retry is due. This assertion is what stops a later
+    // "simplification" from deleting the cap as redundant.
+    expect(LEDGER_LIMITS.retryBackoffMaxMs).toBeGreaterThan(LEDGER_LIMITS.retryBackoffBaseMs)
+    expect(LEDGER_LIMITS.retryBackoffMaxMs).toBeLessThan(LEDGER_LIMITS.nextAttemptAtClampMs)
+    // T19: the fallback pass has to be more frequent than the smallest backoff step,
+    // or a one-step backoff is honoured only on the NEXT interval — turning a 2 s
+    // delay into up to 30 s of avoidable waiting. The inequality is the requirement.
+    expect(LEDGER_LIMITS.retryIntervalMs).toBeGreaterThan(LEDGER_LIMITS.retryBackoffBaseMs)
   })
 })

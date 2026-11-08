@@ -14,6 +14,7 @@ import { S2sLifecycleService, type S2sRefusedOutcome } from './lifecycle.ts'
 import type { S2sBudget, S2sThreadEntry } from './budget.ts'
 import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, readLedger, type S2sLedger } from './ledger.ts'
+import { LEDGER_LIMITS } from './ledger-schema.ts'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import type { S2sLatestOfResult } from './discovery.ts'
@@ -1051,6 +1052,46 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
           }
         }
 
+        // ★ T19: the fallback retry pass, rendered for exactly the reason the sweep
+        // line is (T24): a timer whose effect nobody can read is indistinguishable
+        // from a timer that silently stopped.
+        //
+        // `skipped` carries the distinction a lone timestamp would merge — "the pass
+        // ran and nothing was due" versus "the pass ran but the ledger is closed, so
+        // due-ness cannot be decided at all". Without it an inert pass reads healthy.
+        //
+        // `waited` counts entries left in the mailbox because their backoff has not
+        // elapsed. A NON-ZERO value here is the feature working, not a fault: it is
+        // the backoff holding messages back on purpose. Zero means every pending
+        // entry was due — which is why the wording says "waiting", not "stuck": the
+        // distinction matters, since a counter that can only be read as "something is
+        // wrong" would make correct behaviour look like a fault.
+        if (lifecycle !== undefined) {
+          // Guarded like `probe()` below, and for the same stated reason: a
+          // diagnostic must never be the thing that breaks the tool it explains. A
+          // test double or an older composition may not expose this method, and
+          // throwing here would take down all of `s2s_status` — the one place you
+          // would look to find out why retries are not happening.
+          //
+          // The degradation is loud rather than silent (G9): it says the field is
+          // unavailable instead of omitting the line, so "no retry line because
+          // nothing is configured" and "no retry line because the method is missing"
+          // stay distinguishable.
+          const retry = typeof lifecycle.getLastRetryStatus === 'function' ? lifecycle.getLastRetryStatus() : undefined
+          if (typeof lifecycle.getLastRetryStatus !== 'function') {
+            lines.push('retry: UNAVAILABLE — this lifecycle service does not expose retry status, so the fallback pass cannot be observed from here.')
+          } else if (retry === undefined) {
+            lines.push('retry: the fallback pass is armed (' + Math.round(LEDGER_LIMITS.retryIntervalMs / 1000)
+              + 's) but has NOT run yet in this process (nothing recorded since the last restart).')
+          } else {
+            lines.push('retry: last pass ' + new Date(retry.at).toISOString()
+              + ', mail-holding sessions=' + retry.sessions + ' drained=' + retry.drained
+              + (retry.skipped === undefined
+                ? ' — due-ness decided against the ledger.'
+                : ' — SKIPPED: the ledger is not open, so due-ness cannot be decided and the pass did nothing. The timer is alive; its effect is not.')
+              + ' Waiting on backoff: ' + retry.waited + ' entr(y/ies) left in the mailbox because their retry is not due yet.')
+          }
+        }
         // ★ Ledger handshake diagnostics.
         //
         // Two fixes failed on the real host while every local model passed. A

@@ -99,7 +99,82 @@ export async function noteLedger(
  */
 export type DeliveryClaim =
   | { readonly decision: 'deliver'; readonly reason: 'claimed' | 'untracked' }
-  | { readonly decision: 'refuse'; readonly reason: 'in-flight' | 'delivered' | 'terminal' | 'not-queued' | 'cas-lost' }
+  | {
+      readonly decision: 'refuse'
+      /**
+       * `backoff` — a retry is scheduled but not yet due (T18).
+       *
+       * It sits with the refusals rather than with the deliveries because the row
+       * must not be handed over yet; it differs from every other refusal in being
+       * **temporary** — the reason will stop applying on its own when
+       * `nextAttemptAt` passes, with no state change in between. Callers must
+       * therefore keep the message queued instead of dropping it: treating a
+       * temporary refusal as permanent is what turns a backoff into a
+       * permanently stalled message.
+       */
+      readonly reason: 'in-flight' | 'delivered' | 'terminal' | 'not-queued' | 'cas-lost' | 'backoff'
+    }
+
+/**
+ * How long to wait before the next attempt on a row (T18).
+ *
+ * `retryBackoffBaseMs * 2^(attempts-1)`, capped at `retryBackoffMaxMs`, plus a
+ * jitter of at most a quarter of that step.
+ *
+ * Three properties this has to hold, each of which a plausible simpler version
+ * breaks:
+ *
+ * - **Non-decreasing in `attempts`.** The plan's T18 wording asks for backoff to
+ *   be monotone. A *decreasing* delay would retry a hopeless target faster the
+ *   more often it failed, which is the opposite of backing off. The jitter is
+ *   therefore not `±`: a symmetric jitter can make attempt 3 wait less than
+ *   attempt 2. Making the jitter **additive and proportional to the step**
+ *   (`[0, step/4]`) keeps attempt *n+1* at least `2*step` against attempt *n*'s
+ *   `step + step/4`, so monotonicity survives the jitter instead of fighting it.
+ * - **Bounded.** Uncapped doubling reaches 12 days by attempt 20, i.e. past the
+ *   24 h zombie deadline — the row would be judged dead before its own retry was
+ *   due. Capping at `retryBackoffMaxMs` keeps retries inside the rescue window.
+ * - **Deterministic per row, varied across rows.** The jitter is derived from
+ *   `msgId`, so the same row always computes the same instant (a replayed call
+ *   cannot invent a different schedule), while two rows that failed in the same
+ *   millisecond still spread out instead of retrying in lockstep. Randomised
+ *   jitter would give the second property and lose the first.
+ *
+ * `attempts` is the count AFTER the attempt that just failed (the caller
+ * increments before handing over), so attempt 1 waits `retryBackoffBaseMs`.
+ */
+export function retryBackoffMs(msgId: string, attempts: number): number {
+  const MAX_SHIFT = 30
+  const n = Math.min(Math.max(Math.trunc(attempts) || 1, 1), MAX_SHIFT)
+  const step = Math.min(LEDGER_LIMITS.retryBackoffBaseMs * 2 ** (n - 1), LEDGER_LIMITS.retryBackoffMaxMs)
+  // FNV-1a over the id, reduced to [0, 1). Only the row's identity feeds it, so the
+  // value is stable for one row across attempts and across process restarts.
+  let hash = 0x811c9dc5
+  for (let i = 0; i < msgId.length; i++) {
+    hash ^= msgId.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  const jitter = Math.floor((hash / 0x100000000) * (step / 4))
+  return step + jitter
+}
+
+/**
+ * Is this row's retry clock due? The single judgment of "due", in one place (T18).
+ *
+ * Deliberately a pure function over a row: two callers need this answer — the
+ * delivery gate ({@link claimDelivery}) and the mailbox filter that decides which
+ * queued entries may be *taken* (T19) — and if each computed it, the two would
+ * drift until a message was judged due by one and not-due by the other, which
+ * presents as "it retried and then immediately refused" with no single culprit.
+ *
+ * Missing stamp (`null`/`undefined`) means due: a row that was never scheduled
+ * (or came from an older schema) must not be blocked forever by an absent field.
+ */
+export function dueByClock(row: { nextAttemptAt?: number | null }, now: number): boolean {
+  const at = row.nextAttemptAt
+  if (at === null || at === undefined) return true
+  return at <= now
+}
 
 /**
  * What a failed-attempt report actually did — three outcomes, not two.
@@ -921,10 +996,17 @@ export class S2sLedger extends Service {
    * the new transition instead of a test this batch wrote for itself.
    *
    * `attempts` is deliberately NOT decremented: the attempt really happened, and it
-   * is the honest count the exhaustion branch below reads. For the same reason
-   * `nextAttemptAt` becomes `now` rather than a backoff instant — nothing reads a
+   * is the honest count the exhaustion branch below reads.
+   *
+   * ★ `nextAttemptAt` used to be written as `now`, with the comment "nothing reads a
    * future stamp yet, and writing one would be a value with no consumer. Backoff
-   * belongs with the dispatcher that reads it, which does not exist.
+   * belongs with the dispatcher that reads it, which does not exist." That was true
+   * when it was written and is no longer: {@link claimDelivery} refuses with
+   * `backoff` while `nextAttemptAt` is in the future (T18), and the lifecycle's
+   * fallback pass (T19) is what wakes up to retry once it passes. The stamp now
+   * schedules something, so the rollback writes a real instant and the old comment
+   * had to go — left in place it would have claimed the opposite of the code
+   * directly beneath it.
    *
    * `absent` COUNTS as an attempt on purpose. The plan groups "`deliver()` throws /
    * returns absent" together as one failure kind, and if a message addressed to a
@@ -956,6 +1038,11 @@ export class S2sLedger extends Service {
       // `dead_letter` previously had exactly one inbound edge (`expireZombies`, for
       // a landed-but-unreadable log) and this is the second, independent one.
       const exhausted = (row.attempts ?? 0) >= (row.maxRetries ?? 0)
+      // T18: a rolled-back row is scheduled, not made immediately eligible again.
+      // Exhausted rows get `now` because they are terminal — nothing will consult
+      // their stamp again, and writing a future one would imply a retry that has
+      // been ruled out.
+      const nextAttemptAt = exhausted ? now : now + retryBackoffMs(msgId, row.attempts ?? 0)
       const wrote = await this.putIfUnchanged(row.revision ?? 0, {
         ...row,
         status: exhausted ? 'dead_letter' : 'queued',
@@ -963,7 +1050,7 @@ export class S2sLedger extends Service {
           ? reason + ' — giving up after ' + (row.attempts ?? 0) + ' attempt(s) (maxRetries '
             + (row.maxRetries ?? 0) + ')'
           : reason,
-        nextAttemptAt: now,
+        nextAttemptAt,
         updatedAt: now,
       })
       if (wrote) outcome = { outcome: exhausted ? 'dead-lettered' : 'rolled-back' }
@@ -1055,7 +1142,7 @@ export class S2sLedger extends Service {
    * not to check the branch at all. An absolute qualifier has to be enumerable
    * branch-by-branch, or it is an unverified universal claim wearing a fact's clothes.
    */
-  async claimDelivery(msgId: string): Promise<DeliveryClaim> {
+  async claimDelivery(msgId: string, opts: { now?: number } = {}): Promise<DeliveryClaim> {
     const domain = this.opened()
     const table = domain.table(MESSAGES_TABLE)
     const row = table.get(msgId)
@@ -1064,8 +1151,61 @@ export class S2sLedger extends Service {
     if (row.status === 'inboxed' || row.status === 'landed' || row.status === 'consumed') return { decision: 'refuse', reason: 'delivered' }
     if (row.status === 'delivering') return { decision: 'refuse', reason: 'in-flight' }
     if (row.status !== 'queued') return { decision: 'refuse', reason: 'not-queued' }
+    // T18, the consumer of `nextAttemptAt`. This check is the whole reason that
+    // field exists: before it, the backoff instant was written by
+    // `markAttemptFailed` and read by nothing, so a "backoff" that never delayed
+    // anything was indistinguishable from no backoff at all.
+    //
+    // Placement matters. It sits AFTER every permanent refusal, so a row that is
+    // terminal or already delivered is still refused for that reason rather than
+    // for its clock — otherwise a dead-lettered row with a future stamp would
+    // report `backoff` and a caller would re-queue it forever. And it sits BEFORE
+    // the CAS, so a not-yet-due row is never dragged into `delivering`: spending
+    // an attempt (and incrementing `attempts` toward the dead-letter limit) on a
+    // retry that was already scheduled to wait would exhaust a message's retries
+    // while it was still adhering to its own schedule.
+    //
+    // `now` is injectable for the same reason `tick()`'s is: the decision is about
+    // a clock, and a test that had to sleep for the real backoff would be slow and
+    // flaky instead of exact.
+    const now = opts.now ?? Date.now()
+    if (!dueByClock(row, now)) return { decision: 'refuse', reason: 'backoff' }
     const won = await this.markDelivering(msgId)
     return won ? { decision: 'deliver', reason: 'claimed' } : { decision: 'refuse', reason: 'cas-lost' }
+  }
+
+  /**
+   * Read-only "is this row's retry due right now?" (T18, used by T19).
+   *
+   * This is **not** a substitute for {@link claimDelivery} and must never be used
+   * as the delivery decision: it changes no state, so two callers can both get
+   * `true` and both go on to deliver. Its one job is to let a caller decide
+   * whether an entry is worth *taking* — the mailbox filter in `lifecycle` uses it
+   * to skip entries whose retry is still in the future **without removing them
+   * from disk**.
+   *
+   * Why that matters concretely: the obvious alternative was to let the drain take
+   * every entry and re-enqueue the not-due ones. But `mailbox.drain()` deletes each
+   * file as it reads it, so "take then put back" opens a crash window between the
+   * delete and the rewrite. Dying inside it leaves a message with no mailbox file
+   * and a ledger row still `queued` — and `recoverInterrupted()` only repairs
+   * `delivering` rows, so nothing would ever look for it again. That is the
+   * "permanently stalled" state this batch exists to remove, re-created every backoff
+   * interval. Answering the question before taking removes the window instead of
+   * narrowing it.
+   *
+   * `true` for a missing row is deliberate, not defensive: the message was never
+   * recorded, and bookkeeping must not outrank delivery (T6b). `true` for a
+   * non-`queued` row is also deliberate — the real answer for those is a *reason*
+   * (`terminal` / `delivered` / `in-flight`), which only the gate can report, so
+   * the filter must let them through and let the gate say why.
+   */
+  async isDue(msgId: string, now: number = Date.now()): Promise<boolean> {
+    const domain = this.opened()
+    const row = domain.table(MESSAGES_TABLE).get(msgId)
+    if (row === undefined) return true
+    if (row.status !== 'queued') return true
+    return dueByClock(row, now)
   }
 
   /**
