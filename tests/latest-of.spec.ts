@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { S2sDiscoveryService } from '../src/discovery.ts'
+import { buildTools } from '../src/tools.ts'
 
 /**
  * T16 — `latest_of` addressing.
@@ -51,6 +52,127 @@ async function mount(options: {
   await ctx.plugin(S2sDiscoveryService)
   return ctx.get('s2sDiscovery') as S2sDiscoveryService
 }
+
+/**
+ * Drive `s2s_latest` **through the tool surface** (T16 reachability).
+ *
+ * ★ Why this exists, spelled out because it is the whole point of the batch:
+ * every other case in this file calls `discovery.resolveLatestOf()` DIRECTLY.
+ * That proved the method correct while the defect — no production path from the
+ * model to the method — went unnoticed: the method shipped in `lib/index.js`
+ * with 13 green cases and **zero call sites**.
+ *
+ * ★ And this is not a theoretical argument: the FIRST draft of these cases fed
+ * three sessions all titled "主干" and got back
+ * `Multiple sessions named "主干". Disambiguate with session_id: a / b / c`.
+ * That is correct behaviour — the anchor goes through the same exact-title
+ * resolution as every other tool, so a duplicate title refuses rather than
+ * guessing which lineage to search. A method-level test calling
+ * `resolveLatestOf(['a','b','c'])` **cannot see the anchor-resolution step at
+ * all**, so it could never have found this. That is the concrete case for
+ * "at least one case must go through the tool surface".
+ */
+async function viaTool(options: Parameters<typeof mount>[0], args: { name?: string; session_id?: string; current?: string }) {
+  const discovery = await mount(options)
+  // buildTools needs a ctx for logging/ledger lookups that s2s_latest never
+  // touches; a bare Context is enough and keeps this case free of the ledger.
+  const ctx = new Context()
+  ctx.logger.warn = vi.fn() as never
+  const defs = buildTools({ ctx, broker: { history: () => [] } as never, discovery })
+  const tool = defs.find(d => d.name === 's2s_latest')
+  if (tool === undefined) throw new Error('s2s_latest is not registered — the tool surface gap is back')
+  const out = await tool.execute(args as never, { agent: { id: 'sess-caller' } } as never)
+  return { text: (out as { text: string }).text, defs }
+}
+
+describe('T16 reachability — the tool surface', () => {
+  it('★ s2s_latest is registered, and executing it returns the newest lineage member', async () => {
+    // ★ The anchor must have a UNIQUE title: `s2s_latest` resolves its anchor
+    // through the same exact-title path as every other tool, so three sessions
+    // all titled "主干" make the ANCHOR ambiguous and the call never reaches the
+    // lineage search. That is correct behaviour (an ambiguous anchor could mean
+    // the wrong lineage), and this test's first draft got it wrong — which is
+    // itself the point of driving the tool surface: a direct-call test on
+    // `resolveLatestOf(['a','b','c'])` cannot see the anchor-resolution step at
+    // all. The lineage is anchored on `a` (titled "原型") and contains a/b/c.
+    const { text, defs } = await viaTool({
+      records: [rec('a', '原型', 100), rec('b', '继承者', 300), rec('c', '中间态', 200)],
+      titles: { a: '原型', b: '继承者', c: '中间态' },
+      lineage: lineageOf(['a', 'b', 'c']),
+      archived: [],
+    }, { name: '原型' })
+
+    // The registration half: the name must exist on the surface at all.
+    expect(defs.map(d => d.name)).toContain('s2s_latest')
+    // The wiring half: the rendered text must carry the session the service
+    // picked. A stubbed `execute` would fail here even with the tool registered.
+    expect(text).toContain('Latest in the lineage of')
+    expect(text).toContain('b')
+    expect(text).toContain('chosen from 3 eligible rankable member(s)')
+  })
+
+  it('an ambiguous ANCHOR is refused rather than searching a guessed lineage', async () => {
+    // Three sessions share the anchor title. The tool must stop at the ambiguity
+    // instead of picking one and reporting a confident "latest".
+    const { text } = await viaTool({
+      records: [rec('a', '主干', 100), rec('b', '主干', 300)],
+      titles: { a: '主干', b: '主干' },
+      lineage: lineageOf(['a', 'b']),
+      archived: [],
+    }, { name: '主干' })
+    expect(text).toContain('Multiple sessions named')
+    expect(text).not.toContain('Latest in the lineage of')
+  })
+
+  it('★ the `current` argument actually reaches the service (translation, not just wiring)', async () => {
+    // Deliberately chosen so the WRONG answer is the most attractive one: `b` is
+    // the newest, and a tool that dropped `current` would return exactly that.
+    const { text } = await viaTool({
+      records: [rec('a', '原型', 100), rec('b', '继承者', 300)],
+      titles: { a: '原型', b: '继承者' },
+      lineage: lineageOf(['a', 'b']),
+      archived: [],
+    }, { name: '原型', current: 'b' })
+
+    // `a` is the only remaining member once `b` is excluded.
+    expect(text).toContain('Latest in the lineage of')
+    expect(text).toContain('chosen from 1 eligible rankable member(s)')
+  })
+
+  it('★ a miss rendered through the tool names its own cause (G9 at the receipt level)', async () => {
+    // No `s2sLineage` service mounted: the tool must say the SERVICE is
+    // unavailable, not that the session has no lineage. Those two read
+    // identically from a silent fallback, and only the receipt tells them apart.
+    //
+    // ★ The reason is `lineage-service-absent`, NOT `session-query-absent` — the
+    // two are different layers and the first draft of this case conflated them:
+    // `session-query-absent` is what S2sLineage reports when the HOST lacks
+    // `sessionQuery`; `lineage-service-absent` is what discovery reports when the
+    // PLUGIN lacks `s2sLineage`. Here only the plugin service is missing, so the
+    // outer reason is the right one — and asserting the inner one would have been
+    // an assertion about a path this test never reaches.
+    const { text } = await viaTool({
+      records: [rec('a', '原型', 100)],
+      titles: { a: '原型' },
+      archived: [],
+    }, { name: '原型' })
+    expect(text).toContain('lineage service is unavailable')
+    expect(text).toContain('lineage-service-absent')
+    expect(text).toContain('NOT "this session has no lineage"')
+  })
+
+  it('a policy-unavailable miss says it is NOT "no archived sessions"', async () => {
+    const { text } = await viaTool({
+      records: [rec('a', '原型', 100)],
+      titles: { a: '原型' },
+      lineage: lineageOf(['a']),
+      // no workspaceRegistry ⇒ archive policy unavailable
+    }, { name: '原型' })
+    expect(text).toContain('policy is UNAVAILABLE')
+    expect(text).toContain('registry-absent')
+    expect(text).toContain('NOT "no archived sessions"')
+  })
+})
 
 describe('T16 latest_of — ranking by createdAt', () => {
   it('picks the newest eligible member of the lineage', async () => {

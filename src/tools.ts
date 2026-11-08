@@ -16,6 +16,7 @@ import type { S2sScheduleService } from './schedule.ts'
 import { noteLedger, readLedger, type S2sLedger } from './ledger.ts'
 import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
+import type { S2sLatestOfResult } from './discovery.ts'
 import { readHistory } from './history.ts'
 import { ledgerDiagnostics, readDrainRefusalOutcomes, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
 
@@ -85,6 +86,72 @@ function displayResolve(resolved: Extract<S2sResolveResult, { kind: 'not-found' 
     return 'No session named "' + resolved.name + '" (a rename becomes visible after the next title checkpoint; list actual names with s2s_sessions). Names must match EXACTLY or be a unique TITLE PREFIX.\n' + lines.join('\n')
   }
   return 'Multiple sessions named "' + resolved.name + '". Disambiguate with session_id:\n' + resolved.candidates.map(function(c) { return '- ' + c.sessionId + ' (' + c.workspaceDir + ')' }).join('\n')
+}
+
+/**
+ * Render a `latest_of` result (T16).
+ *
+ * G9 (no silent degradation) drives the shape: every miss names its own cause,
+ * because "not found" alone would merge four situations whose correct responses
+ * differ — fix the name, mount the lineage service, fix the policy wiring, or
+ * accept that the lineage has no rankable member. The receipt also reports the
+ * members it could NOT rank and the lineage members absent from the corpus, since
+ * both are facts a caller needs to tell "the lineage is a single session" from
+ * "I could not compare the members I found".
+ *
+ * @param result - what `resolveLatestOf` returned.
+ * @param requested - the caller's own spelling, echoed back on a miss.
+ * @param anchorId - the session the lineage was anchored on, for the receipt.
+ */
+function renderLatestOf(result: S2sLatestOfResult, requested: string, anchorId: string): string {
+  // One formatter for the two facts that are true of both the ok and the
+  // not-found shapes — kept as a plain function of the parts rather than of the
+  // union, so a miss does not have to fabricate a fake `ok` object to reuse it.
+  const extras = function(unrankable: readonly string[] | undefined, notInCorpus: readonly string[] | undefined, complete: boolean): string {
+    const out: string[] = []
+    if (unrankable !== undefined && unrankable.length > 0) {
+      out.push('  unrankable (no usable createdAt, never chosen): ' + unrankable.join(', '))
+    }
+    if (notInCorpus !== undefined && notInCorpus.length > 0) {
+      out.push('  in the lineage trace but absent from the session corpus: ' + notInCorpus.join(', '))
+    }
+    if (!complete) {
+      // T15's `complete: false`: the chain was not followed to its root, so the
+      // candidate set may be incomplete. Saying so is the difference between
+      // "this is the newest of the family" and "this is the newest I could see".
+      out.push('  NOTE: the lineage could NOT be traced to its root, so newer members may exist outside the known chain.')
+    }
+    return out.join('\n')
+  }
+  if (result.kind === 'ok') {
+    const who = result.title === undefined ? result.sessionId : result.title + ' (' + result.sessionId + ')'
+    const lines = [
+      'Latest in the lineage of "' + anchorId + '": ' + who,
+      '  state=' + result.state + '  createdAt=' + new Date(result.createdAt).toISOString() + '  ws=' + result.workspaceDir,
+      '  chosen from ' + result.candidateCount + ' eligible rankable member(s)  |  lineage complete=' + result.lineageComplete,
+    ]
+    const more = extras(result.unrankable, result.notInCorpus, result.lineageComplete)
+    if (more.length > 0) lines.push(more)
+    return lines.join('\n')
+  }
+  if (result.kind === 'policy-unavailable') {
+    return 'Cannot resolve latest_of: the target policy is UNAVAILABLE (' + result.reason + '). This is NOT "no archived sessions" — the archived-session filter could not be read, so eligibility cannot be judged. Failing closed.'
+  }
+  if (result.kind === 'lineage-unavailable') {
+    return 'Cannot resolve latest_of: the lineage service is unavailable (' + result.reason + '). This is NOT "this session has no lineage" — the lineage question could not be answered in this process.'
+  }
+  // not-found: every branch names its reason.
+  const byReason: Record<string, string> = {
+    'empty-name': 'No anchor given: supply a name or session_id. The lineage search needs a member to anchor on.',
+    'anchor-not-found': 'No session titled "' + requested + '" exists, so no lineage could be anchored. Titles must match EXACTLY (this tool does not prefix-match an anchor — an approximation would search the WRONG lineage and report success).',
+    'no-ranked-member': 'The lineage was traced, but no eligible member carried a usable createdAt, so nothing could be ranked. Members seen but unrankable are listed below — none of them was chosen.',
+  }
+  const head = byReason[result.reason] ?? ('latest_of produced no session (' + result.reason + ').')
+  const lines = [head]
+  if (result.candidates.length > 0) lines.push(describeCandidates([...result.candidates]).join('\n'))
+  const more = extras(result.unrankable, result.notInCorpus, result.lineageComplete ?? false)
+  if (more.length > 0) lines.push(more)
+  return lines.join('\n')
 }
 
 function buildThread(broker: S2sBroker, from: string, to: string): S2sThreadEntry[] {
@@ -344,6 +411,41 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
         const { rows, note } = applyTargetPolicyToList(sessions, args)
         if (rows.length === 0) return { text: 'No sessions found.' + note }
         return { text: rows.map(function(r) { const s = r.info; return r.line + '  ws=' + s.workspaceDir + (s.lastActivity === undefined ? '' : '  last=' + new Date(s.lastActivity).toISOString()) }).join('\n') + note }
+      },
+    }),
+    // T16 reachability: `latest_of` needs a TOOL, not just a service method.
+    //
+    // The measured defect this fixes: `resolveLatestOf()` shipped with 13 green
+    // cases, was present in `lib/index.js`, and had **zero call sites** — every
+    // one of those 13 tests called `discovery.resolveLatestOf()` directly. So the
+    // tests proved the method was correct while the product path from the model
+    // to that method did not exist at all. "In the bundle" and "reachable" are
+    // two different facts; only this tool makes the second one true.
+    //
+    // A SEPARATE tool rather than an option on `resolve()`/`s2s_message` on
+    // purpose: `resolve()` answers "which session does this NAME mean", while
+    // `latest_of` answers "which member of this LINEAGE is newest". Their inputs
+    // differ (a name vs a lineage plus an exclusion), and folding the second into
+    // the first would change the default semantics that 552 existing cases pin.
+    defineTool({
+      name: 's2s_latest',
+      description: 'Resolve the NEWEST session in a lineage. Anchor on any member by NAME (exact title) or session_id; the server traces that session\'s lineage through the host and returns the most recently created eligible member. Use this after a handover so a message goes to the successor, not the session that was replaced. Ranked by the session header\'s createdAt; members with no usable createdAt are reported as unrankable and never chosen. Read-only: it addresses, it does not send.',
+      parameters: {
+        name: { type: 'string', description: 'Anchor session title (exact, from s2s_sessions). The lineage is the search space.' },
+        session_id: { type: 'string', description: 'Fallback anchor: exact session id, when the title is ambiguous or unknown.' },
+        current: { type: 'string', description: 'Optional session id to EXCLUDE from the result — the "give me some OTHER member" case (e.g. the caller\'s own id).' },
+      },
+      output: OUTPUT,
+      execute: async function(args) {
+        // Resolve the anchor through the SAME path every other tool uses, so the
+        // T30 target policy applies identically. An anchor that is archived or a
+        // subagent is refused here rather than silently yielding a lineage.
+        const anchor = await resolve(args.name, args.session_id)
+        if (anchor.kind === 'err') return { text: anchor.reason }
+        if (anchor.kind !== 'ok') return { text: displayResolve(anchor) }
+        const current = args.current
+        const result = await discovery.resolveLatestOf(labelOf(anchor), current === undefined ? {} : { current: current })
+        return { text: renderLatestOf(result, args.name ?? args.session_id ?? '', anchor.sessionId) }
       },
     }),
     defineTool({
