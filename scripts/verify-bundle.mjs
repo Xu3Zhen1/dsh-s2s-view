@@ -78,6 +78,16 @@ const CLIENT_REQUIRED = [
   { marker: 'dsw-alias-bg-layer-2', why: 'panel surface from the framework palette, not a missing --dsh-*' },
   { marker: 'dsw-specific-bubble', why: 'message card fill from the framework bubble token' },
   { marker: 'border-radius:8px', why: 'message card frame (a frame around each message, not a divider between)' },
+  // T20: the panel is driven by the host's change stream. These three markers
+  // name the properties that make the claim checkable from the outside, and each
+  // one is a fact that a rewrite could silently undo:
+  { marker: '/api/s2s-history/events', why: 'T20: the panel subscribes to the change stream (not a 5s poll)' },
+  { marker: "'feed.live'", why: 'T20: the panel SAYS it is event-driven, so "quiet" and "disabled" differ' },
+  { marker: "'feed.polling'", why: 'T20: the degraded fallback is reported, not silent (G9)' },
+  // ★ Negative marker: the old 5s poll constant must be GONE. `FEED_FALLBACK_MS`
+  // replaced it, and re-introducing a 5s timer is exactly the regression L1568
+  // forbids. Checked as an absence because that is what the spec states.
+  { marker: 'FEED_REFRESH_MS', why: 'T20: the 5s poll constant must NOT be present', absent: true },
 ]
 
 let clientFailed = false
@@ -102,10 +112,19 @@ if (!existsSync(clientPath)) {
     clientFailed = true
   }
 
-  const clientMissing = CLIENT_REQUIRED.filter(({ marker }) => !client.includes(marker))
+  const clientMissing = CLIENT_REQUIRED.filter(({ marker, absent }) => {
+    const present = client.includes(marker)
+    // `absent: true` inverts the check: the marker names something that must NOT
+    // be there (the retired 5s poll constant). Without the inversion the list
+    // could only ever assert presence, and "the poll is gone" — which is the
+    // actual M5 exit condition — would be unrepresentable.
+    return absent === true ? present : !present
+  })
   if (clientMissing.length > 0) {
-    console.error('verify-bundle: lib/client.js is missing markers:')
-    for (const { marker, why } of clientMissing) console.error(`  - ${marker}  (${why})`)
+    console.error('verify-bundle: lib/client.js markers are wrong:')
+    for (const { marker, why, absent } of clientMissing) {
+      console.error(`  - ${marker}  (${why})${absent === true ? '  [unexpectedly PRESENT]' : '  [missing]'}`)
+    }
     clientFailed = true
   }
 
@@ -130,6 +149,20 @@ const hostSourcePath = join(root, 'src', 'host', 'index.js')
 const hostOutPath = join(root, 'lib', 's2s-history-host.mjs')
 let hostHalfFailed = false
 
+/**
+ * Properties of the host half that must survive a rewrite (T20).
+ *
+ * The byte comparison above already proves the file matches its source; these
+ * markers name WHY the change exists, so a future edit that keeps the bytes
+ * self-consistent but drops a signal fails here.
+ */
+const HOST_HALF_REQUIRED = [
+  { marker: "'domain/changed'", why: 'T20 signal 1: the ledger subscription is wired' },
+  { marker: "'session/event'", why: 'T20 signal 2: conversation growth is wired (the deliberate widening)' },
+  { marker: 'text/event-stream', why: 'T20: the change route answers as a stream, not a one-shot JSON' },
+  { marker: 'event: ready', why: 'T20: the opening frame proves the subscriber is IN this build (G9)' },
+]
+
 if (!existsSync(hostOutPath)) {
   console.error('verify-bundle: lib/s2s-history-host.mjs is MISSING — run: npm run build:client')
   hostHalfFailed = true
@@ -145,8 +178,14 @@ if (!existsSync(hostOutPath)) {
   } else {
     console.log(
       `verify-bundle: ok — lib/s2s-history-host.mjs matches source`
-      + ` (${Buffer.byteLength(hostOut)} bytes)`,
+      + ` (${Buffer.byteLength(hostOut)} bytes, ${HOST_HALF_REQUIRED.length} markers present)`,
     )
+    const hostMissing = HOST_HALF_REQUIRED.filter(({ marker }) => !hostOut.includes(marker))
+    if (hostMissing.length > 0) {
+      console.error('verify-bundle: lib/s2s-history-host.mjs is missing markers:')
+      for (const { marker, why } of hostMissing) console.error(`  - ${marker}  (${why})`)
+      hostHalfFailed = true
+    }
   }
 }
 

@@ -40,6 +40,58 @@ export const inject = ['connection', 'sessionQuery']
 /** Exact route below `/api`; the browser half asks for this same path. */
 const ROUTE = '/api/s2s-history/messages'
 
+/**
+ * Exact route the browser half opens to be TOLD when to re-read.
+ *
+ * ## Why this cannot subscribe to `domain/changed` on the browser side
+ *
+ * `domain/changed` is an in-process Host event (`dsh-storage-domain`'s writes
+ * emit it on the Host context). The browser can only observe Host events listed
+ * in `API_REMOTE_FORWARDED_EVENTS` (`dsh-api-remotes/src/remote-events.ts`), and
+ * that array does not contain it — forwarding one more event is a change to the
+ * DSH packages themselves, not to this repo. So the subscription has to happen
+ * HERE, in the same process as the ledger, and the browser learns about it over
+ * an ordinary HTTP stream.
+ *
+ * ## Why two signals and not one
+ *
+ * The ledger only records s2s deliveries. The panel's message tab renders
+ * ordinary conversation, which appends to a session log WITHOUT touching the
+ * ledger — so a ledger-only signal would leave the panel stale exactly when the
+ * user is typing. Both signals are therefore wired:
+ *
+ *   `domain/changed`  (domain `s2s`) — a delivery changed state
+ *   `session/event`   (message types, append surface only) — a conversation grew
+ *
+ * ★ This is a deliberate WIDENING of plan §14 T20 ("panel driven by
+ * `domain/changed`"), recorded as such rather than passed off as the literal
+ * spec: the literal reading would make the panel miss ordinary turns.
+ */
+const EVENTS_ROUTE = '/api/s2s-history/events'
+
+/** Exported so a test can pin the literal the browser half hard-codes. */
+export { EVENTS_ROUTE }
+
+/** The ledger's domain name; a change to any other domain is not ours. */
+const LEDGER_DOMAIN = 's2s'
+
+/**
+ * Idle comment interval, in ms.
+ *
+ * A stream with no traffic is indistinguishable from a dropped carrier, and a
+ * half-open socket would leave the panel frozen with no error. `25s` sits under
+ * the common 30s idle-proxy timeout and costs one comment per period.
+ */
+const KEEPALIVE_MS = 25_000
+
+/**
+ * How many concurrent streams this Host will hold.
+ *
+ * One per open panel is the design; the cap exists so a reload loop (or several
+ * browser windows) cannot grow an unbounded set of timers and closures.
+ */
+const MAX_STREAMS = 8
+
 /** Conversations one request may read; the panel pages through the rest. */
 const MAX_SESSIONS_PER_REQUEST = 8
 
@@ -54,6 +106,21 @@ const CACHE_MAX_ENTRIES = 64
 
 /** Event types that carry conversation text. */
 const MESSAGE_TYPES = new Set(['user/message', 'assistant/message'])
+
+/**
+ * Whether one session event is something the feed would render.
+ *
+ * Deliberately the SAME predicate {@link recordsOf} applies, so "the panel was
+ * told to re-read" and "the re-read has something new" cannot drift apart: a
+ * replacement op rewrites an earlier surface entry instead of adding a turn, and
+ * machinery events carry no conversation text.
+ * @param {object} event - one appended session event.
+ * @returns {boolean} true when the feed would show it.
+ */
+function isFeedWorthy(event) {
+  if (!MESSAGE_TYPES.has(event.type)) return false
+  return event.surfaceOp === undefined || event.surfaceOp === 'append'
+}
 
 /** Session ids this route will read; anything else is dropped, not escaped. */
 const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
@@ -87,6 +154,20 @@ function recordsOf(events) {
 export function apply(ctx) {
   /** @type {Map<string, { at: number, records: object[] }>} */
   const cache = new Map()
+
+  /**
+   * Live change streams, one per open panel.
+   *
+   * Each entry owns a controller whose `close()` tears down the stream; the Set
+   * exists so plugin unload can close every one of them (a fibre disposed while
+   * a browser is still holding a socket would otherwise leave the stream open
+   * forever — the browser sees a connection that never delivers).
+   * @type {Set<{ close: () => void, signal: (reason: string) => void }>}
+   */
+  const streams = new Set()
+
+  /** Counters behind the "no silent degradation" rule (G9). */
+  const streamStats = { opened: 0, closed: 0, refused: 0, ledgerSignals: 0, sessionSignals: 0 }
 
   const readCached = async (sessionId) => {
     const hit = cache.get(sessionId)
@@ -136,6 +217,112 @@ export function apply(ctx) {
     return Response.json({ sessions }, { headers: { 'cache-control': 'no-store' } })
   }
 
+  /** Encoder for the change stream; one instance, these frames are tiny. */
+  const encoder = new TextEncoder()
+
+  /**
+   * Open one change stream for a browser panel.
+   *
+   * The opening frame is NOT decoration. It states, unconditionally, that the
+   * route is mounted and both Host subscriptions are attached — which is the
+   * only way a reader can tell "nothing changed yet" from "this build has no
+   * subscriber at all". Those two states are otherwise identical (no traffic),
+   * and that ambiguity is exactly what G9 forbids leaving silent.
+   * @param {Request} request - the browser's stream request.
+   * @returns {Promise<Response>} an open event stream.
+   */
+  const openStream = async (request) => {
+    if (streams.size >= MAX_STREAMS) {
+      streamStats.refused += 1
+      return new Response(
+        `s2s-history: ${String(MAX_STREAMS)} change streams are already open `
+        + `(opened=${String(streamStats.opened)} closed=${String(streamStats.closed)} `
+        + `refused=${String(streamStats.refused)})`,
+        { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } },
+      )
+    }
+
+    let heartbeat
+    let entry
+    const body = new ReadableStream({
+      start(controller) {
+        let open = true
+        const write = (frame) => {
+          if (!open) return
+          try {
+            controller.enqueue(encoder.encode(frame))
+          } catch {
+            // The reader went away between the abort signal and this write.
+            open = false
+          }
+        }
+        const finish = () => {
+          if (!open) return
+          open = false
+          if (heartbeat !== undefined) clearInterval(heartbeat)
+          streams.delete(entry)
+          streamStats.closed += 1
+          try {
+            controller.close()
+          } catch {
+            // Already closed by the carrier.
+          }
+        }
+
+        entry = {
+          close: finish,
+          signal: (reason, sessionId) => {
+            if (reason === 'ledger') streamStats.ledgerSignals += 1
+            if (reason === 'session') streamStats.sessionSignals += 1
+            // The session id rides along so the panel can tell "one of the
+            // conversations I am showing grew" from "something unrelated moved"
+            // without a round trip. `reason` stays because the two signals mean
+            // different things: a ledger write changed a delivery's state, an
+            // append added conversation text.
+            const data = sessionId === undefined ? { reason } : { reason, sessionId }
+            write(`event: change\ndata: ${JSON.stringify(data)}\n\n`)
+          },
+        }
+        streams.add(entry)
+        streamStats.opened += 1
+
+        write('retry: 3000\n')
+        write(`event: ready\ndata: ${JSON.stringify({
+          wired: { 'domain/changed': LEDGER_DOMAIN, 'session/event': 'message+append' },
+          streams: { open: streams.size, max: MAX_STREAMS },
+          counts: { ...streamStats },
+        })}\n\n`)
+
+        // An idle stream and a dead carrier look the same from the browser, so
+        // the stream says something on a schedule.
+        heartbeat = setInterval(() => { write(': keepalive\n\n') }, KEEPALIVE_MS)
+        if (typeof heartbeat === 'object' && heartbeat !== null && 'unref' in heartbeat) {
+          heartbeat.unref()
+        }
+
+        // The carrier aborts the request when the socket closes; that is the one
+        // signal that fires for a browser tab the user simply closed.
+        if (request.signal !== undefined) {
+          request.signal.addEventListener('abort', finish, { once: true })
+        }
+      },
+      cancel() {
+        // Reader cancelled (navigating away without an abort): same teardown.
+        if (entry !== undefined) entry.close()
+      },
+    })
+
+    return new Response(body, {
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        // `no-store` keeps a proxy from buffering the whole stream, and the
+        // explicit `no-transform`/keep-alive pair says the same thing to caches.
+        'cache-control': 'no-store, no-transform',
+        'x-accel-buffering': 'no',
+      },
+    })
+  }
+
   // `requestBody: 'buffered'` is REQUIRED, not decorative. The Connection
   // shared handler resolves `requestBodyMode` as `route.requestBody` for a
   // matched exact route and only falls back to `'buffered'` for UNMATCHED
@@ -153,5 +340,77 @@ export function apply(ctx) {
       fetch,
     }),
     's2s-history-host: read-only route',
+  )
+
+  // ---------------------------------------------------------------------------
+  // Signal 1: the ledger (plan §14 T20, taken literally).
+  //
+  // `domain/changed` fires once per durable domain write, after the backend
+  // acknowledged durability, in write-chain order. Only the `s2s` domain is ours;
+  // any other domain's write is not a reason to re-read the panel.
+  // ---------------------------------------------------------------------------
+  ctx.effect(
+    () => ctx.on('domain/changed', (change) => {
+      if (change === undefined || change === null) return
+      if (change.domain !== LEDGER_DOMAIN) return
+      for (const stream of streams) stream.signal('ledger')
+    }),
+    's2s-history-host: ledger change signal',
+  )
+
+  // ---------------------------------------------------------------------------
+  // Signal 2: conversation growth (the deliberate widening of T20 — see
+  // EVENTS_ROUTE's comment for why a ledger-only signal would leave the panel
+  // stale while the user is typing).
+  //
+  // `session/event` is the post-commit append feed: callbacks run after the log
+  // push, and a listener failure is contained, so this cannot make an append
+  // fail. The predicate is shared with `recordsOf`, so the signal and the payload
+  // agree by construction.
+  // ---------------------------------------------------------------------------
+  ctx.effect(
+    () => ctx.on('session/event', (session, event) => {
+      if (event === undefined || event === null) return
+      if (!isFeedWorthy(event)) return
+      const sessionId = session === undefined || session === null ? undefined : session.id
+      for (const stream of streams) stream.signal('session', sessionId)
+    }),
+    's2s-history-host: session append signal',
+  )
+
+  // ---------------------------------------------------------------------------
+  // The stream route itself.
+  //
+  // `requestBody` is NOT passed here: `ConnectionFetchRoute` on this host
+  // (`@deepseek-ai/dsh-client-connection` 0.1.2-rc.1) declares only `path`,
+  // `methods` and `fetch`, and neither `lib/index.js` nor its browser face reads
+  // any `requestBody` property — the HTTP bridge attaches a body only when the
+  // incoming request actually carried one (`...chunks.length > 0 ? { body } : {}`).
+  // That makes this a GET with no body, which is what the stream wants.
+  //
+  // ★ The neighbouring `/messages` route above still passes `requestBody:
+  // 'buffered'` and its comment claims the field is REQUIRED. That mechanism was
+  // measured absent on this host version; the field is harmless and left alone
+  // (out of scope for this batch), but nobody should read that comment as an
+  // explanation of anything.
+  // ---------------------------------------------------------------------------
+  ctx.effect(
+    () => ctx.connection.fetch.register({
+      path: EVENTS_ROUTE,
+      methods: ['GET'],
+      fetch: openStream,
+    }),
+    's2s-history-host: change stream route',
+  )
+
+  // Disposing the plugin must close every stream it opened: a disposed fibre with
+  // a live socket leaves the browser holding a connection that will never deliver
+  // again, and nothing on either side would report it.
+  ctx.effect(
+    () => () => {
+      for (const stream of [...streams]) stream.close()
+      streams.clear()
+    },
+    's2s-history-host: stream teardown',
   )
 }

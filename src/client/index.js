@@ -40,13 +40,35 @@
     const FEED_RENDER_LIMIT = 400
 
     /**
-     * How often the open feed re-reads the conversations it already holds.
+     * Exact host route that TELLS the feed when to re-read.
      *
-     * The host half caches each conversation for a few seconds, so polling
-     * faster than that only re-reads the cache; this is the interval at which
-     * new traffic can actually appear.
+     * The feed used to poll this panel's own 5s timer. That is gone: the host
+     * half subscribes to the in-process change events and pushes one frame per
+     * change over this stream (see `src/host/index.js` for why the subscription
+     * cannot live in the browser — `domain/changed` is not among the Host events
+     * the browser is allowed to receive).
      */
-    const FEED_REFRESH_MS = 5_000
+    const EVENTS_ROUTE = '/api/s2s-history/events'
+
+    /**
+     * Fallback re-read interval, in ms — used ONLY when the stream is not usable.
+     *
+     * Not a poll: a `null` value here means "the stream negotiated and we are
+     * event-driven". This exists so a host half that is absent, or a browser
+     * without `EventSource`/`fetch` streaming, degrades to a working panel
+     * instead of one that never updates. G9: the degradation is reported in the
+     * status line, never silent.
+     */
+    const FEED_FALLBACK_MS = 15_000
+
+    /**
+     * Longest a stream may stay silent before it is treated as dead, in ms.
+     *
+     * The host sends a comment every 25s, so 3 missed periods means the carrier
+     * is gone even if `onerror` never fired (a half-open socket does exactly
+     * that). Reconnecting is the only recovery the browser owns.
+     */
+    const STREAM_IDLE_MS = 80_000
 
     /** Per-message body cap. One huge tool dump must not bury the conversation. */
     const FEED_BODY_LIMIT = 1200
@@ -114,6 +136,8 @@
       'feed.s2sOnly': '只看 s2s',
       'feed.count': '{n} 条',
       'feed.noroute': '读取消息正文需要宿主半边 s2s-history-host（重启 dsh web 后生效）；索引页签不受影响。',
+      'feed.live': '实时 · 已收到 {n} 次变化通知',
+      'feed.polling': '降级：实时通道不可用，正按 {n}s 兜底重读',
       'feed.failed': '读取失败：{why}',
       'feed.retry': '重试',
     }
@@ -162,6 +186,8 @@
       'feed.s2sOnly': 's2s only',
       'feed.count': '{n}',
       'feed.noroute': 'Reading message bodies needs the host half (s2s-history-host); restart dsh web to mount it. The Index tab is unaffected.',
+      'feed.live': 'live · {n} change notices received',
+      'feed.polling': 'degraded: no live channel, re-reading every {n}s',
       'feed.failed': 'Read failed: {why}',
       'feed.retry': 'Retry',
     }
@@ -957,6 +983,118 @@
     }
 
     /**
+     * Subscribe to the host half's change stream.
+     *
+     * Returns a `mode` the panel renders:
+     * - `'events'`  — the stream opened and delivered its `ready` frame, so the
+     *                 feed is genuinely event-driven (no timer anywhere).
+     * - `'polling'` — the stream could not be used (host half absent, no
+     *                 `EventSource`, a non-2xx response), so a fallback interval
+     *                 is running. **Reported, never silent**: from the outside
+     *                 "no updates" and "updates are disabled" look identical.
+     * - `'idle'`    — not subscribed (the tab is not showing).
+     *
+     * `onChange` is called once per pushed frame. It is held in a ref so a new
+     * closure per render cannot tear down and reopen the connection.
+     * @param {object} React - React module.
+     * @param {boolean} active - whether the feed tab is showing.
+     * @param {Function} onChange - called for each change frame.
+     * @returns {{ mode: string, changes: number, lastReason: string, lastAt: number }} stream state.
+     */
+    function useChangeStream(React, active, onChange) {
+      const [state, setState] = React.useState({
+        mode: 'idle', changes: 0, lastReason: '', lastAt: 0,
+      })
+      const onChangeRef = React.useRef(onChange)
+      onChangeRef.current = onChange
+
+      React.useEffect(() => {
+        if (!active) {
+          setState(previous => (previous.mode === 'idle'
+            ? previous
+            : { ...previous, mode: 'idle' }))
+          return undefined
+        }
+        if (typeof EventSource !== 'function') {
+          // No stream seat at all. `polling` is the honest reading: the panel
+          // still updates, but something has to drive it, and the reader
+          // deserves to know that before trusting a "live" looking tab.
+          setState(previous => ({ ...previous, mode: 'polling' }))
+          return undefined
+        }
+
+        let closed = false
+        let source
+        try {
+          // `credentials: 'same-origin'` is EventSource's default and is what the
+          // `/api` fence expects: the same cookie every other call uses.
+          source = new EventSource(EVENTS_ROUTE)
+        } catch (error) {
+          setState(previous => ({ ...previous, mode: 'polling' }))
+          return undefined
+        }
+
+        const onReady = () => {
+          if (closed) return
+          setState(previous => ({ ...previous, mode: 'events' }))
+        }
+        const onChangeFrame = (message) => {
+          if (closed) return
+          let reason = ''
+          try {
+            const parsed = JSON.parse(message.data)
+            reason = parsed === null || typeof parsed !== 'object' ? '' : String(parsed.reason || '')
+          } catch (error) {
+            reason = ''
+          }
+          setState(previous => ({
+            ...previous,
+            mode: 'events',
+            changes: previous.changes + 1,
+            lastReason: reason,
+            lastAt: Date.now(),
+          }))
+          onChangeRef.current()
+        }
+        const onError = () => {
+          if (closed) return
+          // EventSource reconnects by itself (`retry:` frame from the host sets
+          // the delay); a CLOSED source never will, so that is the one case that
+          // drops to the fallback.
+          if (source.readyState === 2) setState(previous => ({ ...previous, mode: 'polling' }))
+        }
+
+        source.addEventListener('ready', onReady)
+        source.addEventListener('change', onChangeFrame)
+        source.addEventListener('error', onError)
+
+        return () => {
+          closed = true
+          source.removeEventListener('ready', onReady)
+          source.removeEventListener('change', onChangeFrame)
+          source.removeEventListener('error', onError)
+          source.close()
+        }
+      }, [active])
+
+      // A stream that negotiated and then went quiet is the one failure mode the
+      // browser cannot see: a half-open socket fires no `error`. Turning that
+      // into a visible `polling` reading is the whole point of this effect.
+      React.useEffect(() => {
+        if (state.mode !== 'events') return undefined
+        if (typeof setInterval !== 'function') return undefined
+        const timer = setInterval(() => {
+          if (Date.now() - state.lastAt > STREAM_IDLE_MS) {
+            setState(previous => (previous.mode === 'events' ? { ...previous, mode: 'polling' } : previous))
+          }
+        }, STREAM_IDLE_MS)
+        return () => { clearInterval(timer) }
+      }, [state.mode, state.lastAt])
+
+      return state
+    }
+
+    /**
      * Incremental message reader for the feed tab.
      *
      * Reading is driven by the user opening the tab rather than by mount: each
@@ -964,7 +1102,9 @@
      * the index only when someone is looking at it.
      *
      * While the tab stays open the feed re-reads the conversations it already
-     * holds on a timer. Without that, a panel left open is a photograph of the
+     * holds — but it no longer does so on its own timer (plan §14 T20). The push
+     * arrives from {@link useChangeStream}; this hook only exposes `refresh` for
+     * it to call. Without any refresh a panel left open is a photograph of the
      * moment it was opened: traffic that arrives afterwards never appears, and
      * watching a conversation you are actively messaging looks exactly like the
      * plugin "not recording new messages".
@@ -976,9 +1116,10 @@
      * @param {Array<object>} targets - readable conversations, newest first.
      * @param {Map<string,string>} senderIndex - session id → display label.
      * @param {boolean} active - whether the feed tab is showing.
+     * @param {boolean} polling - whether the fallback interval should run.
      * @returns {object} feed state plus its controls.
      */
-    function useFeed(React, targets, senderIndex, active) {
+    function useFeed(React, targets, senderIndex, active, polling) {
       const [state, setState] = React.useState({
         messages: [], failed: [], read: 0, phase: 'idle', error: null,
       })
@@ -1089,14 +1230,16 @@
         }
       }, [])
 
-      // Poll while the tab is visible so arriving traffic shows up without the
-      // user knowing to press refresh.
+      // Re-reading used to be a 5s poll here. It is now driven by the host's
+      // change stream (T20): `refresh` is exposed for `useChangeStream` to call,
+      // and the only timer left is the DEGRADED fallback — which runs ONLY when
+      // the stream reported that it could not carry the signal.
       React.useEffect(() => {
-        if (!active) return undefined
+        if (!active || !polling) return undefined
         if (typeof setInterval !== 'function') return undefined
-        const timer = setInterval(() => { void refresh() }, FEED_REFRESH_MS)
+        const timer = setInterval(() => { void refresh() }, FEED_FALLBACK_MS)
         return () => { clearInterval(timer) }
-      }, [active, refresh])
+      }, [active, polling, refresh])
 
       const reload = React.useCallback(() => {
         reset(targets)
@@ -1187,7 +1330,19 @@
       // without re-paging a cursor through a re-sorted array.
       const targets = React.useMemo(() => feedTargets(groups), [groups])
       const senders = React.useMemo(() => senderIndex(list), [list])
-      const feed = useFeed(React, targets, senders, open && tab === 'messages')
+      const feedActive = open && tab === 'messages'
+      // The refresh reader is held in a ref, created before the stream, so the
+      // stream's callback identity never has to change: a dependency on
+      // `feed.refresh` would resubscribe on every refresh.
+      const feedRefreshRef = React.useRef(() => {})
+      // Subscribed before the feed so the feed knows which mode to run in:
+      // `events` means no timer at all, `polling` means the signal is unavailable
+      // and the fallback interval carries it (G9: the reader is told which).
+      const stream = useChangeStream(React, feedActive, React.useCallback(() => {
+        feedRefreshRef.current()
+      }, []))
+      const feed = useFeed(React, targets, senders, feedActive, stream.mode === 'polling')
+      feedRefreshRef.current = feed.refresh
 
       return React.createElement(React.Fragment, null,
         React.createElement('button', {
@@ -1207,6 +1362,7 @@
             tab: tab,
             onTab: setTab,
             feed: feed,
+            stream: stream,
             showSubagents: showSubagents,
             onToggleSubagents: () => { setShowSubagents(value => !value) },
             onClose: () => { setOpen(false) },
@@ -1287,6 +1443,7 @@
               React: React,
               t: t,
               feed: props.feed,
+              stream: props.stream,
               openSession: openSession,
             })
             : React.createElement(React.Fragment, null,
@@ -1429,6 +1586,16 @@
       status.push(feed.phase === 'loading'
         ? fill(t('feed.loading'), { n: Math.min(FEED_BATCH, feed.remaining) })
         : fill(t('feed.loaded'), { s: feed.read, m: feed.messages.length, n: shown }))
+      // ★ Which mode is driving the re-read is part of the status, not a debug
+      // detail. "Live" and "quiet because updates are disabled" render the same
+      // otherwise — the reader would have no way to tell a working stream from a
+      // panel that is simply never told to re-read (G9).
+      const streamMode = props.stream === undefined ? 'idle' : props.stream.mode
+      if (streamMode === 'events') {
+        status.push(fill(t('feed.live'), { n: props.stream.changes }))
+      } else if (streamMode === 'polling') {
+        status.push(t('feed.polling', { n: Math.round(FEED_FALLBACK_MS / 1000) }))
+      }
       // Says what actually happened to the reader: the cap hides messages that
       // passed every filter. `feed.truncated` is a different fact (one BODY was
       // cut), and reusing it here described the wrong thing.
