@@ -70,14 +70,13 @@
      */
     const FEED_FALLBACK_MS = 15_000
 
-    /**
-     * Longest a stream may stay silent before it is treated as dead, in ms.
-     *
-     * The host sends a comment every 25s, so 3 missed periods means the carrier
-     * is gone even if `onerror` never fired (a half-open socket does exactly
-     * that). Reconnecting is the only recovery the browser owns.
-     */
-    const STREAM_IDLE_MS = 80_000
+    // There is deliberately no "stream has been silent for too long" threshold
+    // here. One used to live at this spot, justified as "the host sends a
+    // comment every 25s, so counting missed periods detects a half-open socket".
+    // That premise was false: the host's keepalive is an SSE comment line, and
+    // EventSource never surfaces comments, so the browser could not count those
+    // periods at all. The threshold therefore measured activity, not liveness,
+    // and an idle-but-healthy ledger was reported as a dead channel.
 
     /** Per-message body cap. One huge tool dump must not bury the conversation. */
     const FEED_BODY_LIMIT = 1200
@@ -1030,11 +1029,11 @@
      * @param {object} React - React module.
      * @param {boolean} active - whether the feed tab is showing.
      * @param {Function} onChange - called for each change frame.
-     * @returns {{ mode: string, changes: number, lastReason: string, lastAt: number }} stream state.
+     * @returns {{ mode: string, changes: number, lastReason: string, lastChangeAt: number }} stream state.
      */
     function useChangeStream(React, active, onChange) {
       const [state, setState] = React.useState({
-        mode: 'idle', changes: 0, lastReason: '', lastAt: 0,
+        mode: 'idle', changes: 0, lastReason: '', lastChangeAt: 0,
       })
       const onChangeRef = React.useRef(onChange)
       onChangeRef.current = onChange
@@ -1067,6 +1066,12 @@
 
         const onReady = () => {
           if (closed) return
+          // `ready` proves the channel negotiated; it does NOT prove anything
+          // about activity. Stamping `lastChangeAt` here would still expire: the frame
+          // arrives once per connection, so an idle-but-healthy panel would age
+          // out exactly like a dead one. Silence and death are distinguished by
+          // `readyState` in `onError`, never by elapsed time — see the watchdog
+          // note below for why elapsed time cannot carry that meaning here.
           setState(previous => ({ ...previous, mode: 'events' }))
         }
         const onChangeFrame = (message) => {
@@ -1083,7 +1088,7 @@
             mode: 'events',
             changes: previous.changes + 1,
             lastReason: reason,
-            lastAt: Date.now(),
+            lastChangeAt: Date.now(),
           }))
           onChangeRef.current()
         }
@@ -1108,20 +1113,27 @@
         }
       }, [active])
 
-      // A stream that negotiated and then went quiet is the one failure mode the
-      // browser cannot see: a half-open socket fires no `error`. Turning that
-      // into a visible `polling` reading is the whole point of this effect.
-      React.useEffect(() => {
-        if (state.mode !== 'events') return undefined
-        if (typeof setInterval !== 'function') return undefined
-        const timer = setInterval(() => {
-          if (Date.now() - state.lastAt > STREAM_IDLE_MS) {
-            setState(previous => (previous.mode === 'events' ? { ...previous, mode: 'polling' } : previous))
-          }
-        }, STREAM_IDLE_MS)
-        return () => { clearInterval(timer) }
-      }, [state.mode, state.lastAt])
-
+      // A panel that is open but idle must keep reading as `live`.
+      //
+      // An earlier version turned quiet into `polling`: if no change frame had
+      // arrived past an idle threshold it declared the channel unavailable. That
+      // conflated "nothing happened" with "the connection died", and the host
+      // gives the browser no way to tell them apart — its keepalive is an SSE
+      // comment line (`:`), which EventSource never surfaces, so the only
+      // observable traffic is a real change. An idle ledger therefore aged out
+      // within one interval and the panel reported a healthy stream as degraded
+      // for good (the effect below kept re-arming the same stale stamp).
+      //
+      // Death is already observable: `onError` sees `readyState === CLOSED` and
+      // drops to `polling`, which is the one case where the fallback really is
+      // the only thing driving the panel. What is NOT observable here is a
+      // half-open socket; reporting it would need the host to emit a named
+      // heartbeat event, which is a host-side change and deliberately not part
+      // of this fix. `lastChangeAt` stays in the state shape for that future signal.
+      //
+      // Nothing is hidden by this: `mode` still says which path drives the
+      // panel, and `feed.live` still renders the change count, so "connected but
+      // no changes yet" stays legible instead of being dressed up as a failure.
       return state
     }
 
@@ -2161,6 +2173,9 @@
     exports.HistoryDock = HistoryDock
     exports.DOCK_ID = DOCK_ID
     exports.FeedView = FeedView
+    // Exported so a test can drive the stream hook without rendering: the idle
+    // misreport described above shipped because nothing could reach this hook.
+    exports.useChangeStream = useChangeStream
     exports.buildGroups = buildGroups
     exports.groupsOf = groupsOf
     exports.feedTargets = feedTargets

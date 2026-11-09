@@ -323,15 +323,20 @@ export function apply(ctx) {
     })
   }
 
-  // `requestBody: 'buffered'` is REQUIRED, not decorative. The Connection
-  // shared handler resolves `requestBodyMode` as `route.requestBody` for a
-  // matched exact route and only falls back to `'buffered'` for UNMATCHED
-  // paths — so omitting this field yields `undefined`, which the bridge reads
-  // as "streaming" and then attaches a body to this GET. `new Request(...,
-  // { method: 'GET', body })` throws `Request with GET/HEAD method cannot have
-  // body`, and the Host webserver's error middleware turns any handler
-  // exception into an empty 400. Declaring the mode selects the buffered
-  // (no-body) branch this read-only route actually needs.
+  // `requestBody: 'buffered'` carries no behaviour on this host and must not be
+  // cited as load-bearing. An earlier comment here claimed the Connection shared
+  // handler reads `route.requestBody` and that omitting it makes the bridge
+  // attach a body to this GET, which would throw and turn into an empty 400.
+  // Measured against `@deepseek-ai/dsh-client-connection@0.1.2-rc.1`, none of
+  // that holds: bare `requestBody` (i.e. excluding `maxRequestBodyBytes`)
+  // occurs **0** times in `lib/index.js`, and `ConnectionFetchRoute` declares
+  // only `path`, `methods` and `fetch` (`lib/types/rpc.d.ts:82-89`). The bridge
+  // decides the body from the bytes it actually read — `...chunks.length > 0 ?
+  // { body } : {}` (`lib/index.js:62`) — so a bodyless GET never gets one.
+  //
+  // The field is left in place because it is inert, not because it is required;
+  // removing it would be a separate change with its own verification. Read the
+  // deployed package before trusting any comment here about that interface.
   ctx.effect(
     () => ctx.connection.fetch.register({
       path: ROUTE,
