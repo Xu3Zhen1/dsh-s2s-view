@@ -53,17 +53,31 @@ function makeHost() {
 interface Frame { event: string, data: string }
 
 /**
- * Read frames from a stream response until `wanted` frames arrived or the
- * stream ends. Bounded so a broken stream fails the test instead of hanging it.
+ * Read frames from a stream response until the stream goes QUIET.
  *
- * ★ `wanted` is a FLOOR, not a ceiling. Draining continues until a read yields
- * nothing new (the stream is still open, so `read()` would block) — a helper that
- * stopped at exactly `wanted` silently discarded extra frames, and that made a
- * "only this domain counts" assertion pass while the mutation it was supposed to
- * catch was live. The observed count is returned so a test can assert equality
- * and thereby notice the surplus.
+ * ★ Two properties this helper must have, and an earlier version had only the
+ * first — that gap is what let mutation M1 survive:
+ *
+ * 1. **`wanted` is a FLOOR, not a ceiling.** The drain keeps going after the
+ *    first `wanted` frames. A helper that stopped at exactly `wanted` discarded
+ *    extra frames, which made "only the s2s domain counts" pass while the
+ *    mutation it exists to catch was live.
+ * 2. ★ **The drain must prove the stream is QUIET, and must not report a
+ *    timeout as if it were quiet.** A false positive on either side ruins the
+ *    assertion: still-quiet-but-not-yet-read looks exactly like "nothing more
+ *    came". So the return value carries `quiet: boolean` and the caller asserts
+ *    it — a drain that hit the timeout with no frames after the floor returns
+ *    `quiet: false` and the test fails loudly instead of passing on a race.
+ *
+ * Why a timer is needed at all: the stream stays OPEN by design (SSE), so
+ * `read()` never resolves once the buffer is empty. Waiting for the reader to
+ * end would hang forever; a bounded quiet-window is the only terminating probe.
+ *
+ * @param response - the stream response.
+ * @param wanted - minimum frames to wait for before entering the quiet window.
+ * @returns the frames seen, plus whether the stream was proven quiet.
  */
-async function readFrames(response: Response, wanted: number): Promise<Frame[]> {
+async function readFrames(response: Response, wanted: number): Promise<{ frames: Frame[], quiet: boolean }> {
   const reader = response.body!.getReader()
   const decoder = new TextDecoder()
   const frames: Frame[] = []
@@ -85,29 +99,92 @@ async function readFrames(response: Response, wanted: number): Promise<Frame[]> 
     }
   }
 
-  for (let guard = 0; guard < 40; guard += 1) {
-    // Wait for `wanted` frames first, then keep draining whatever else the
-    // stream already produced. A blocking `read()` would hang once the buffer is
-    // empty, so the drain phase is race-with-a-ticks-timer.
-    const step = await Promise.race([
-      reader.read(),
-      new Promise<{ value?: undefined, done: true }>(resolve => {
-        setTimeout(() => { resolve({ done: true }) }, frames.length >= wanted ? 5 : 50)
-      }),
-    ])
-    if (step.done === true || step.value === undefined) {
-      if (frames.length >= wanted) break
+  /**
+   * Read with a deadline. `timedOut` is the discriminator the old helper threw
+   * away: a deadline reached while below the floor means "not enough arrived",
+   * and a deadline reached above the floor means "the stream is quiet".
+   */
+  const readWithDeadline = async (ms: number): Promise<
+    { kind: 'chunk', value: Uint8Array } | { kind: 'end' } | { kind: 'timeout' }
+  > => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const expiry = new Promise<{ kind: 'timeout' }>(resolve => {
+      timer = setTimeout(() => { resolve({ kind: 'timeout' }) }, ms)
+    })
+    try {
+      const step = await Promise.race([
+        reader.read().then(outcome => (outcome.done === true
+          ? { kind: 'end' as const }
+          : { kind: 'chunk' as const, value: outcome.value })),
+        expiry,
+      ])
+      return step
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+
+  const FLOOR_DEADLINE_MS = 500
+  const QUIET_WINDOW_MS = 60
+  /**
+   * ★ Overall bound, and it must expire BEFORE the runner's own timeout.
+   *
+   * Found by mutation M7 (suppress the `ready` frame): the floor was never met,
+   * so the loop kept waiting and the suite died on vitest's 5s test timeout —
+   * five tests "failed" without this helper ever returning. That reads as a
+   * passing criterion and is not one: a case that fails by being KILLED never
+   * exercises the assertion it was written for. With this bound the helper
+   * returns `quiet: false` on its own terms and the explicit `expect(quiet)`
+   * below is what fails.
+   */
+  const FLOOR_BUDGET_MS = 2_400
+  const floorDeadline = Date.now() + FLOOR_BUDGET_MS
+
+  for (let guard = 0; guard < 400; guard += 1) {
+    const floorMet = frames.length >= wanted
+    if (!floorMet && Date.now() > floorDeadline) {
+      await reader.cancel()
+      return { frames, quiet: false }
+    }
+    const step = await readWithDeadline(floorMet ? QUIET_WINDOW_MS : FLOOR_DEADLINE_MS)
+    if (step.kind === 'end') {
+      await reader.cancel()
+      // A closed stream is unambiguously complete.
+      return { frames, quiet: true }
+    }
+    if (step.kind === 'timeout') {
+      // Above the floor and nothing for a whole quiet window ⇒ proven quiet.
+      // Below the floor ⇒ the stream is open but starved; that is NOT quiet.
+      if (floorMet) {
+        await reader.cancel()
+        return { frames, quiet: true }
+      }
       continue
     }
     buffer += decoder.decode(step.value, { stream: true })
     parse()
   }
   await reader.cancel()
-  return frames
+  return { frames, quiet: false }
 }
 
 /** Give the stream's `start()` a tick to enqueue before reading. */
 const settle = () => new Promise(resolve => { setTimeout(resolve, 0) })
+
+/**
+ * Read a stream and assert it was PROVEN quiet.
+ *
+ * Every assertion below compares a full sequence, so the drain has to be
+ * trustworthy: `quiet === false` means the helper hit its bound without ever
+ * proving the stream stopped, and an equality assert on a partial read is
+ * worthless. Failing here (rather than returning the frames) is the whole point —
+ * a timeout must never be read as "nothing more came".
+ */
+async function drain(response: Response, wanted: number): Promise<Frame[]> {
+  const { frames, quiet } = await readFrames(response, wanted)
+  expect(quiet).toBe(true)
+  return frames
+}
 
 describe('s2s history change stream (T20)', () => {
   it('advertises the route the browser half asks for', () => {
@@ -125,9 +202,9 @@ describe('s2s history change stream (T20)', () => {
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toContain('text/event-stream')
 
-    const frames = await readFrames(response, 1)
-    expect(frames).toHaveLength(1)
-    expect(frames[0]!.event).toBe('ready')
+    const frames = await drain(response, 1)
+    // Equality: a second frame here would mean the opening frame is duplicated.
+    expect(frames.map(frame => frame.event)).toEqual(['ready'])
     const ready = JSON.parse(frames[0]!.data)
     // The point of this frame: a reader can prove the subscription is IN this
     // build. Without it, "no changes yet" and "nothing is listening" are the same
@@ -146,7 +223,7 @@ describe('s2s history change stream (T20)', () => {
     // The ledger's own domain is.
     ctx.emit('domain/changed', { domain: 's2s', table: 'deliveries', key: 'm-1', operation: 'put', value: {} })
 
-    const frames = await readFrames(response, 2)
+    const frames = await drain(response, 2)
     // ★ Equality, not `≥`: a `workspaces` write that ALSO produced a frame would
     // show up as a third frame. Asserting only "the second frame says ledger"
     // leaves the surplus unobserved — which is exactly how this assertion passed
@@ -162,7 +239,7 @@ describe('s2s history change stream (T20)', () => {
 
     ctx.emit('session/event', { id: 'sess-1' }, { type: 'user/message', seq: 7, time: 1, data: {} })
 
-    const frames = await readFrames(response, 2)
+    const frames = await drain(response, 2)
     expect(frames.map(frame => frame.event)).toEqual(['ready', 'change'])
     // The session id rides along so the panel can tell a growth in a conversation
     // it is showing from unrelated activity.
@@ -185,7 +262,7 @@ describe('s2s history change stream (T20)', () => {
     // above had fired, the frame below would not be the first change frame.
     ctx.emit('session/event', { id: 'sess-2' }, { type: 'assistant/message', seq: 3, time: 3, data: {} })
 
-    const frames = await readFrames(response, 2)
+    const frames = await drain(response, 2)
     // Equality again: the two ignored events above must produce NOTHING, so a
     // surplus third frame is the failure signal.
     expect(frames.map(frame => frame.event)).toEqual(['ready', 'change'])
@@ -206,7 +283,7 @@ describe('s2s history change stream (T20)', () => {
     const text = await refused.text()
     expect(text).toContain('8')
     expect(text).toContain('refused=1')
-    for (const response of live) await readFrames(response, 1)
+    for (const response of live) expect((await drain(response, 1)).map(f => f.event)).toEqual(['ready'])
   })
 
   it('closes every stream when the plugin is disposed', async () => {
@@ -217,12 +294,18 @@ describe('s2s history change stream (T20)', () => {
     await ctx.fiber.dispose()
 
     // After disposal the stream must END, not fall silent: a browser holding a
-    // socket that will never deliver again has no way to notice.
+    // socket that will never deliver again has no way to notice. The loop is
+    // bounded by a deadline as well, so a stream that neither ends nor delivers
+    // fails here instead of hanging the run.
     const reader = response.body!.getReader()
     let done = false
-    for (let guard = 0; guard < 10 && !done; guard += 1) {
-      const step = await reader.read()
-      done = step.done === true
+    const deadline = Date.now() + 2_000
+    while (!done && Date.now() < deadline) {
+      const step = await Promise.race([
+        reader.read(),
+        new Promise<{ done?: undefined }>(resolve => { setTimeout(() => { resolve({}) }, 100) }),
+      ])
+      if (step.done === true) done = true
     }
     expect(done).toBe(true)
     // And the route is unregistered, so a reconnect gets a 404 rather than a
