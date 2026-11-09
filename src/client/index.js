@@ -14,6 +14,15 @@
     /** localStorage key holding the active panel tab. */
     const TAB_KEY = 'dsh-s2s:history-tab'
 
+    /** Entry id for the `shell.overlay` dock (list slots require one). */
+    const DOCK_ID = 's2s-dock'
+
+    /** localStorage key holding the dock's open/closed state. */
+    const DOCK_KEY = 'dsh-s2s:dock-open'
+
+    /** localStorage key holding the dock's active tab — independent of the panel's. */
+    const DOCK_TAB_KEY = 'dsh-s2s:dock-tab'
+
     /**
      * Conversations read per feed batch.
      *
@@ -98,6 +107,8 @@
       'panel.title': '会话历史',
       'panel.subtitle': '只引用对话，不显示消息正文',
       'panel.close': '关闭',
+      'panel.pinDock': '浮层',
+      'panel.pinPanel': '面板',
       'panel.empty': '没有可显示的会话',
       'panel.otherGroups': '其他工作区',
       'panel.count': '{n} 个会话',
@@ -148,6 +159,8 @@
       'panel.title': 'Session history',
       'panel.subtitle': 'Conversations are quoted, not shown',
       'panel.close': 'Close',
+      'panel.pinDock': 'Dock',
+      'panel.pinPanel': 'Panel',
       'panel.empty': 'No conversations to show',
       'panel.otherGroups': 'Other workspaces',
       'panel.count': '{n} conversations',
@@ -419,6 +432,24 @@
         'color:var(--dsw-alias-label-primary,var(--dsh-text,#e6e6e6));',
         'border-left:1px solid rgba(128,128,128,.25);',
         'box-shadow:-8px 0 32px rgba(0,0,0,.35);}',
+        // T21 — the `shell.overlay` dock. The frame's overlay layer is ALREADY
+        // click-through (`pointer-events:none`, entries opt back in — see
+        // dsh-client-ui-layout/src/client/AppFrame.module.css `.overlayLayer`).
+        // The dock keeps that property on its own host box and turns it back on
+        // ONLY for the card, so everything around the card stays clickable.
+        // The authoritative declaration is inline in HistoryDock: the frame's
+        // `.overlayLayer > *{pointer-events:auto}` has the same specificity as
+        // `.s2s-h-dock`, so a class rule here would win or lose by stylesheet
+        // order — an inline style has no such race.
+        '.s2s-h-dock{position:absolute;right:18px;bottom:18px;display:flex;',
+        'align-items:flex-end;justify-content:flex-end;max-width:calc(100% - 36px);',
+        'max-height:calc(100% - 36px);pointer-events:none;}',
+        '.s2s-h-dockcard{display:flex;flex-direction:column;width:min(420px,92vw);',
+        'height:min(540px,72vh);border-radius:10px;overflow:hidden;',
+        'border:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.3));',
+        'box-shadow:0 12px 32px rgba(0,0,0,.35);pointer-events:auto;}',
+        '.s2s-h-panel.is-dock{position:relative;height:100%;width:100%;border-left:0;',
+        'box-shadow:none;border-radius:0;}',
         '.s2s-h-head{display:flex;align-items:flex-start;gap:8px;padding:14px 16px;',
         'border-bottom:1px solid rgba(128,128,128,.2);}',
         '.s2s-h-title{font-size:14px;font-weight:600;}',
@@ -1256,16 +1287,104 @@
         error: state.error,
         remaining: remaining,
         loadMore: loadMore,
+        // ★ The change stream calls this (T20). It MUST be part of the exposed
+        // surface: `refresh` re-reads the conversations already loaded while
+        // keeping paging depth, so a pushed frame neither re-pages from scratch
+        // nor loses what the user paged to. The first cut of T20 wired
+        // `feedRefreshRef.current = feed.refresh` without exposing the key, so
+        // every pushed frame threw before doing anything — a green build, a live
+        // stream and a stale feed all at once (the shape G10 exists for).
+        refresh: refresh,
         reload: reload,
       }
     }
 
+    /** Read a boolean preference, defaulting to false when storage is unavailable. */
+    function storedFlag(key) {
+      try {
+        return window.localStorage.getItem(key) === '1'
+      } catch (error) {
+        return false
+      }
+    }
+
+    /** Persist a boolean preference; storage is a convenience, never a source of truth. */
+    function storeFlag(key, value) {
+      try {
+        window.localStorage.setItem(key, value ? '1' : '0')
+      } catch (error) {
+        /* storage is a convenience; the surfaces work without it */
+      }
+    }
+
+    /** Read a text preference, defaulting to null when storage is unavailable. */
+    function storedText(key) {
+      try {
+        return window.localStorage.getItem(key)
+      } catch (error) {
+        return null
+      }
+    }
+
+    /** Persist a text preference; storage is a convenience, never a source of truth. */
+    function storeText(key, value) {
+      try {
+        window.localStorage.setItem(key, value)
+      } catch (error) {
+        /* storage is a convenience; the surfaces work without it */
+      }
+    }
+
     /**
-     * The sidebar trigger and, when open, its panel.
+     * Open flags shared by two SIBLING slots.
      *
-     * Open state is component state: the slot re-renders through React, so a
-     * value kept outside React could never invalidate the tree. Persistence is
-     * a side effect of that state, not its source of truth.
+     * The panel lives in `sidebar.footer.action` and the dock in
+     * `shell.overlay`; sibling slots render in separate component subtrees, so
+     * neither can hand the other a prop and a React context would not reach
+     * across. They share this one external store instead, read through
+     * `useSyncExternalStore`. Only the flags both surfaces must agree on live
+     * here — tab, scroll and feed state stay per-component, which is exactly
+     * what lets the panel and the dock coexist without overwriting each other.
+     */
+    const slotState = {
+      value: {
+        open: storedFlag(OPEN_KEY),
+        dockOpen: storedFlag(DOCK_KEY),
+        showSubagents: storedFlag(SUBAGENT_KEY),
+      },
+      listeners: new Set(),
+      read() { return this.value },
+      write(patch) {
+        const next = { ...this.value, ...patch }
+        if (next.open !== this.value.open) storeFlag(OPEN_KEY, next.open)
+        if (next.dockOpen !== this.value.dockOpen) storeFlag(DOCK_KEY, next.dockOpen)
+        if (next.showSubagents !== this.value.showSubagents) storeFlag(SUBAGENT_KEY, next.showSubagents)
+        this.value = next
+        for (const listener of this.listeners) listener()
+      },
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+      },
+    }
+
+    /**
+     * Read the cross-slot flags through React.
+     * @param {object} React - React module.
+     * @returns {{open: boolean, dockOpen: boolean, showSubagents: boolean}} flags.
+     */
+    function useSlotState(React) {
+      const subscribe = React.useCallback((listener) => slotState.subscribe(listener), [])
+      const getSnapshot = React.useCallback(() => slotState.read(), [])
+      return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+    }
+
+    /**
+     * The sidebar trigger.
+     *
+     * Past the trigger it renders the modal panel; the surface itself lives in
+     * {@link HistorySurface} and is shared with the `shell.overlay` dock
+     * ({@link HistoryDock}), so the two forms can never drift apart.
      * @param {object} props - slot props (React, t, sessions, workspaces, openSession).
      * @returns {object} element tree.
      */
@@ -1273,35 +1392,11 @@
       const React = props.React
       const t = translator(props.t)
 
-      const [open, setOpen] = React.useState(() => {
-        try {
-          return window.localStorage.getItem(OPEN_KEY) === '1'
-        } catch (error) {
-          return false
-        }
-      })
-      React.useEffect(() => {
-        try {
-          window.localStorage.setItem(OPEN_KEY, open ? '1' : '0')
-        } catch (error) {
-          /* storage is a convenience; the panel works without it */
-        }
-      }, [open])
-
-      const [showSubagents, setShowSubagents] = React.useState(() => {
-        try {
-          return window.localStorage.getItem(SUBAGENT_KEY) === '1'
-        } catch (error) {
-          return false
-        }
-      })
-      React.useEffect(() => {
-        try {
-          window.localStorage.setItem(SUBAGENT_KEY, showSubagents ? '1' : '0')
-        } catch (error) {
-          /* storage is a convenience; the panel works without it */
-        }
-      }, [showSubagents])
+      // The panel and the dock are sibling slots, so the flags they must agree
+      // on live in the shared store above rather than in either one's state.
+      const slot = useSlotState(React)
+      const open = slot.open
+      const showSubagents = slot.showSubagents
 
       const list = useSource(React, props.sessions)
       const workspaces = useSource(React, props.workspaces)
@@ -1350,7 +1445,7 @@
           className: 's2s-h-action',
           title: t('action.tip'),
           'aria-label': t('action.tip'),
-          onClick: () => { setOpen(value => !value) },
+          onClick: () => { slotState.write({ open: !open }) },
         }, t('action.open')),
         open
           ? React.createElement(HistoryPanel, {
@@ -1364,11 +1459,15 @@
             feed: feed,
             stream: stream,
             showSubagents: showSubagents,
-            onToggleSubagents: () => { setShowSubagents(value => !value) },
-            onClose: () => { setOpen(false) },
+            onToggleSubagents: () => { slotState.write({ showSubagents: !showSubagents }) },
+            // The pin SWITCHES surfaces rather than stacking a duplicate: the
+            // panel is a modal band above the dock, so leaving both mounted
+            // would hide the very thing this button just opened.
+            onToggleDock: () => { slotState.write({ open: false, dockOpen: true }) },
+            onClose: () => { slotState.write({ open: false }) },
             openSession: (sessionId) => {
               props.openSession(sessionId)
-              setOpen(false)
+              slotState.write({ open: false })
             },
           })
           : null,
@@ -1376,7 +1475,90 @@
     }
 
     /**
-     * The conversation menu itself.
+     * The surface both containers render: header, tab strip, and the active
+     * tab's body.
+     *
+     * Container-neutral on purpose — T21 puts the IDENTICAL surface inside the
+     * sidebar's modal panel and inside the frame's `shell.overlay` dock. The
+     * wrapper owns positioning, the mask, and the Escape binding; this function
+     * owns what the user reads, so the two forms can never drift apart.
+     * @param {object} props - surface props (React, t, groups, current, tab,
+     * onTab, feed, stream, showSubagents, onToggleSubagents, onPin, pinLabel,
+     * onClose, openSession, variant).
+     * @returns {object} element tree.
+     */
+    function HistorySurface(props) {
+      const React = props.React
+      const t = props.t
+      const groups = props.groups || []
+      const current = props.current
+      const openSession = props.openSession
+      const variant = props.variant === 'dock' ? 'dock' : 'panel'
+      // Group order is already resolved by buildGroups (current workspace
+      // first, ungrouped last) — re-hoisting here would fight that.
+      const now = Date.now()
+      const sections = groups.map(group => section(React, t, group, current, now, openSession))
+
+      return React.createElement('div', {
+        className: variant === 'dock' ? 's2s-h-panel is-dock' : 's2s-h-panel',
+        role: variant === 'dock' ? 'region' : 'dialog',
+        'aria-label': t('panel.title'),
+      },
+        React.createElement('div', { className: 's2s-h-head' },
+          React.createElement('div', null,
+            React.createElement('div', { className: 's2s-h-title' }, t('panel.title')),
+            React.createElement('div', { className: 's2s-h-sub' },
+              props.tab === 'messages' ? t('tab.messages') : t('panel.subtitle')),
+          ),
+          props.onPin === undefined ? null : React.createElement('button', {
+            type: 'button',
+            className: 's2s-h-close',
+            title: props.pinLabel,
+            'aria-label': props.pinLabel,
+            onClick: () => { props.onPin() },
+          }, props.pinLabel),
+          React.createElement('button', {
+            type: 'button',
+            className: 's2s-h-close',
+            'aria-label': t('panel.close'),
+            onClick: () => { props.onClose() },
+          }, '\u00d7'),
+        ),
+        React.createElement('div', { className: 's2s-h-tabs', role: 'tablist' },
+          tabButton(React, t, 'index', props.tab, props.onTab),
+          tabButton(React, t, 'messages', props.tab, props.onTab),
+        ),
+        props.tab === 'messages'
+          ? React.createElement(FeedView, {
+            React: React,
+            t: t,
+            feed: props.feed,
+            stream: props.stream,
+            openSession: openSession,
+          })
+          : React.createElement(React.Fragment, null,
+            React.createElement('div', { className: 's2s-h-body' },
+              sections.length === 0
+                ? React.createElement('div', { className: 's2s-h-ghead' }, t('panel.empty'))
+                : sections,
+            ),
+            React.createElement('div', { className: 's2s-h-foot' },
+              React.createElement('label', { className: 's2s-h-toggle' },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: Boolean(props.showSubagents),
+                  onChange: () => { props.onToggleSubagents() },
+                }),
+                React.createElement('span', null, t('panel.showSubagents')),
+              ),
+              React.createElement('span', { className: 's2s-h-sort' }, t('panel.sort')),
+            ),
+          ),
+      )
+    }
+
+    /**
+     * The modal panel: the shared surface inside the sidebar's dialog wrapper.
      *
      * Rendered through `createPortal` onto `document.body`, never inside the
      * sidebar: the sidebar column gains a `backdrop-filter` whenever the
@@ -1392,13 +1574,9 @@
      */
     function HistoryPanel(props) {
       const React = props.React
-      const t = props.t
-      const groups = props.groups || []
-      const current = props.current
+      const t = translator(props.t)
       const onClose = props.onClose
-      const openSession = props.openSession
       const portal = props.portal
-      const now = Date.now()
 
       // A portaled dialog is outside the slot's own subtree, so Escape has to
       // be bound to the document rather than to a wrapper's onKeyDown.
@@ -1410,64 +1588,116 @@
         return () => { document.removeEventListener('keydown', onKeyDown) }
       }, [onClose])
 
-      // Group order is already resolved by buildGroups (current workspace
-      // first, ungrouped last) — re-hoisting here would fight that.
-      const sections = groups.map(group => section(React, t, group, current, now, openSession))
-
       const tree = React.createElement('div', { className: 's2s-h-root' },
         React.createElement('div', { className: 's2s-h-mask', onClick: onClose }),
-        React.createElement('div', {
-          className: 's2s-h-panel',
-          role: 'dialog',
-          'aria-label': t('panel.title'),
-        },
-          React.createElement('div', { className: 's2s-h-head' },
-            React.createElement('div', null,
-              React.createElement('div', { className: 's2s-h-title' }, t('panel.title')),
-              React.createElement('div', { className: 's2s-h-sub' },
-                props.tab === 'messages' ? t('tab.messages') : t('panel.subtitle')),
-            ),
-            React.createElement('button', {
-              type: 'button',
-              className: 's2s-h-close',
-              'aria-label': t('panel.close'),
-              onClick: onClose,
-            }, '\u00d7'),
-          ),
-          React.createElement('div', { className: 's2s-h-tabs', role: 'tablist' },
-            tabButton(React, t, 'index', props.tab, props.onTab),
-            tabButton(React, t, 'messages', props.tab, props.onTab),
-          ),
-          props.tab === 'messages'
-            ? React.createElement(FeedView, {
-              React: React,
-              t: t,
-              feed: props.feed,
-              stream: props.stream,
-              openSession: openSession,
-            })
-            : React.createElement(React.Fragment, null,
-              React.createElement('div', { className: 's2s-h-body' },
-                sections.length === 0
-                  ? React.createElement('div', { className: 's2s-h-ghead' }, t('panel.empty'))
-                  : sections,
-              ),
-              React.createElement('div', { className: 's2s-h-foot' },
-                React.createElement('label', { className: 's2s-h-toggle' },
-                  React.createElement('input', {
-                    type: 'checkbox',
-                    checked: Boolean(props.showSubagents),
-                    onChange: () => { props.onToggleSubagents() },
-                  }),
-                  React.createElement('span', null, t('panel.showSubagents')),
-                ),
-                React.createElement('span', { className: 's2s-h-sort' }, t('panel.sort')),
-              ),
-            ),
-        ),
-      )
+        React.createElement(HistorySurface, {
+          React: React,
+          t: translator(props.t),
+          variant: 'panel',
+          groups: props.groups,
+          current: props.current,
+          tab: props.tab,
+          onTab: props.onTab,
+          feed: props.feed,
+          stream: props.stream,
+          showSubagents: props.showSubagents,
+          onToggleSubagents: props.onToggleSubagents,
+          onPin: props.onToggleDock,
+          pinLabel: t('panel.pinDock'),
+          onClose: onClose,
+          openSession: props.openSession,
+        }))
 
       return typeof portal === 'function' ? portal(tree, document.body) : tree
+    }
+
+    /**
+     * The `shell.overlay` dock: the SAME surface in a floating container.
+     *
+     * Why a slot and not a second window: `shell.overlay` is the frame's
+     * floating layer, and the layer is already click-through (`pointer-events:
+     * none`, entries opt back in). The dock keeps that property on its own host
+     * box and re-enables it only for the card, so everything around the card
+     * stays clickable — this is T21's "click-through 不被挡" acceptance. The
+     * declaration is INLINE because the frame's `.overlayLayer > *` rule has
+     * the same specificity as a class rule here, so a class rule's winner would
+     * be decided by stylesheet order instead of by intent.
+     *
+     * The dock and the panel are siblings, so they share only the open flags
+     * (see `slotState`); tab, scroll and feed state are independent, so
+     * opening one never rewrites the other. Both may be mounted at once: the
+     * panel is a modal band (z-index 1000) and dims the dock, which is the
+     * intended layering — closing the panel reveals the dock unchanged.
+     * @param {object} props - slot props (React, t, sessions, workspaces, openSession).
+     * @returns {object|null} element tree, or null while closed.
+     */
+    function HistoryDock(props) {
+      const React = props.React
+      const t = translator(props.t)
+      const slot = useSlotState(React)
+
+      const [tab, setTab] = React.useState(() => {
+        const stored = storedText(DOCK_TAB_KEY)
+        return stored === 'messages' ? 'messages' : 'index'
+      })
+      React.useEffect(() => {
+        storeText(DOCK_TAB_KEY, tab)
+      }, [tab])
+
+      const list = useSource(React, props.sessions)
+      const workspaces = useSource(React, props.workspaces)
+      const groups = list === undefined
+        ? []
+        : buildGroups(list, workspaces, { showSubagents: slot.showSubagents })
+      const current = list === undefined ? undefined : list.current
+      const targets = React.useMemo(() => feedTargets(groups), [groups])
+      const senders = React.useMemo(() => senderIndex(list), [list])
+
+      // Same rule as the panel: the feed only runs while the messages tab is
+      // showing, so a closed dock costs nothing. When both surfaces show that
+      // tab, each holds its own stream — two of the host's eight seats, not a
+      // degraded path (the ready frame reports `streams.open`, so the count is
+      // observable rather than assumed).
+      const active = slot.dockOpen && tab === 'messages'
+      const feedRefreshRef = React.useRef(() => {})
+      const onStreamChange = React.useCallback(() => { feedRefreshRef.current() }, [])
+      const stream = useChangeStream(React, active, onStreamChange)
+      const feed = useFeed(React, targets, senders, active, stream.mode === 'polling')
+      feedRefreshRef.current = feed.refresh
+
+      if (!slot.dockOpen) return null
+
+      return React.createElement('div', {
+        className: 's2s-h-dock',
+        style: { pointerEvents: 'none' },
+      },
+        React.createElement('div', {
+          className: 's2s-h-dockcard',
+          style: { pointerEvents: 'auto' },
+        },
+          React.createElement(HistorySurface, {
+            React: React,
+            t: t,
+            variant: 'dock',
+            groups: groups,
+            current: current,
+            tab: tab,
+            onTab: setTab,
+            feed: feed,
+            stream: stream,
+            showSubagents: slot.showSubagents,
+            onToggleSubagents: () => { slotState.write({ showSubagents: !slot.showSubagents }) },
+            onPin: () => { slotState.write({ open: true, dockOpen: false }) },
+            pinLabel: t('panel.pinPanel'),
+            onClose: () => { slotState.write({ dockOpen: false }) },
+            openSession: (sessionId) => {
+              // The dock is a glance surface: it stays open when a row is
+              // followed, unlike the modal panel which closes for the switch.
+              props.openSession(sessionId)
+            },
+          }),
+        ),
+      )
     }
 
     /**
@@ -1900,10 +2130,36 @@
           },
         }),
       }, HistoryAction))
+
+      // T21 — the same surface in the frame's floating layer. `shell.overlay`
+      // is `{kind:'list', scope:'root'}`: it is ADDITIVE (a fresh id sits
+      // beside the shipped entries, it does not replace one) and the layer
+      // itself is click-through, so an occupant opts back into pointer events
+      // only where it draws. The dock does that with inline styles (see
+      // HistoryDock) instead of a class rule: the frame's own
+      // `.overlayLayer > *{pointer-events:auto}` has the same specificity, so a
+      // class rule would be decided by stylesheet order rather than by intent.
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay',
+        id: DOCK_ID,
+        order: 40,
+        locale: NS,
+        inject: () => ({
+          React: React,
+          sessions: sessionsList,
+          workspaces: workspacesList,
+          openSession: (sessionId) => {
+            if (sessionsService !== undefined) sessionsService.open(sessionId)
+          },
+        }),
+      }, HistoryDock))
     }
 
     exports.HistoryAction = HistoryAction
     exports.HistoryPanel = HistoryPanel
+    exports.HistorySurface = HistorySurface
+    exports.HistoryDock = HistoryDock
+    exports.DOCK_ID = DOCK_ID
     exports.FeedView = FeedView
     exports.buildGroups = buildGroups
     exports.groupsOf = groupsOf

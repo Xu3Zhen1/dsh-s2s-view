@@ -88,6 +88,33 @@ const CLIENT_REQUIRED = [
   // replaced it, and re-introducing a 5s timer is exactly the regression L1568
   // forbids. Checked as an absence because that is what the spec states.
   { marker: 'FEED_REFRESH_MS', why: 'T20: the 5s poll constant must NOT be present', absent: true },
+  // T21: the dock is a SECOND container for the SAME surface, mounted in the
+  // frame's `shell.overlay` seat. The first four markers name the seat, the
+  // entry id, and the shared surface class — losing any of them means the dock
+  // silently stopped being "the same component in another container". The two
+  // pointer-events markers are the click-through acceptance itself; they are
+  // INLINE in the source on purpose (the frame's `.overlayLayer > *` rule has
+  // the same specificity), so their literal shape is the contract.
+  { marker: "'shell.overlay'", why: 'T21: the dock occupies the frame overlay seat' },
+  { marker: "'s2s-dock'", why: 'T21: dock entry id (a list-slot entry needs one)' },
+  { marker: 's2s-h-panel is-dock', why: 'T21: dock reuses the panel surface class (same component, one container changed)' },
+  { marker: "pointerEvents: 'none'", why: 'T21: the dock host does not intercept clicks (click-through kept)' },
+  { marker: "pointerEvents: 'auto'", why: 'T21: only the card opts back into pointer events' },
+  // ★ Negative marker with a count: the dock must not be a MODAL copy. The mask
+  // is the thing that would cover the app under the floating card, so it exists
+  // exactly once — in the panel wrapper — and the dock path must never add a
+  // second one. A plain presence check cannot tell one mask from two.
+  { marker: "className: 's2s-h-mask'", why: 'T21: the modal mask exists exactly once (panel only)', count: 1 },
+  // ★ T20 defect lock, found 2026-11-09 by READING the delivered code while the
+  // whole gate set was green: `useFeed` never exposed `refresh`, yet the change
+  // stream was wired to `feed.refresh` — every pushed frame threw before doing
+  // anything, so the stream looked live while the feed stayed stale. Two
+  // markers are needed because the defect was a CONTRACT between two places:
+  // either half alone can be re-broken by a rename that keeps the other side
+  // compiling. (The behaviour is covered separately by tests/client.dock.spec.ts;
+  // these two keep the source-level contract from disappearing silently.)
+  { marker: 'refresh: refresh', why: 'T20: useFeed EXPOSES the reader the change stream calls (the missing key threw on every frame)' },
+  { marker: 'feedRefreshRef.current = feed.refresh', why: 'T20: the change stream is wired to that exposed reader' },
 ]
 
 let clientFailed = false
@@ -112,8 +139,14 @@ if (!existsSync(clientPath)) {
     clientFailed = true
   }
 
-  const clientMissing = CLIENT_REQUIRED.filter(({ marker, absent }) => {
+  const clientMissing = CLIENT_REQUIRED.filter(({ marker, absent, count }) => {
     const present = client.includes(marker)
+    // `count` is the third shape a marker can take: "present, but exactly N
+    // times". It exists because the T21 dock shares the panel's surface, so the
+    // question is not whether the modal mask exists (the panel needs it) but
+    // whether the DOCK added a second one — and a presence check would pass on
+    // both the right tree and the wrong one.
+    if (count !== undefined) return client.split(marker).length - 1 !== count
     // `absent: true` inverts the check: the marker names something that must NOT
     // be there (the retired 5s poll constant). Without the inversion the list
     // could only ever assert presence, and "the poll is gone" — which is the
@@ -122,8 +155,12 @@ if (!existsSync(clientPath)) {
   })
   if (clientMissing.length > 0) {
     console.error('verify-bundle: lib/client.js markers are wrong:')
-    for (const { marker, why, absent } of clientMissing) {
-      console.error(`  - ${marker}  (${why})${absent === true ? '  [unexpectedly PRESENT]' : '  [missing]'}`)
+    for (const { marker, why, absent, count } of clientMissing) {
+      const found = client.split(marker).length - 1
+      const reading = count !== undefined
+        ? `  [expected exactly ${String(count)}, found ${String(found)}]`
+        : absent === true ? '  [unexpectedly PRESENT]' : '  [missing]'
+      console.error(`  - ${marker}  (${why})${reading}`)
     }
     clientFailed = true
   }
