@@ -335,6 +335,53 @@ export function resetDrainRefusalOutcomes(): void {
 }
 
 /**
+ * One `nextAttemptAt` that the clock-jump guard had to pull back (T27, plan §6 R14).
+ *
+ * The spec says an implausible stamp must be "clamped **and logged**". A logger is
+ * not a durable artifact on this host — the session transcript keeps only
+ * `{type,seq,time,data}` records and `~/.dsh` has no host log directory — so a
+ * logger-only trace cannot be verified afterwards. That is why this is a record
+ * with a reader instead of a `logger.warn` alone (G9: no silent degradation).
+ *
+ * `previousAt` is kept beside the two derived instants because the three numbers
+ * tell different stories: `previousAt` explains WHY the clamp fired (a stamp left
+ * far in the future by a clock jump), while `intendedAt`→`clampedTo` shows what the
+ * guard did about it. A record carrying only the clamped value would look like a
+ * normal scheduling decision.
+ */
+export interface ClampedNextAttempt {
+  readonly msgId: string
+  /** The instant the backoff would have scheduled, before the guard. */
+  readonly intendedAt: number
+  /** The instant actually written. */
+  readonly clampedTo: number
+  /** The stamp already on the row when the guard fired (the reason it fired). */
+  readonly previousAt: number
+  readonly at: number
+}
+
+const clampedNextAttempts: ClampedNextAttempt[] = []
+const MAX_CLAMPED_NEXT_ATTEMPTS = 20
+
+/** Record one clamped stamp. Never throws. */
+export function recordClampedNextAttempt(entry: ClampedNextAttempt): void {
+  try {
+    clampedNextAttempts.push(entry)
+    while (clampedNextAttempts.length > MAX_CLAMPED_NEXT_ATTEMPTS) clampedNextAttempts.shift()
+  } catch {}
+}
+
+/** Read-only view for `s2s_status` (latest last). */
+export function readClampedNextAttempts(): readonly ClampedNextAttempt[] {
+  return clampedNextAttempts
+}
+
+/** Test isolation. */
+export function resetClampedNextAttempts(): void {
+  clampedNextAttempts.length = 0
+}
+
+/**
  * Self-target check skipped because the host gave no caller id (T29).
  *
  * The ruling allows the explicit fail-open only if it is observable on every

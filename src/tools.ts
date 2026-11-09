@@ -19,7 +19,7 @@ import { S2sError, type S2sErrorCode } from './error.ts'
 import type { S2sArchiveFilterState, S2sTargetClass } from './discovery.ts'
 import type { S2sLatestOfResult } from './discovery.ts'
 import { readHistory } from './history.ts'
-import { ledgerDiagnostics, readDrainRefusalOutcomes, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, readClampedNextAttempts, readDrainRefusalOutcomes, readSelfCheckSkipped, recordFirstS2sToolCall, recordProbe, recordSelfCheckSkipped, recordSelfRefusalCancelFailure } from './ledger-diagnostics.ts'
 
 function textRender(_args: object, value: { text: string }): ContentBlock[] {
   return [{ type: 'text', text: value.text }]
@@ -834,6 +834,26 @@ export function buildTools(deps: { ctx: Context; broker: S2sBroker; discovery: S
             lines.push('  ' + o.msgId + ' -> ' + o.sessionId + '  code=' + o.code + '  cancel=' + o.cancelOutcome + '  at=' + new Date(o.at).toISOString())
           }
         }
+
+        // ★ T27 clock-jump guard. Rendered even when the count is 0, unlike the drain
+// refusals above. The spec requires an implausible `nextAttemptAt` to be "clamped
+// AND logged", and a logger is not a durable artifact on this host — so this line
+// is the only place the guard can be confirmed to have run, and the only place a
+// later reader can tell "the guard never fired" from "the guard is not in this
+// build". An always-present line carries that distinction; a conditional one would
+// collapse it into "no line", which means both things at once.
+const clamps = readClampedNextAttempts()
+if (clamps.length === 0) {
+  lines.push('clock-jump guard: no nextAttemptAt clamp applied in this process (the guard is armed; nothing was implausibly far ahead).')
+} else {
+  lines.push('clock-jump guard: ' + clamps.length + ' nextAttemptAt clamp(s) applied (retained <= 20, process-scoped):')
+  for (const c of clamps) {
+    lines.push('  ' + c.msgId + '  previous=' + new Date(c.previousAt).toISOString()
+      + '  intended=' + new Date(c.intendedAt).toISOString()
+      + '  clamped-to=' + new Date(c.clampedTo).toISOString()
+      + '  at=' + new Date(c.at).toISOString())
+  }
+}
 
         // History durability: T11 gave history a durable read path, so the old
         // flat "process-scoped only" claim is no longer true and must not be

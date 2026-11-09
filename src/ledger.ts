@@ -20,7 +20,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { S2sError } from './error.ts'
 import { readSessionLog, type HistoryEntry } from './history.ts'
-import { ledgerDiagnostics, recordUntrackedDelivery } from './ledger-diagnostics.ts'
+import { ledgerDiagnostics, recordClampedNextAttempt, recordUntrackedDelivery } from './ledger-diagnostics.ts'
 import {
   LEDGER_LIMITS,
   MESSAGES_TABLE,
@@ -174,6 +174,60 @@ export function dueByClock(row: { nextAttemptAt?: number | null }, now: number):
   const at = row.nextAttemptAt
   if (at === null || at === undefined) return true
   return at <= now
+}
+
+/**
+ * The instant to persist after a failed attempt: T18's backoff plus T27's clock guard.
+ *
+ * Spec (plan §6 R14): retries use a monotonic clock for the delay, the persisted
+ * stamp stays wall-clock, and a stamp implausibly far ahead is clamped and logged.
+ *
+ * **Why no `performance.now()` here.** The delay comes from `attempts`, not from any
+ * measured elapsed time — `retryBackoffMs` never reads a clock, so there is no
+ * "rollback makes the delay wrong" entry point to defend. And the monotonic clock
+ * *could not* help even if the delay were elapsed-based: its zero point resets with
+ * the process and it cannot be persisted, while `nextAttemptAt` must survive
+ * restarts. The spec itself concedes this ("持久化仍存 wall-clock nextAttemptAt").
+ * So the only wall-clock-dependent step is `now + delay`, and the floor below is
+ * what makes that step safe. This is not "we skipped it" — the API has no place in
+ * a cross-process schedule.
+ *
+ * **★ `max` applies to the FINAL instant, not to the base.** The obvious writing —
+ * `base = max(now, previous); at = base + delay` — is wrong, and the difference
+ * only shows up when `previous` is already in the future (which happens after a
+ * forward clock jump, the exact case this guard exists for). With
+ * `previous = now + 1000` and `delay = 5000`:
+ * ```
+ * wrong: (now + 1000) + 5000 = now + 6000   ← the old remainder added again
+ * right: max(now + 5000, now + 1000) = now + 5000
+ * ```
+ * The wrong form re-adds the previous stamp's remainder on every failure, so a row
+ * that was once scheduled ahead drifts away from the designed delay one attempt at
+ * a time. The ceiling and the clamp would eventually hide that, but a bound on the
+ * error is not the same as the correct value.
+ *
+ * The floor's only job is "never move the stamp backwards": a wall clock that jumps
+ * back must not make an already-scheduled retry due earlier than it was.
+ *
+ * A stamp beyond `nextAttemptAtClampMs` from `now` is pulled back to that ceiling —
+ * that is the rescue path for a stamp written under a jumped clock, which would
+ * otherwise sit unreachable for days (long past the 24 h zombie deadline). The clamp
+ * deliberately overrides the floor: monotonicity yields to "the row must remain
+ * reachable", and the caller records the event so the override is never silent.
+ *
+ * @returns `at` to persist, `intendedAt` before the guard, and `clamped`.
+ */
+export function nextAttemptAtAfterFailure(
+  msgId: string,
+  attempts: number,
+  now: number,
+  previousAt: number,
+): { at: number; intendedAt: number; clamped: boolean } {
+  const intendedAt = now + retryBackoffMs(msgId, attempts)
+  const floored = Math.max(intendedAt, previousAt)
+  const ceiling = now + LEDGER_LIMITS.nextAttemptAtClampMs
+  if (floored > ceiling) return { at: ceiling, intendedAt, clamped: true }
+  return { at: floored, intendedAt, clamped: false }
 }
 
 /**
@@ -1038,11 +1092,33 @@ export class S2sLedger extends Service {
       // `dead_letter` previously had exactly one inbound edge (`expireZombies`, for
       // a landed-but-unreadable log) and this is the second, independent one.
       const exhausted = (row.attempts ?? 0) >= (row.maxRetries ?? 0)
-      // T18: a rolled-back row is scheduled, not made immediately eligible again.
-      // Exhausted rows get `now` because they are terminal — nothing will consult
-      // their stamp again, and writing a future one would imply a retry that has
-      // been ruled out.
-      const nextAttemptAt = exhausted ? now : now + retryBackoffMs(msgId, row.attempts ?? 0)
+      // T18 schedules the retry; T27 guards the instant against clock jumps.
+      // Exhausted rows get `now`: they are terminal, nothing will consult their
+      // stamp again, and writing a future one would imply a ruled-out retry.
+      let nextAttemptAt = now
+      if (!exhausted) {
+        const scheduled = nextAttemptAtAfterFailure(msgId, row.attempts ?? 0, now, row.nextAttemptAt ?? 0)
+        nextAttemptAt = scheduled.at
+        if (scheduled.clamped) {
+          // G9: a clamp silently rewriting a schedule would be a fallback with no
+          // trace. Both the log AND the read-back record fire here — the log alone
+          // is not durable on this host (no host log dir, transcripts keep only
+          // events), so an auditor could never confirm the guard ran.
+          recordClampedNextAttempt({
+            msgId,
+            intendedAt: scheduled.intendedAt,
+            clampedTo: scheduled.at,
+            previousAt: row.nextAttemptAt ?? 0,
+            at: now,
+          })
+          this.ctx.logger.warn(
+            's2s ledger: nextAttemptAt for ' + msgId + ' was implausibly far ahead (previous '
+            + new Date(row.nextAttemptAt ?? 0).toISOString() + ', intended '
+            + new Date(scheduled.intendedAt).toISOString() + '); clamped to '
+            + new Date(scheduled.at).toISOString() + ' — clock-jump guard (T27).',
+          )
+        }
+      }
       const wrote = await this.putIfUnchanged(row.revision ?? 0, {
         ...row,
         status: exhausted ? 'dead_letter' : 'queued',
