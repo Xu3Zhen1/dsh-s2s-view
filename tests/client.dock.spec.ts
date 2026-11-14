@@ -137,10 +137,12 @@ function makeCtx(): Record<string, any> {
   const ctx: Record<string, any> = {
     injected: [] as string[],
     registered: [] as Array<{ spec: Record<string, any>; component: unknown }>,
+    openedSessionIds: [] as string[],
+    uiWorkspace: { openSession: (sessionId: string) => { ctx.openedSessionIds.push(sessionId) } },
     effect: (fn: () => unknown): (() => void) => { fn(); return () => {} },
     locale: { register: () => {}, bind: () => (key: string) => key },
     get: (name: string): unknown => {
-      if (name === 'sessions') return { list: emptySessions(), open: () => {} }
+      if (name === 'sessions') return { list: emptySessions() }
       if (name === 'workspaces') return { list: emptyWorkspaces() }
       return undefined
     },
@@ -199,6 +201,22 @@ describe('T21 · the shell.overlay dock', () => {
     // A list slot needs an entry id, and the id must not collide with the panel's.
     expect(dock!.spec.id).toBe('s2s-dock')
     expect(exports.DOCK_ID).toBe('s2s-dock')
+  })
+
+  it('opens indexed and history sessions through uiWorkspace', () => {
+    const { exports } = loadClient()
+    const ctx = makeCtx()
+    exports.apply(ctx)
+
+    const sessionId = 'session-target'
+    for (const name of ['sidebar.footer.action', 'shell.overlay']) {
+      const slot = ctx.registered.find((row: { spec: Record<string, any> }) => row.spec.name === name)
+      expect(slot).toBeDefined()
+      const props = slot!.spec.inject()
+      props.openSession(sessionId)
+    }
+
+    expect(ctx.openedSessionIds).toEqual([sessionId, sessionId])
   })
 
   it('draws NOTHING while closed — the overlay layer stays click-through', () => {

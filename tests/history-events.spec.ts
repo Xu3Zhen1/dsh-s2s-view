@@ -27,11 +27,11 @@ function makeHost() {
   const ctx = new Context()
   ctx.logger.warn = vi.fn() as never
   /** Routes registered through `ctx.connection.fetch.register`. */
-  const routes = new Map<string, (request: Request) => Promise<Response>>()
+  const routes = new Map<string, { fetch: (request: Request) => Promise<Response>, requestBody?: string }>()
   ctx.provide('connection', {
     fetch: {
-      register: (route: { path: string, fetch: (request: Request) => Promise<Response> }) => {
-        routes.set(route.path, route.fetch)
+      register: (route: { path: string, fetch: (request: Request) => Promise<Response>, requestBody?: string }) => {
+        routes.set(route.path, { fetch: route.fetch, requestBody: route.requestBody })
         // The disposer must actually REMOVE the entry: `ctx.effect` runs it on
         // dispose, and a fake that only returns a resolved promise would make the
         // post-disposal assertion pass for the wrong reason (or, here, fail it).
@@ -193,9 +193,14 @@ describe('s2s history change stream (T20)', () => {
     expect(EVENTS_ROUTE).toBe('/api/s2s-history/events')
   })
 
+  it('registers the SSE GET as buffered for the current Fetch bridge', () => {
+    const { routes } = makeHost()
+    expect(routes.get(EVENTS_ROUTE)?.requestBody).toBe('buffered')
+  })
+
   it('opens with a ready frame that NAMES both wired signals', async () => {
     const { routes } = makeHost()
-    const open = routes.get(EVENTS_ROUTE)
+    const open = routes.get(EVENTS_ROUTE)?.fetch
     expect(open).toBeDefined()
 
     const response = await open!(new Request('http://dsh.internal' + EVENTS_ROUTE))
@@ -215,7 +220,7 @@ describe('s2s history change stream (T20)', () => {
 
   it('★ pushes a frame when a LEDGER write lands, and only for the s2s domain', async () => {
     const { ctx, routes } = makeHost()
-    const response = await routes.get(EVENTS_ROUTE)!(new Request('http://dsh.internal' + EVENTS_ROUTE))
+    const response = await routes.get(EVENTS_ROUTE)?.fetch!(new Request('http://dsh.internal' + EVENTS_ROUTE))
     await settle()
 
     // Another domain writing is not a reason to re-read this panel.
@@ -234,7 +239,7 @@ describe('s2s history change stream (T20)', () => {
 
   it('★ pushes a frame when a conversation APPENDS a message', async () => {
     const { ctx, routes } = makeHost()
-    const response = await routes.get(EVENTS_ROUTE)!(new Request('http://dsh.internal' + EVENTS_ROUTE))
+    const response = await routes.get(EVENTS_ROUTE)?.fetch!(new Request('http://dsh.internal' + EVENTS_ROUTE))
     await settle()
 
     ctx.emit('session/event', { id: 'sess-1' }, { type: 'user/message', seq: 7, time: 1, data: {} })
@@ -248,7 +253,7 @@ describe('s2s history change stream (T20)', () => {
 
   it('ignores session events the feed would not render', async () => {
     const { ctx, routes } = makeHost()
-    const response = await routes.get(EVENTS_ROUTE)!(new Request('http://dsh.internal' + EVENTS_ROUTE))
+    const response = await routes.get(EVENTS_ROUTE)?.fetch!(new Request('http://dsh.internal' + EVENTS_ROUTE))
     await settle()
 
     // Machinery: not a message type.
@@ -271,7 +276,7 @@ describe('s2s history change stream (T20)', () => {
 
   it('refuses past the stream cap instead of growing without bound, and says so', async () => {
     const { routes } = makeHost()
-    const open = routes.get(EVENTS_ROUTE)!
+    const open = routes.get(EVENTS_ROUTE)?.fetch!
     const live: Response[] = []
     for (let index = 0; index < 8; index += 1) {
       live.push(await open(new Request('http://dsh.internal' + EVENTS_ROUTE)))
@@ -288,7 +293,7 @@ describe('s2s history change stream (T20)', () => {
 
   it('closes every stream when the plugin is disposed', async () => {
     const { ctx, routes } = makeHost()
-    const response = await routes.get(EVENTS_ROUTE)!(new Request('http://dsh.internal' + EVENTS_ROUTE))
+    const response = await routes.get(EVENTS_ROUTE)?.fetch!(new Request('http://dsh.internal' + EVENTS_ROUTE))
     await settle()
 
     await ctx.fiber.dispose()

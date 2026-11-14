@@ -2138,7 +2138,7 @@
           sessions: sessionsList,
           workspaces: workspacesList,
           openSession: (sessionId) => {
-            if (sessionsService !== undefined) sessionsService.open(sessionId)
+            if (sessionsService !== undefined) ctx.uiWorkspace.openSession(sessionId)
           },
         }),
       }, HistoryAction))
@@ -2161,7 +2161,7 @@
           sessions: sessionsList,
           workspaces: workspacesList,
           openSession: (sessionId) => {
-            if (sessionsService !== undefined) sessionsService.open(sessionId)
+            if (sessionsService !== undefined) ctx.uiWorkspace.openSession(sessionId)
           },
         }),
       }, HistoryDock))
@@ -2198,5 +2198,5 @@
     exports.en = en
 
     exports.name = 'dsh-s2s/client'
-    exports.inject = ['slots', 'sessions', 'locale', 'remote']
+    exports.inject = ['slots', 'sessions', 'uiWorkspace', 'locale', 'remote']
     exports.apply = apply

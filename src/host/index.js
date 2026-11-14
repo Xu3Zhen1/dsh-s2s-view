@@ -323,20 +323,11 @@ export function apply(ctx) {
     })
   }
 
-  // `requestBody: 'buffered'` carries no behaviour on this host and must not be
-  // cited as load-bearing. An earlier comment here claimed the Connection shared
-  // handler reads `route.requestBody` and that omitting it makes the bridge
-  // attach a body to this GET, which would throw and turn into an empty 400.
-  // Measured against `@deepseek-ai/dsh-client-connection@0.1.2-rc.1`, none of
-  // that holds: bare `requestBody` (i.e. excluding `maxRequestBodyBytes`)
-  // occurs **0** times in `lib/index.js`, and `ConnectionFetchRoute` declares
-  // only `path`, `methods` and `fetch` (`lib/types/rpc.d.ts:82-89`). The bridge
-  // decides the body from the bytes it actually read — `...chunks.length > 0 ?
-  // { body } : {}` (`lib/index.js:62`) — so a bodyless GET never gets one.
-  //
-  // The field is left in place because it is inert, not because it is required;
-  // removing it would be a separate change with its own verification. Read the
-  // deployed package before trusting any comment here about that interface.
+  // This route also uses `buffered` because the current Fetch bridge reads the
+  // exact route's requestBody mode before constructing the Request. The field was
+  // inert under @deepseek-ai/dsh-client-connection@0.1.2-rc.1, but is required
+  // under @deepseek-ai/dsh-client-connection@0.2.2-rc.3: without it, a bodyless
+  // GET receives a streaming body and Request construction throws.
   ctx.effect(
     () => ctx.connection.fetch.register({
       path: ROUTE,
@@ -383,26 +374,17 @@ export function apply(ctx) {
     's2s-history-host: session append signal',
   )
 
-  // ---------------------------------------------------------------------------
-  // The stream route itself.
-  //
-  // `requestBody` is NOT passed here: `ConnectionFetchRoute` on this host
-  // (`@deepseek-ai/dsh-client-connection` 0.1.2-rc.1) declares only `path`,
-  // `methods` and `fetch`, and neither `lib/index.js` nor its browser face reads
-  // any `requestBody` property — the HTTP bridge attaches a body only when the
-  // incoming request actually carried one (`...chunks.length > 0 ? { body } : {}`).
-  // That makes this a GET with no body, which is what the stream wants.
-  //
-  // ★ The neighbouring `/messages` route above still passes `requestBody:
-  // 'buffered'` and its comment claims the field is REQUIRED. That mechanism was
-  // measured absent on this host version; the field is harmless and left alone
-  // (out of scope for this batch), but nobody should read that comment as an
-  // explanation of anything.
-  // ---------------------------------------------------------------------------
+  // The current bridge reads the exact route's requestBody mode before it
+  // constructs the Fetch Request. With no mode it attaches the streaming GET
+  // body and Request rejects: "Request with GET/HEAD method cannot have body."
+  // `buffered` preserves a bodyless request and lets the SSE response stream.
+  // This was inert under @deepseek-ai/dsh-client-connection@0.1.2-rc.1, but is
+  // load-bearing under @deepseek-ai/dsh-client-connection@0.2.2-rc.3.
   ctx.effect(
     () => ctx.connection.fetch.register({
       path: EVENTS_ROUTE,
       methods: ['GET'],
+      requestBody: 'buffered',
       fetch: openStream,
     }),
     's2s-history-host: change stream route',
